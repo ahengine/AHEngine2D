@@ -554,32 +554,30 @@ requestAnimationFrame(frame);
 
 ### چرخهٔ Play / Pause / Stop
 
-وقتی می‌خواهید خود Engine حلقهٔ Frame را مدیریت کند، یک Custom Runtime بدهید:
+وقتی می‌خواهید خود Engine حلقهٔ Frame را مدیریت کند، Runtime را انتخاب کنید و فقط `engine.start()` را اجرا کنید. برای PixiJS v8 خود `start()` همگام باقی می‌ماند، اما ساخت Renderer ناهمگام است؛ قبل از دسترسی به Canvas یا Display Tree، `engine.runtime.ready` را await کنید:
 
 ```js
-const engine = new AH2D.Engine({
-  runtime: 'custom',
-  runtimeOptions: {
-    mount(engine, target) {
-      console.log('Mounted on', target);
-    },
-    render(engine, alpha) {
-      drawWorld(engine, alpha);
-    },
-    destroy() {
-      console.log('Renderer destroyed');
-    }
-  }
+const engine = new AH2D.Engine({ runtime: 'pixijs' });
+engine.load(project);
+engine.useRuntime('pixijs', {
+  PIXI,
+  designWidth: 1920,
+  designHeight: 1080,
+  fit: 'contain',
+  backgroundAlpha: 0
 });
 
-engine.load(project);
-engine.start(canvas, { restoreOnStop: false });
+engine.start(document.querySelector('#game'), { restoreOnStop: true });
+await engine.runtime.ready;
+
 engine.pause();
 engine.resume();
-engine.stop({ restore: false });
+engine.stop();
 ```
 
-به‌صورت پیش‌فرض `start()` یک runtime snapshot می‌گیرد و `stop()` آن را restore می‌کند. این snapshot فقط ECS فعال است و Universal Multi-Scene Project نیست؛ بنابراین برای یک بازی Multi-Scene معمولاً `restoreOnStop: false` مناسب‌تر است. اگر Preview باید به حالت Authoring برگردد، سند اصلی `project` را نزد host نگه دارید و هنگام Stop دوباره `engine.load(project)` را صدا بزنید. گزینهٔ `snapshot: false` گرفتن snapshot را کاملاً غیرفعال می‌کند.
+به‌صورت پیش‌فرض `start()` وضعیت Runtime شامل ECS، hierarchy، Physics، Animation و Camera را همراه با سند Universal و `activeSceneId` نگه می‌دارد. `stop()` همان وضعیت پیش از Play را restore و Runtime canvas را unmount می‌کند؛ بنابراین سند چندصحنه‌ای حفظ می‌شود و بعد از Stop می‌توان `loadScene()` را روی Scene دیگری اجرا کرد. برای اجرای نهایی بازی که Stop نباید state را عقب ببرد از `restoreOnStop: false` یا `stop({ restore: false })` استفاده کنید. گزینهٔ `snapshot: false` گرفتن snapshot را کاملاً غیرفعال می‌کند.
+
+`pause()` فقط Frame loop را متوقف می‌کند و Display Tree را نگه می‌دارد؛ `resume()` از همان pose ادامه می‌دهد. خطای update/render رویداد `runtime:error` ایجاد می‌کند و loop را متوقف می‌سازد. خطای بارگذاری Texture با `runtime:textureError` گزارش می‌شود. در Editor، Play یک کپی مستقل از کل Authoring state نگه می‌دارد و Stop آن را بازمی‌گرداند تا شبیه‌سازی هرگز Scene ذخیره‌شده را تغییر ندهد.
 
 ### ساخت Entity و Component سفارشی
 
@@ -859,7 +857,7 @@ engine.tilemap.setTile('map', 1, 0, 2);
 console.log(engine.tilemap.tileAt('map', 1, 0)); // 2
 ```
 
-Camera/Light/Shadow داده و collection فراهم می‌کنند؛ renderer باید zoom، نور و سایه را اعمال کند.
+PixiJS Runtime دوربین فعال را به‌صورت خودکار روی root viewport اعمال می‌کند؛ Camera دارای `active: true` نیز وقتی `engine.camera.active` صریح تنظیم نشده باشد انتخاب می‌شود. Light، Shadow و Tilemap هنوز داده و collection فراهم می‌کنند و نگاشت تصویری آن‌ها، همانند Custom و Phaser، بر عهدهٔ host بازی است.
 
 ### Custom Runtime
 
@@ -879,17 +877,51 @@ engine.useRuntime('custom', {
 
 ### PixiJS Runtime
 
+PixiJS v8 وابستگی Runtime است. در صفحهٔ Browser، bundle آن را پیش از Data Model و Engine بارگذاری کنید تا `window.PIXI` هنگام ساخت adapter قابل کشف باشد:
+
+```html
+<script src="./node_modules/pixi.js/dist/pixi.min.js"></script>
+<script src="./engine/AH2DDataModel.js"></script>
+<script src="./engine/AH2DEngine.js"></script>
+```
+
+در یک bundler می‌توانید `import * as PIXI from 'pixi.js'` انجام دهید و namespace را صریح به adapter بدهید:
+
 ```js
-engine.useRuntime('pixijs', { PIXI: window.PIXI });
+engine.useRuntime('pixijs', {
+  PIXI,
+  designWidth: 1920,
+  designHeight: 1080,
+  fit: 'contain',       // none | contain | cover | stretch
+  backgroundAlpha: 0,
+  textureResolver(renderable, entityId, engine, PIXI) {
+    if (!renderable.assetId) return null;
+    return PIXI.Assets.load(`/assets/${renderable.assetId}.png`);
+  }
+});
+
+engine.start(document.querySelector('#game'));
+await engine.runtime.ready;
+
 console.log(engine.runtime.name);    // pixijs
 console.log(engine.runtime.backend); // pixijs یا editor-bridge
-
-for (const id of engine.ecs.query('Transform', 'Renderable')) {
-  const transform = engine.ecs.get(id, 'Transform');
-  const renderable = engine.ecs.get(id, 'Renderable');
-  syncPixiDisplayObject(id, transform, renderable);
-}
 ```
+
+`designWidth` و `designHeight` فضای منطقی بازی را تعیین می‌کنند. همان مقادیر را می‌توان با `viewport: { width, height, fit }` داد. `fit` نحوهٔ قرارگرفتن فضای منطقی داخل target را مشخص می‌کند و renderer هنگام تغییر اندازهٔ target همگام می‌شود. `backgroundAlpha` شفافیت clear را کنترل می‌کند؛ `clearColor` یا `Camera.clearColor` رنگ پس‌زمینه را تعیین می‌کند. گزینه‌های سطح پایین Pixi را می‌توان در `applicationOptions` قرار داد.
+
+Adapter به‌صورت خودکار:
+
+- برای هر Entity یک `PIXI.Container` می‌سازد و Nested Scene Graph را mirror می‌کند؛
+- Transform محلی را با Matrix اعمال می‌کند تا world transformهای چرخیده، scale غیرهمسان و shear حاصل از nesting دقیق بمانند؛
+- برای Renderable دارای تصویر `PIXI.Sprite` با anchor مرکزی و برای Renderable بدون تصویر `PIXI.Graphics` می‌سازد؛
+- `Hidden`، `Renderable.visible` و `layer`/`zIndex` را همگام می‌کند؛
+- ساخت، حذف و Reparent شدن Entityها را در Frame بعدی reconcile می‌کند؛
+- `imageSrc` را مستقیم و `assetId` را از `project.assets` resolve می‌کند و منابع را با `PIXI.Assets.load()` به‌صورت async بار می‌گیرد؛
+- دوربین فعال، zoom، اندازهٔ منطقی و resize target را روی world container اعمال می‌کند.
+
+`textureResolver` می‌تواند یک Texture، Promise یک Texture یا alias از قبل loadشده برگرداند. اگر Assetها را خود host preload کرده است، `loadAssets: false` بگذارید و Texture/alias قابل استفاده را از resolver برگردانید. Adapter Textureهای مشترک Pixi را هنگام حذف Sprite نابود نمی‌کند؛ lifecycle cache سراسری `PIXI.Assets` باید توسط مالک Asset مدیریت شود.
+
+اگر namespace معتبر PixiJS در دسترس نباشد، `runtime.backend` برابر `editor-bridge` و `runtime.native` برابر `false` می‌شود. وجود `runtime.name === 'pixijs'` به‌تنهایی اثبات renderer بومی نیست.
 
 ### PhaserJS Runtime
 
@@ -912,7 +944,7 @@ class GameScene extends Phaser.Scene {
 }
 ```
 
-آداپترهای PixiJS و PhaserJS در نسخهٔ فعلی انتخاب Runtime و قرارداد host را فراهم می‌کنند، اما خودشان Spriteها را از ECS ایجاد یا Render نمی‌کنند. توابع نگاشت مانند `syncPixiDisplayObject` و `createPhaserObjectsFromECS` باید در پروژهٔ بازی پیاده شوند.
+PixiJS adapter اکنون Display Tree، Sprite/Graphics، Transform، visibility، Camera و asset loading پایه را مستقیماً از ECS ایجاد و Render می‌کند. PhaserJS همچنان یک adapter انتخاب/سازگاری است و ساخت Game Objectها، sync ECS و Camera/renderer mapping آن باید توسط پروژهٔ بازی انجام شود؛ مثال `createPhaserObjectsFromECS` بالا host-owned است. Animation frame slicing، Particle rendering، Light/Shadow و Post Process filters برای هر دو Runtime همچنان نیازمند نگاشت اختصاصی بازی هستند.
 
 ### اجرای Headless در Node.js
 

@@ -198,16 +198,21 @@ const WORKSPACE_BRIDGE = String.raw`
 export async function GET(request: Request) {
   try {
     await requireRequestAuth(request);
-    const [editorSource, dataModelSource, engineSource] = await Promise.all([
+    const [editorSource, pixiSource, dataModelSource, engineSource] = await Promise.all([
       readFile(path.join(process.cwd(), "AH2DEdtior.html"), "utf8"),
+      readFile(path.join(process.cwd(), "node_modules", "pixi.js", "dist", "pixi.min.js"), "utf8"),
       readFile(path.join(process.cwd(), "engine", "AH2DDataModel.js"), "utf8"),
       readFile(path.join(process.cwd(), "engine", "AH2DEngine.js"), "utf8"),
     ]);
     let html = editorSource
+      .replace(
+        '<script src="./node_modules/pixi.js/dist/pixi.min.js"></script>',
+        () => `<script>${pixiSource.replace(/<\/script/gi, "<\\/script")}</script>`,
+      )
       .replace('<script src="./engine/AH2DDataModel.js"></script>', "")
       .replace(
         '<script src="./engine/AH2DEngine.js"></script>',
-        `<script>${dataModelSource.replace(/<\/script/gi, "<\\/script")}</script>\n` +
+        () => `<script>${dataModelSource.replace(/<\/script/gi, "<\\/script")}</script>\n` +
           `<script>${engineSource.replace(/<\/script/gi, "<\\/script")}</script>`,
       );
     html = html.replace("</body>", `${WORKSPACE_BRIDGE}\n</body>`);

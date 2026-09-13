@@ -89,6 +89,9 @@ border-color:rgba(255,255,255,.12);box-shadow:0 8px 22px rgba(52,104,223,.22),in
 .runtime-indicator{width:6px;height:6px;border-radius:50%;background:#69788d;box-shadow:0 0 0 3px rgba(105,120,141,.1);margin:0 3px;transition:background .2s ease,box-shadow .2s ease}
 .runtime-indicator.playing{background:#67df94;box-shadow:0 0 0 3px rgba(103,223,148,.13),0 0 10px rgba(103,223,148,.45)}
 .runtime-indicator.paused{background:#ffc45e;box-shadow:0 0 0 3px rgba(255,196,94,.12)}
+.runtime-indicator.starting{background:#78a8ff;box-shadow:0 0 0 3px rgba(120,168,255,.14),0 0 12px rgba(120,168,255,.42);animation:runtime-pulse 1s ease-in-out infinite}
+.runtime-indicator.error{background:#ff6478;box-shadow:0 0 0 3px rgba(255,100,120,.14),0 0 12px rgba(255,100,120,.45)}
+@keyframes runtime-pulse{50%{opacity:.42;transform:scale(.78)}}
 
 /* APP MENU */
 .app-menu{
@@ -272,6 +275,8 @@ border-color:rgba(255,255,255,.12);box-shadow:0 8px 22px rgba(52,104,223,.22),in
 .play-mode .viewport{box-shadow:inset 0 0 0 2px rgba(101,222,147,.34)}
 .play-mode #sceneCanvas{cursor:default}
 .play-mode #inspector input,.play-mode #inspector select,.play-mode #inspector .toggle,.play-mode #inspector .component-remove{pointer-events:none;opacity:.58}
+.play-mode #hierarchy,.play-mode #hierSearch,.play-mode #addEntityBtn,.play-mode #projectTree,.play-mode #projectSearch,.play-mode #importProjectBtn,.play-mode #newFolderBtn{pointer-events:none;opacity:.56}
+.play-mode .ws:not([data-page="edit"]),.play-mode [data-scene-tool],.play-mode #sceneSnap,.play-mode #sceneComments,.play-mode #postProcessBtn,.play-mode #sceneSwitcher,.play-mode .zoom{pointer-events:none;opacity:.45}
 .inspector-title{height:40px;display:flex;align-items:center;gap:8px;padding:0 11px;border-bottom:1px solid var(--line2)}
 .inspector-title b{font-size:12px}.inspector-title .spacer{flex:1}
 .object-head{padding:9px 10px;border-bottom:1px solid var(--line2);display:flex;gap:9px;align-items:center;min-width:0}
@@ -311,6 +316,13 @@ border-color:rgba(255,255,255,.12);box-shadow:0 8px 22px rgba(52,104,223,.22),in
 .canvas-page{display:grid;grid-template-rows:minmax(0,1fr)}
 .viewport{position:relative;min-width:0;min-height:0;overflow:hidden;background:#111a27}
 canvas{display:block;width:100%;height:100%;touch-action:none}
+#sceneCanvas{position:absolute;inset:0;z-index:0;transition:opacity .22s ease}
+.runtime-stage{position:absolute;inset:0;z-index:1;min-width:1px;min-height:1px;overflow:hidden;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .24s ease,visibility 0s linear .24s}
+.runtime-stage.active{opacity:1;visibility:visible;pointer-events:auto;transition-delay:0s}
+.runtime-stage>canvas{position:absolute;inset:0;width:100%!important;height:100%!important}
+.viewport.runtime-native #sceneCanvas{opacity:0}
+.runtime-error{position:absolute;z-index:19;left:50%;top:50%;width:min(420px,calc(100% - 40px));padding:13px 15px;border-radius:13px;border:1px solid rgba(255,112,129,.42);background:rgba(35,15,24,.94);box-shadow:0 22px 65px rgba(0,0,0,.5);backdrop-filter:blur(18px);opacity:0;visibility:hidden;pointer-events:none;transform:translate(-50%,-46%) scale(.97);transition:opacity .2s ease,transform .3s cubic-bezier(.22,1,.36,1),visibility 0s linear .3s}
+.runtime-error.show{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,-50%) scale(1);transition-delay:0s}.runtime-error b,.runtime-error span{display:block}.runtime-error b{color:#ff9aa8;margin-bottom:4px}.runtime-error span{color:#d6b6bd;font-size:10px;line-height:1.55;overflow-wrap:anywhere}
 .floatbar{
   position:absolute;z-index:8;background:rgba(16,25,38,.82);border:1px solid rgba(255,255,255,.10);
   backdrop-filter:blur(16px);box-shadow:0 12px 30px rgba(0,0,0,.22);border-radius:11px;display:flex;align-items:center;gap:4px;padding:4px
@@ -465,9 +477,9 @@ radial-gradient(circle at 50% 58%,#182b45,#0a121d 60%);background-size:32px 32px
         <div class="runtime-controls" title="Runtime preview">
           <span class="runtime-indicator" id="runtimeIndicator"></span>
           <select class="runtime-select" id="runtimeSelect" aria-label="Runtime">
-            <option value="pixijs">PixiJS</option>
+            <option value="pixijs" selected>PixiJS</option>
             <option value="phaserjs">PhaserJS</option>
-            <option value="custom" selected>Custom</option>
+            <option value="custom">Custom</option>
           </select>
           <span class="runtime-backend" id="runtimeBackend">Canvas</span>
           <button class="runtime-play" id="editorPlay" title="Play" aria-label="Play">▶</button>
@@ -524,6 +536,8 @@ radial-gradient(circle at 50% 58%,#182b45,#0a121d 60%);background-size:32px 32px
         <section class="workspace-page canvas-page active" data-page="edit">
           <div class="viewport" id="sceneViewport">
             <canvas id="sceneCanvas"></canvas>
+            <div class="runtime-stage" id="runtimeStage" aria-label="Runtime preview surface"></div>
+            <div class="runtime-error" id="runtimeError" role="alert"><b>Runtime paused after an error</b><span id="runtimeErrorText"></span></div>
             <div class="floatbar tools">
 
               <button class="tool" data-scene-tool="move" title="Move" aria-label="Move tool">✥</button>
@@ -666,6 +680,7 @@ radial-gradient(circle at 50% 58%,#182b45,#0a121d 60%);background-size:32px 32px
 </div>
 <div class="toast" id="toast"></div>
 
+<script src="./node_modules/pixi.js/dist/pixi.min.js"></script>
 <script src="./engine/AH2DDataModel.js"></script>
 <script src="./engine/AH2DEngine.js"></script>
 <script>
@@ -718,13 +733,13 @@ const state={
  hierarchyCollapsed:false,projectCollapsed:false,leftClosed:false,rightClosed:false,openFolders:{},openEntities:{},
  projectSize:0,projectFolder:'',folders:['Environment','Props','Characters','FX','UI','Prefabs','Animations'],
  assets:[...builtins], history:[], future:[],
- runtime:'custom',playMode:'stopped',playSnapshot:null,playSelection:null,worldGravity:{x:0,y:980},
+ runtime:'pixijs',playMode:'stopped',playSnapshot:null,playSelection:null,runtimeScene:null,runtimeError:'',playGeneration:0,worldGravity:{x:0,y:980},
  postProcess:createDefaultPostProcess(),
  animator:{frame:0,playing:false,fps:12,timer:0,onion:true,timelineHeight:300,clip:'Knight_Run'},
  particle:createDefaultParticle(),particleIncluded:true,
  particles:[],emitAcc:0
 };
-const ah2dEngine=new AH2D.Engine({runtime:'custom',runtimeOptions:{render:()=>{}}});
+const ah2dEngine=new AH2D.Engine({runtime:'pixijs',runtimeOptions:{PIXI:window.PIXI,viewport:{width:1920,height:1080,fit:'contain'},backgroundAlpha:0}});
 const componentSchemas=ah2dEngine.componentSchemas;
 const entityCodec=ah2dEngine.entityCodec;
 const dataModelDescriptor=Object.freeze({id:AH2D.DataModel.DATA_MODEL_ID,version:AH2D.DataModel.DATA_MODEL_VERSION,componentSchemaVersion:AH2D.DataModel.COMPONENT_SCHEMA_VERSION});
@@ -737,19 +752,20 @@ window.AH2DEditorRuntime={
   component:type=>componentSchemas.describe(type),
   validate:(entity,strict=false)=>entityCodec.validate(entity,{profile:AH2D.DataModel.PROFILES.AUTHORING,mode:strict?'strict':'compat',strict})
  },
- use:(runtime)=>selectRuntime(runtime),
+ use:(runtime)=>state.playMode==='stopped'?selectRuntime(runtime):(toast('Stop Preview before changing Runtime'),ah2dEngine.runtime),
  play:()=>startPlayMode(),
  pause:()=>pausePlayMode(),
  stop:()=>stopPlayMode(),
+ status:()=>({mode:state.playMode,runtime:state.runtime,backend:ah2dEngine.runtime?.backend||'editor-bridge',native:ah2dEngine.runtime?.native===true,error:state.runtimeError||null,canvasCount:$('#runtimeStage')?.querySelectorAll('canvas').length||0}),
  scenes:{list:()=>state.scenes.map(({id,name,updatedAt})=>({id,name,updatedAt})),current:()=>state.currentSceneId,switch:id=>switchScene(id),create:name=>createScene(name),save:()=>saveCurrentScene()},
  postProcess:{
   list:()=>cloneData(state.postProcess.effects),
-  setEnabled:enabled=>{state.postProcess.enabled=Boolean(enabled);syncPostProcess();renderPostProcessPanel();drawScene();return state.postProcess.enabled},
-  configure:(id,values)=>{const effect=state.postProcess.effects.find(item=>item.id===id||item.type===id);if(!effect)return null;Object.assign(effect,cloneData(values||{}));syncPostProcess();renderPostProcessPanel();drawScene();return cloneData(effect)},
-  reset:()=>{state.postProcess=createDefaultPostProcess();syncPostProcess();renderPostProcessPanel();drawScene();return cloneData(state.postProcess)}
+  setEnabled:enabled=>{if(authoringMutationBlocked())return state.postProcess.enabled;state.postProcess.enabled=Boolean(enabled);syncPostProcess();renderPostProcessPanel();drawScene();return state.postProcess.enabled},
+  configure:(id,values)=>{if(authoringMutationBlocked())return null;const effect=state.postProcess.effects.find(item=>item.id===id||item.type===id);if(!effect)return null;Object.assign(effect,cloneData(values||{}));syncPostProcess();renderPostProcessPanel();drawScene();return cloneData(effect)},
+  reset:()=>{if(authoringMutationBlocked())return cloneData(state.postProcess);state.postProcess=createDefaultPostProcess();syncPostProcess();renderPostProcessPanel();drawScene();return cloneData(state.postProcess)}
  },
  exportECS:()=>ah2dEngine.export(),
- sync:()=>syncEngineDocument(true),
+ sync:()=>state.playMode==='stopped'?syncEngineDocument(true):false,
  physics:{
   body:id=>ah2dEngine.physics.getBody(id),
   applyForce:(id,x,y)=>ah2dEngine.physics.applyForce(id,x,y),
@@ -903,12 +919,12 @@ const starterSceneTemplate=cloneData(state.scene);
 state.currentSceneId=uid();
 state.scenes=[{id:state.currentSceneId,name:'Main Scene',objects:cloneData(state.scene),updatedAt:Date.now(),view:{zoom:state.sceneZoom,pan:cloneData(state.scenePan)}}];
 function activeSceneRecord(){return state.scenes.find(scene=>scene.id===state.currentSceneId)||null}
-function editableSceneObjects(){return state.playMode!=='stopped'&&state.playSnapshot?state.playSnapshot:state.scene}
+function editableSceneObjects(){return state.scene}
 function uniqueSceneName(base='New Scene'){
  const clean=String(base||'New Scene').trim()||'New Scene',names=new Set(state.scenes.map(scene=>scene.name.toLowerCase()));if(!names.has(clean.toLowerCase()))return clean;
  let index=2;while(names.has(`${clean} ${index}`.toLowerCase()))index++;return `${clean} ${index}`;
 }
-function commitActiveScene(objects=editableSceneObjects()){
+function commitActiveScene(objects=state.scene){
  const scene=activeSceneRecord();if(!scene)return null;scene.objects=prepareEditorEntities(objects);scene.updatedAt=Date.now();scene.view={zoom:state.sceneZoom,pan:cloneData(state.scenePan)};return scene;
 }
 function renderSceneSwitcher(){
@@ -918,26 +934,27 @@ function renderSceneSwitcher(){
 }
 function resetSceneSession(){setSelection('scene',[]);state.sceneInteraction=null;state.sceneSelectionRect=null;state.history=[];state.future=[]}
 function switchScene(id,silent=false){
+ if(state.playMode!=='stopped'){if(!silent)toast('Stop Preview before switching Scene');renderSceneSwitcher();return null}
  if(id===state.currentSceneId){renderSceneSwitcher();return activeSceneRecord()}
  const target=state.scenes.find(scene=>scene.id===id);if(!target){toast('Scene not found');renderSceneSwitcher();return null}
- if(state.playMode!=='stopped')stopPlayMode(true);commitActiveScene();state.currentSceneId=target.id;state.scene=hydrateEditorObjects(cloneData(target.objects||[]));
+ commitActiveScene();state.currentSceneId=target.id;state.scene=hydrateEditorObjects(cloneData(target.objects||[]));
  state.sceneZoom=Number.isFinite(target.view?.zoom)?clamp(target.view.zoom,.25,4):1;state.scenePan=target.view?.pan?cloneData(target.view.pan):{x:0,y:0};$('#zoomLabel').textContent=Math.round(state.sceneZoom*100)+'%';resetSceneSession();
  syncEngineDocument(true);renderAll();if(!silent)toast(`Switched to ${target.name}`);return target;
 }
 function createScene(name='New Scene'){
- if(state.playMode!=='stopped')stopPlayMode(true);commitActiveScene();const scene={id:uniqueEditorId(new Set(state.scenes.map(item=>item.id))),name:uniqueSceneName(name),objects:[],updatedAt:Date.now(),view:{zoom:1,pan:{x:0,y:0}}};state.scenes.push(scene);state.currentSceneId=scene.id;state.scene=[];state.sceneZoom=1;state.scenePan={x:0,y:0};$('#zoomLabel').textContent='100%';resetSceneSession();renderAll();toast(`${scene.name} created`);return scene;
+ if(state.playMode!=='stopped'){toast('Stop Preview before creating a Scene');return null}commitActiveScene();const scene={id:uniqueEditorId(new Set(state.scenes.map(item=>item.id))),name:uniqueSceneName(name),objects:[],updatedAt:Date.now(),view:{zoom:1,pan:{x:0,y:0}}};state.scenes.push(scene);state.currentSceneId=scene.id;state.scene=[];state.sceneZoom=1;state.scenePan={x:0,y:0};$('#zoomLabel').textContent='100%';resetSceneSession();renderAll();toast(`${scene.name} created`);return scene;
 }
-function openSceneModal(){const modal=$('#sceneModal'),input=$('#sceneName');input.value=uniqueSceneName('New Scene');modal.classList.add('show');setTimeout(()=>{input.focus();input.select()},30)}
-function saveCurrentScene(){const name=activeSceneRecord()?.name||'Scene';commitActiveScene();saveLocal(`${name} saved`)}
+function openSceneModal(){if(authoringMutationBlocked())return;const modal=$('#sceneModal'),input=$('#sceneName');input.value=uniqueSceneName('New Scene');modal.classList.add('show');setTimeout(()=>{input.focus();input.select()},30)}
+function saveCurrentScene(){if(authoringMutationBlocked())return false;const name=activeSceneRecord()?.name||'Scene';return saveLocal(`${name} saved`)}
 const defaultRigidbody=()=>componentSchemas.create('Rigidbody',{}, {profile:AH2D.DataModel.PROFILES.AUTHORING});
 const defaultCollider=(o,shape='rectangle')=>{const width=Math.max(8,Math.abs(o.w||64)),height=Math.max(8,Math.abs(o.h||64));return componentSchemas.create('Collider',{shape,width,height,radius:Math.max(4,Math.min(width,height)/2)},{profile:AH2D.DataModel.PROFILES.AUTHORING,entity:o})};
 function runtimeOptions(runtime){
- if(runtime==='pixijs')return{PIXI:window.PIXI};
+ if(runtime==='pixijs')return{PIXI:window.PIXI,designWidth:1920,designHeight:1080,viewport:{width:1920,height:1080,fit:'contain'},fit:'contain',backgroundAlpha:0,transparent:true};
  if(runtime==='phaserjs')return{Phaser:window.Phaser};
  return{mount:()=>{},render:()=>{},destroy:()=>{}};
 }
-function syncEngineComponents(){
- for(const o of state.scene){
+function syncEngineComponents(objects=state.scene){
+ for(const o of objects){
   if(!ah2dEngine.ecs.entities.has(o.id))continue;
   const t=ah2dEngine.ecs.get(o.id,'Transform');
   if(t){const local=editorLocalTransform(o);t.x=local.x;t.y=local.y;t.rotation=local.rot;t.scaleX=local.sx;t.scaleY=local.sy}
@@ -946,11 +963,11 @@ function syncEngineComponents(){
   if(collider)ah2dEngine.ecs.add(o.id,'Collider',cloneData(collider));else ah2dEngine.ecs.remove(o.id,'Collider');
  }
 }
-function syncEngineDocument(force=false){
- const editorState={...state,scene:prepareEditorEntities(state.scene)};
+function syncEngineDocument(force=false,objects=state.scene){
+ const editorState={...state,scene:prepareEditorEntities(objects)};
  if(force)ah2dBridge.lastSignature='';
  const changed=ah2dBridge.sync(editorState);
- syncEngineComponents();
+ syncEngineComponents(objects);
  const gravity=state.worldGravity;
  try{
   if(typeof ah2dEngine.physics?.setGravity==='function')ah2dEngine.physics.setGravity(gravity);
@@ -959,57 +976,78 @@ function syncEngineDocument(force=false){
  return changed;
 }
 function updateRuntimeControls(){
- const mode=state.playMode,playing=mode==='playing',paused=mode==='paused',stopped=mode==='stopped';
- const adapter=ah2dEngine.runtime,backend=adapter?.backend||'editor-bridge',native=adapter?.native!==false;
+ const mode=state.playMode,playing=mode==='playing',paused=mode==='paused',starting=mode==='starting',failed=mode==='error',stopped=mode==='stopped';
+ const adapter=ah2dEngine.runtime,backend=adapter?.backend||'editor-bridge',native=adapter?.native===true,stage=$('#runtimeStage'),nativePreview=!stopped&&state.runtime==='pixijs'&&native&&backend==='pixijs'&&Boolean(stage?.querySelector('canvas'));
  $('#runtimeSelect').value=state.runtime;
  $('#runtimeSelect').disabled=!stopped;
- $('#editorPlay').disabled=playing;
- $('#editorPause').disabled=stopped||paused;
+ $('#editorPlay').disabled=playing||starting||failed;
+ $('#editorPlay').textContent='▶';$('#editorPlay').title=paused?'Resume':'Play';$('#editorPlay').setAttribute('aria-label',paused?'Resume':'Play');
+ $('#editorPause').disabled=!playing;
  $('#editorStop').disabled=stopped;
  $('#editorPlay').classList.toggle('active',playing);
  $('#editorPause').classList.toggle('active',paused);
  $('#editorStop').classList.toggle('stop-active',!stopped);
- $('#runtimeIndicator').className='runtime-indicator '+(playing?'playing':paused?'paused':'');
- $('#runtimeBackend').textContent=state.runtime==='custom'?'Canvas':native?'Native':'Compat';
- $('#runtimeBackend').title=state.runtime==='custom'?'Custom Canvas runtime':native?`${state.runtime} native adapter`:`${state.runtime} compatibility mode — add the runtime library for native rendering`;
+ $('#runtimeIndicator').className='runtime-indicator '+(playing?'playing':paused?'paused':starting?'starting':failed?'error':'');
+ $('#runtimeBackend').textContent=starting?'Loading':failed?'Error':state.runtime==='custom'?'Canvas':native?backend:'Missing';
+ $('#runtimeBackend').title=state.runtime==='custom'?'Custom Canvas runtime':native?`${state.runtime} native ${backend} renderer`:`${state.runtime} library is unavailable`;
  if(!stopped){$('#addComponentBtn').disabled=true;$('#componentMenu').classList.remove('show')}
  body.classList.toggle('play-mode',!stopped);
+ body.dataset.playMode=mode;
+ const viewport=$('#sceneViewport'),errorPanel=$('#runtimeError');viewport.classList.toggle('runtime-native',nativePreview);stage.classList.toggle('active',nativePreview);stage.setAttribute('aria-hidden',nativePreview?'false':'true');errorPanel.classList.toggle('show',failed);$('#runtimeErrorText').textContent=state.runtimeError||'';
+ ['#hierSearch','#addEntityBtn','#projectSearch','#importProjectBtn','#newFolderBtn','#sceneSelect','#newSceneBtn','#saveSceneBtn','#postProcessBtn','#sceneSnap','#sceneComments','#zoomIn','#zoomOut','#zoomLabel','#fitScene'].forEach(selector=>{const element=$(selector);if(element)element.disabled=!stopped});
+ $$('[data-scene-tool]').forEach(button=>button.disabled=!stopped);$$('.ws').forEach(button=>button.disabled=!stopped&&button.dataset.page!=='edit');
+ $$('[data-menu]').forEach(button=>button.disabled=!stopped&&['new','new-scene','save-scene','import','save','load','recent'].includes(button.dataset.menu));
 }
 function selectRuntime(runtime,silent=false){
  if(!['pixijs','phaserjs','custom'].includes(runtime))runtime='custom';
  try{ah2dEngine.useRuntime(runtime,runtimeOptions(runtime));state.runtime=runtime}
- catch(error){console.warn(error);state.runtime='custom';ah2dEngine.useRuntime('custom',runtimeOptions('custom'));if(!silent)toast('Runtime unavailable — using Custom')}
+ catch(error){console.error(error);if(!silent)toast(`${runtime} runtime is unavailable`);throw error}
  updateRuntimeControls();
- if(!silent){const labels={pixijs:'PixiJS',phaserjs:'PhaserJS',custom:'Custom'},mode=ah2dEngine.runtime?.native===false?' compatibility':'';toast(`${labels[state.runtime]}${mode} runtime selected`)}
+ if(!silent){const labels={pixijs:'PixiJS',phaserjs:'PhaserJS',custom:'Custom'},mode=ah2dEngine.runtime?.native===false?' unavailable':'';toast(`${labels[state.runtime]}${mode} runtime selected`)}
  return ah2dEngine.runtime;
 }
-function startPlayMode(){
- if(state.playMode==='playing')return;
+function capturePlayAuthoringState(){
+ return cloneData({projectName:state.projectName,scene:state.scene,scenes:state.scenes,currentSceneId:state.currentSceneId,prefab:state.prefab,folders:state.folders,assets:state.assets,particle:state.particle,particleIncluded:state.particleIncluded,postProcess:state.postProcess,worldGravity:state.worldGravity,sceneZoom:state.sceneZoom,scenePan:state.scenePan,sceneSelectedIds:state.sceneSelectedIds,sceneSelected:state.sceneSelected,prefabSelectedIds:state.prefabSelectedIds,prefabSelected:state.prefabSelected,history:state.history,future:state.future,pixelsPerMeter:ah2dEngine.physics?.pixelsPerMeter,activePage});
+}
+function restorePlayAuthoringState(saved){
+ if(!saved)return;for(const key of ['projectName','scene','scenes','currentSceneId','prefab','folders','assets','particle','particleIncluded','postProcess','worldGravity','sceneZoom','scenePan','history','future'])state[key]=cloneData(saved[key]);
+ setSelection('scene',saved.sceneSelectedIds||[],saved.sceneSelected);setSelection('prefab',saved.prefabSelectedIds||[],saved.prefabSelected);if(Number.isFinite(saved.pixelsPerMeter)&&ah2dEngine.physics)ah2dEngine.physics.pixelsPerMeter=saved.pixelsPerMeter;$('#projectTitle').textContent=state.projectName+'⌄';$('#zoomLabel').textContent=Math.round(state.sceneZoom*100)+'%';ah2dEngine.postProcess?.load(state.postProcess);
+}
+function clearPlayInteractions(){
+ state.sceneInteraction=null;state.sceneSelectionRect=null;state.prefabInteraction=null;state.prefabSelectionRect=null;$('#dropCover').classList.remove('show');$('#postProcessPanel').classList.remove('show');$('#componentMenu').classList.remove('show');$('#appMenu').classList.remove('show');document.querySelector('.hier-context')?.classList.remove('show');for(const key of Object.keys(panKeys||{}))panKeys[key]=false;
+}
+function runtimeErrorMessage(error){return String(error?.message||error?.error?.message||error||'Unknown runtime error').slice(0,500)}
+function handlePlayRuntimeError(error){
+ if(state.playMode==='stopped'||state.playMode==='error')return;state.runtimeError=runtimeErrorMessage(error);console.error('AH2D Play Mode runtime error',error);try{ah2dEngine.pause()}catch{}state.playMode='error';updateRuntimeControls();toast('Runtime error — authoring state is safe');
+}
+async function startPlayMode(){
+ if(state.playMode==='playing'||state.playMode==='starting'||state.playMode==='error')return;
  if(state.playMode==='paused'){
-  state.playMode='playing';ah2dEngine.resume();updateRuntimeControls();toast('Preview resumed');return;
+  try{ah2dEngine.resume();state.playMode='playing';state.runtimeError='';updateRuntimeControls();toast('Preview resumed')}catch(error){handlePlayRuntimeError(error)}return;
  }
- state.playSnapshot=cloneData(state.scene);state.playSelection={ids:[...state.sceneSelectedIds],primary:state.sceneSelected};
- state.sceneInteraction=null;state.sceneSelectionRect=null;state.prefabInteraction=null;state.prefabSelectionRect=null;
- if(activePage!=='edit')setPage('edit');syncEngineDocument(true);selectRuntime(state.runtime,true);state.playMode='playing';
- try{ah2dEngine.start($('#sceneViewport'),{restoreOnStop:false,snapshot:false})}catch(error){console.warn(error);state.runtime='custom';ah2dEngine.useRuntime('custom',runtimeOptions('custom'));ah2dEngine.start($('#sceneViewport'),{restoreOnStop:false,snapshot:false})}
- updateRuntimeControls();toast(`Playing with ${state.runtime==='phaserjs'?'PhaserJS':state.runtime==='pixijs'?'PixiJS':'Custom'} runtime`);
+ const generation=++state.playGeneration;state.playSnapshot=capturePlayAuthoringState();state.playSelection={ids:[...state.sceneSelectedIds],primary:state.sceneSelected};state.runtimeScene=cloneData(state.scene);state.runtimeError='';clearPlayInteractions();if(activePage!=='edit')setPage('edit');state.playMode='starting';updateRuntimeControls();
+ try{
+  $('#runtimeStage').replaceChildren();const adapter=selectRuntime(state.runtime,true);if(state.runtime!=='custom'&&adapter?.native!==true)throw new Error(`${state.runtime==='pixijs'?'PixiJS':'PhaserJS'} library is not available in this editor`);
+  const runtimeDocument=projectData();ah2dEngine.load(runtimeDocument);syncEngineComponents(state.runtimeScene);ah2dBridge.lastSignature='';
+  const gravity=state.worldGravity;if(typeof ah2dEngine.physics?.setGravity==='function')ah2dEngine.physics.setGravity(gravity);else if(typeof ah2dEngine.physics?.world?.setGravity==='function')ah2dEngine.physics.world.setGravity(gravity);
+  ah2dEngine.start($('#runtimeStage'),{restoreOnStop:true});updateRuntimeControls();await Promise.resolve(adapter?.ready);
+  if(generation!==state.playGeneration||state.playMode!=='starting')return;if(state.runtime!=='custom'&&(adapter?.native!==true||adapter?.error||(state.runtime==='pixijs'&&adapter?.backend!=='pixijs')))throw adapter?.error||new Error(`${state.runtime} renderer failed to initialize`);state.playMode='playing';updateRuntimeControls();toast(`Playing with ${state.runtime==='phaserjs'?'PhaserJS':state.runtime==='pixijs'?'PixiJS':'Custom'} runtime`);
+ }catch(error){if(generation===state.playGeneration&&state.playMode!=='stopped')handlePlayRuntimeError(error)}
 }
 function pausePlayMode(){
- if(state.playMode!=='playing')return;ah2dEngine.pause();state.playMode='paused';updateRuntimeControls();toast('Preview paused');
+ if(state.playMode!=='playing')return;try{ah2dEngine.pause();state.playMode='paused';updateRuntimeControls();toast('Preview paused')}catch(error){handlePlayRuntimeError(error)}
 }
 function stopPlayMode(silent=false){
- if(state.playMode==='stopped')return;ah2dEngine.stop({restore:false});
- try{ah2dEngine.physics?.clear?.()}catch{}
- try{ah2dEngine.useRuntime(state.runtime,runtimeOptions(state.runtime))}catch{}
- if(state.playSnapshot)state.scene=state.playSnapshot;
- const selection=state.playSelection;state.playSnapshot=null;state.playSelection=null;state.playMode='stopped';
- if(selection)setSelection('scene',selection.ids.filter(id=>state.scene.some(o=>o.id===id)),selection.primary);
- syncEngineDocument(true);updateRuntimeControls();renderAll();if(!silent)toast('Stopped — edit state restored');
+ if(state.playMode==='stopped')return;const saved=state.playSnapshot,previousPage=saved?.activePage||'edit';++state.playGeneration;let cleanupError=null;
+ try{ah2dEngine.stop({restore:true})}catch(error){cleanupError=error;console.error(error)}
+ $('#runtimeStage').replaceChildren();restorePlayAuthoringState(saved);state.runtimeScene=null;state.playSnapshot=null;state.playSelection=null;state.runtimeError='';state.playMode='stopped';clearPlayInteractions();syncEngineDocument(true);updateRuntimeControls();if(activePage!==previousPage)setPage(previousPage);else renderAll();if(!silent)toast(cleanupError?'Stopped and restored — cleanup reported an error':'Stopped — authoring state restored');
 }
-function pullSceneTransformsFromEngine(){let changed=false;for(const o of state.scene){const t=ah2dEngine.ecs.get(o.id,'Transform');if(!t)continue;let local=editorLocalTransform(o);if(Math.abs(local.x-t.x)>.0001||Math.abs(local.y-t.y)>.0001||Math.abs(local.rot-t.rotation)>.0001){local=writeEditorLocalTransform(o,{x:t.x,y:t.y,rot:t.rotation,sx:t.scaleX,sy:t.scaleY});changed=true}const rb=ah2dEngine.ecs.get(o.id,'Rigidbody');if(rb&&o.rigidbody){for(const key of ['velocityX','velocityY','angularVelocity','sleeping'])if(typeof rb[key]==='boolean'||Number.isFinite(rb[key]))o.rigidbody[key]=rb[key]}if(o.id===state.sceneSelected&&activePage==='edit'){const values={x:local.x,y:local.y,rot:local.rot,velocityX:o.rigidbody?.velocityX,velocityY:o.rigidbody?.velocityY,angularVelocity:o.rigidbody?.angularVelocity};for(const [key,value] of Object.entries(values)){if(value==null)continue;const input=$(`[data-prop="${key}"],[data-rigidbody="${key}"]`);if(input&&input!==document.activeElement)input.value=Math.round(value*1000)/1000}}}return changed}
+function pullSceneTransformsFromEngine(){let changed=false;for(const o of state.runtimeScene||[]){const t=ah2dEngine.ecs.get(o.id,'Transform');if(!t)continue;const local=editorLocalTransform(o);if(Math.abs(local.x-t.x)>.0001||Math.abs(local.y-t.y)>.0001||Math.abs(local.rot-t.rotation)>.0001||Math.abs(local.sx-t.scaleX)>.0001||Math.abs(local.sy-t.scaleY)>.0001){writeEditorLocalTransform(o,{x:t.x,y:t.y,rot:t.rotation,sx:t.scaleX,sy:t.scaleY});changed=true}}return changed}
 function updatePlaySimulation(){
- if(state.playMode!=='playing')return;pullSceneTransformsFromEngine();
+ if(state.playMode!=='playing')return;try{pullSceneTransformsFromEngine()}catch(error){handlePlayRuntimeError(error)}
 }
+ah2dEngine.events.on('runtime:fallback',payload=>{if(payload?.runtime===ah2dEngine.runtime&&state.playMode!=='stopped')handlePlayRuntimeError(payload.error||payload.runtime?.error||new Error('Runtime renderer fallback'))});
+ah2dEngine.events.on('runtime:error',payload=>{if(state.playMode!=='stopped')handlePlayRuntimeError(payload?.error||payload)});
 
 /* canvas setup */
 const sc=$('#sceneCanvas'), sctx=sc.getContext('2d'), mini=$('#miniCanvas'), mctx=mini.getContext('2d');
@@ -1088,9 +1126,10 @@ function applyScenePostProcess(r){
  const vignette=enabled('vignette');if(vignette){const amount=clamp(Number(vignette.intensity)||0,0,1),softness=clamp(Number(vignette.softness)||.68,.05,.95),radius=Math.max(r.width,r.height),gradient=sctx.createRadialGradient(r.width/2,r.height/2,radius*softness*.34,r.width/2,r.height/2,radius*.72);gradient.addColorStop(0,'rgba(0,0,0,0)');gradient.addColorStop(1,`rgba(2,5,10,${amount})`);sctx.fillStyle=gradient;sctx.fillRect(0,0,r.width,r.height)}
  const crt=enabled('crt');if(crt){const scanlines=clamp(Number(crt.scanlines)||0,0,1),noise=clamp(Number(crt.noise)||0,0,.5),curvature=clamp(Number(crt.curvature)||0,0,1);sctx.save();sctx.fillStyle=`rgba(2,7,13,${scanlines})`;for(let y=1;y<r.height;y+=4)sctx.fillRect(0,y,r.width,1);sctx.globalAlpha=noise;for(let i=0;i<180;i++){const x=(i*83)%Math.max(1,r.width),y=(i*47)%Math.max(1,r.height);sctx.fillStyle=i%2?'#fff':'#0b1020';sctx.fillRect(x,y,1,1)}if(curvature){const edge=sctx.createRadialGradient(r.width/2,r.height/2,Math.min(r.width,r.height)*.3,r.width/2,r.height/2,Math.max(r.width,r.height)*.72);edge.addColorStop(.62,'rgba(0,0,0,0)');edge.addColorStop(1,`rgba(0,0,0,${curvature})`);sctx.globalAlpha=1;sctx.fillStyle=edge;sctx.fillRect(0,0,r.width,r.height)}sctx.restore()}
 }
-function drawScene(){const r=sc.getBoundingClientRect(),layer=prepareSceneLayer(),world=editorWorldObjects(state.scene);layer.clearRect(0,0,r.width,r.height);sceneBackdrop(layer);[...world].sort((a,b)=>a.layer-b.layer).forEach(o=>drawObj(layer,o,sceneW2S));sctx.clearRect(0,0,r.width,r.height);applyScenePostProcess(r);if(state.sceneGrid){const o=sceneW2S(0,0),step=32*o.z;drawGrid(sctx,r.width,r.height,o,step<13?step*2:step)}if(state.playMode==='stopped'){world.filter(o=>o.__effectiveVisible!==false&&state.sceneSelectedIds.includes(o.id)).forEach(o=>drawPhysicsOverlay(sctx,o,sceneW2S));drawSelections(sctx,world,state.sceneSelectedIds,state.sceneSelected,sceneW2S,state.sceneTool);drawMarquee(sctx,state.sceneSelectionRect)}drawMini()}
+function sceneObjectsForDisplay(){return state.playMode==='stopped'||!state.runtimeScene?state.scene:state.runtimeScene}
+function drawScene(){const r=sc.getBoundingClientRect();if($('#sceneViewport').classList.contains('runtime-native')){sctx.clearRect(0,0,r.width,r.height);drawMini();return}const layer=prepareSceneLayer(),world=editorWorldObjects(sceneObjectsForDisplay());layer.clearRect(0,0,r.width,r.height);sceneBackdrop(layer);[...world].sort((a,b)=>a.layer-b.layer).forEach(o=>drawObj(layer,o,sceneW2S));sctx.clearRect(0,0,r.width,r.height);applyScenePostProcess(r);if(state.sceneGrid){const o=sceneW2S(0,0),step=32*o.z;drawGrid(sctx,r.width,r.height,o,step<13?step*2:step)}if(state.playMode==='stopped'){world.filter(o=>o.__effectiveVisible!==false&&state.sceneSelectedIds.includes(o.id)).forEach(o=>drawPhysicsOverlay(sctx,o,sceneW2S));drawSelections(sctx,world,state.sceneSelectedIds,state.sceneSelected,sceneW2S,state.sceneTool);drawMarquee(sctx,state.sceneSelectionRect)}drawMini()}
 function drawMini(){
- const sourceW=sc.width,sourceH=sc.height;
+ const runtimeCanvas=$('#sceneViewport').classList.contains('runtime-native')?$('#runtimeStage canvas'):null,source=runtimeCanvas||sc,sourceW=source.width,sourceH=source.height;
  mctx.save();
  mctx.setTransform(DPR,0,0,DPR,0,0);
  mctx.clearRect(0,0,145,85);
@@ -1098,7 +1137,7 @@ function drawMini(){
  if(sourceW&&sourceH){
    mctx.imageSmoothingEnabled=true;
    mctx.imageSmoothingQuality='high';
-   mctx.drawImage(sc,0,0,sourceW,sourceH,0,0,145,85);
+   try{mctx.drawImage(source,0,0,sourceW,sourceH,0,0,145,85)}catch{}
  }
  mctx.strokeStyle='rgba(255,255,255,.82)';mctx.lineWidth=1;
  mctx.strokeRect(.5,.5,144,84);
@@ -1127,7 +1166,7 @@ function bindCanvas(c,mode){
  const isScene=mode==='scene',arr=()=>isScene?state.scene:state.prefab,map=isScene?sceneW2S:prefabW2S,inv=isScene?sceneS2W:prefabS2W,selKey=isScene?'sceneSelected':'prefabSelected',intKey=isScene?'sceneInteraction':'prefabInteraction',toolKey=isScene?'sceneTool':'prefabTool';
  const pos=e=>{const r=c.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top}};
  c.onpointerdown=e=>{
-   if(authoringMutationBlocked())return;c.setPointerCapture(e.pointerId);const m=pos(e),tool=state[toolKey],ids=selectedIds(mode),objects=arr(),selected=objects.find(o=>o.id===state[selKey]),targets=topLevelTransformSelection(objects,ids),handleId=targets.includes(state[selKey])?state[selKey]:(targets.length===1?targets[0]:null),selectedWorld=handleId?editorWorldObject(objects,handleId):null,h=handleAt(selectedWorld,m.x,m.y,map),add=e.ctrlKey||e.metaKey;
+   if(state.playMode!=='stopped')return;c.setPointerCapture(e.pointerId);const m=pos(e),tool=state[toolKey],ids=selectedIds(mode),objects=arr(),selected=objects.find(o=>o.id===state[selKey]),targets=topLevelTransformSelection(objects,ids),handleId=targets.includes(state[selKey])?state[selKey]:(targets.length===1?targets[0]:null),selectedWorld=handleId?editorWorldObject(objects,handleId):null,h=handleAt(selectedWorld,m.x,m.y,map),add=e.ctrlKey||e.metaKey;
   if(e.button===1||tool==='pan'||e.altKey){state[intKey]={type:'pan',sx:m.x,sy:m.y,px:(isScene?state.scenePan:state.prefabPan).x,py:(isScene?state.scenePan:state.prefabPan).y};return}
   if(h&&selected&&tool!=='select'){const interaction=startEditorTransformInteraction(objects,mode,h.type,m,map,inv,state[selKey]);if(interaction){snapshot();state[intKey]=interaction}return}
   const hit=hitObject(objects,m.x,m.y,map);if(hit){if(add){const next=ids.includes(hit.id)?ids.filter(id=>id!==hit.id):[...ids,hit.id];setSelection(mode,next,hit.id);renderAll();return}if(!ids.includes(hit.id))setSelection(mode,[hit.id],hit.id);else state[selKey]=hit.id;if(['move','rotate','resize'].includes(tool)){const interaction=startEditorTransformInteraction(objects,mode,tool,m,map,inv,hit.id);if(interaction){snapshot();state[intKey]=interaction}}renderAll();return}
@@ -1135,7 +1174,7 @@ function bindCanvas(c,mode){
  };
  c.onpointermove=e=>{const it=state[intKey];if(!it)return;const m=pos(e);if(it.type==='pan'){let p=isScene?state.scenePan:state.prefabPan;p.x=it.px+m.x-it.sx;p.y=it.py+m.y-it.sy;return}if(it.type==='marquee'){const r=state[mode+'SelectionRect'];r.x2=m.x;r.y2=m.y;const hits=editorWorldObjects(arr()).filter(o=>o.__effectiveVisible&&!o.__effectiveLocked&&intersectsMarquee(o,r,map)).map(o=>o.id);setSelection(mode,[...new Set([...it.base,...hits])],hits.at(-1)||it.base.at(-1)||null);renderHierarchy();renderInspector();return}updateEditorTransformInteraction(it,arr(),m,map,inv,isScene);renderInspector()};
   c.onpointerup=()=>{const interaction=state[intKey];state[intKey]=null;state[mode+'SelectionRect']=null;if(state.playMode!=='stopped')return;if(isScene)syncEngineDocument();else ah2dBridge.sync(state);renderHierarchy();renderInspector();if(interaction?.invalid)toast('Transform cannot be preserved without introducing shear')};
- c.onwheel=e=>{e.preventDefault();if(isScene){state.sceneZoom=clamp(state.sceneZoom*(e.deltaY>0?.9:1.1),.25,4);$('#zoomLabel').textContent=Math.round(state.sceneZoom*100)+'%'}else{state.prefabZoom=clamp(state.prefabZoom*(e.deltaY>0?.9:1.1),.25,4);$('#prefabZoomLabel').textContent=Math.round(state.prefabZoom*100)+'%'}};
+ c.onwheel=e=>{e.preventDefault();if(state.playMode!=='stopped')return;if(isScene){state.sceneZoom=clamp(state.sceneZoom*(e.deltaY>0?.9:1.1),.25,4);$('#zoomLabel').textContent=Math.round(state.sceneZoom*100)+'%'}else{state.prefabZoom=clamp(state.prefabZoom*(e.deltaY>0?.9:1.1),.25,4);$('#prefabZoomLabel').textContent=Math.round(state.prefabZoom*100)+'%'}};
 }
 bindCanvas(sc,'scene');bindCanvas(pc,'prefab');
 
@@ -1147,9 +1186,9 @@ sc.addEventListener('pointerdown',e=>beginGizmo(e,sc,'scene'),true);pc.addEventL
 
 /* project dragging into scene */
 function addAssetToScene(a,w){if(authoringMutationBlocked())return false;snapshot();const s=a.size||[100,100],nextLayer=state.scene.length?Math.max(...state.scene.map(x=>Number.isFinite(x.layer)?x.layer:0))+1:0,o=entity(a.name,a.kind,a.icon,w.x,w.y,s[0],s[1],nextLayer,a.color||'#8999aa',{group:a.folder.split('/')[0],imageSrc:a.imageSrc||null,assetId:a.id});state.scene.push(o);setSelection('scene',[o.id],o.id);renderAll();return true}
-$('#sceneViewport').ondragover=e=>{e.preventDefault();$('#dropCover').classList.add('show')};
+$('#sceneViewport').ondragover=e=>{if(state.playMode!=='stopped')return;e.preventDefault();$('#dropCover').classList.add('show')};
 $('#sceneViewport').ondragleave=e=>{if(!$('#sceneViewport').contains(e.relatedTarget))$('#dropCover').classList.remove('show')};
-$('#sceneViewport').ondrop=e=>{e.preventDefault();$('#dropCover').classList.remove('show');const r=sc.getBoundingClientRect(),w=sceneS2W(e.clientX-r.left,e.clientY-r.top),id=e.dataTransfer.getData('text/asset');if(id){let a=state.assets.find(x=>x.id===id);if(a&&a.kind!=='animation')addAssetToScene(a,w)}else if(e.dataTransfer.files?.length)importImages(e.dataTransfer.files,w)};
+$('#sceneViewport').ondrop=e=>{e.preventDefault();$('#dropCover').classList.remove('show');if(authoringMutationBlocked())return;const r=sc.getBoundingClientRect(),w=sceneS2W(e.clientX-r.left,e.clientY-r.top),id=e.dataTransfer.getData('text/asset');if(id){let a=state.assets.find(x=>x.id===id);if(a&&a.kind!=='animation')addAssetToScene(a,w)}else if(e.dataTransfer.files?.length)importImages(e.dataTransfer.files,w)};
 
 /* animator */
 const frameIcons=['🛡️','🛡️','🛡️','🛡️','🛡️','🛡️','🛡️','🛡️','🛡️','🛡️','🛡️','🛡️'];
@@ -1194,7 +1233,7 @@ function renderHierarchy(){
   el.ondragover=e=>{const dragged=dragIds(e);if(dragged.length&&dragged.every(id=>canReparentEntity(arr,id,el.dataset.entity))){e.preventDefault();e.dataTransfer.dropEffect='move';el.classList.add('drop-target')}};
   el.ondragleave=()=>el.classList.remove('drop-target');
   el.ondrop=e=>{e.preventDefault();e.stopPropagation();el.classList.remove('drop-target');if(authoringMutationBlocked())return;const dragged=dragIds(e),targetId=el.dataset.entity;if(!dragged.length||!dragged.every(id=>canReparentEntity(arr,id,targetId))){toast('Cannot parent an object to itself or its descendant');return}const checkpoint=snapshot();if(reparentEditorEntities(arr,dragged,targetId)){state.openEntities[hierarchyEntityKey(mode,targetId)]=true;renderAll()}else{rollbackSnapshot(checkpoint);toast('Reparent cannot preserve this world transform without shear')}};
-  el.onclick=e=>{if(e.target.closest('button,.eye'))return;const id=el.dataset.entity,current=selectedIds(mode),add=e.ctrlKey||e.metaKey;if(add){const next=current.includes(id)?current.filter(x=>x!==id):[...current,id];setSelection(mode,next,id)}else setSelection(mode,[id],id);renderAll()};
+  el.onclick=e=>{if(e.target.closest('button,.eye')||state.playMode!=='stopped')return;const id=el.dataset.entity,current=selectedIds(mode),add=e.ctrlKey||e.metaKey;if(add){const next=current.includes(id)?current.filter(x=>x!==id):[...current,id];setSelection(mode,next,id)}else setSelection(mode,[id],id);renderAll()};
  });
  tree.ondragover=e=>{if(e.target.closest('[data-entity]'))return;const dragged=dragIds(e);if(dragged.length&&dragged.every(id=>canReparentEntity(arr,id,null))){e.preventDefault();tree.classList.add('root-drop-target')}};
  tree.ondragleave=e=>{if(!tree.contains(e.relatedTarget))tree.classList.remove('root-drop-target')};
@@ -1216,12 +1255,12 @@ function renderProject(){
    if(open)for(let sub of nested){let subName=sub.split('/')[1];html+=`<div class="tree-row folder-row ind1" data-folder="${esc(sub)}"><span class="folder">📁</span><span class="name">${esc(subName)}</span></div>`}
    let direct=assets.filter(a=>a.folder===top||!a.folder.includes('/'));
    let nestedAssets=assets.filter(a=>a.folder!==top&&a.folder.includes('/'));
-   const card=a=>{const src=safeImageSrc(a.imageSrc);return`<div class="asset-card" draggable="true" data-asset="${esc(a.id)}" title="${esc(String(a.folder||'')+'/'+String(a.name||''))}"><div class="asset-thumb">${src?`<img src="${esc(src)}" alt="">`:esc(a.icon||'◇')}</div><span>${esc(a.name)}</span></div>`};
+   const card=a=>{const src=safeImageSrc(a.imageSrc);return`<div class="asset-card" draggable="${state.playMode==='stopped'}" data-asset="${esc(a.id)}" title="${esc(String(a.folder||'')+'/'+String(a.name||''))}"><div class="asset-thumb">${src?`<img src="${esc(src)}" alt="">`:esc(a.icon||'◇')}</div><span>${esc(a.name)}</span></div>`};
    if(open){direct.forEach(a=>html+=card(a)); nestedAssets.forEach(a=>html+=card(a));}
  }
  tree.innerHTML=html;
  $$('[data-folder]').forEach(el=>el.onclick=()=>{const k='project:'+el.dataset.folder;state.openFolders[k]=state.openFolders[k]===false;renderProject()});
- $$('[data-asset]').forEach(el=>{el.ondragstart=e=>{e.dataTransfer.setData('text/asset',el.dataset.asset)};el.onclick=()=>{let a=state.assets.find(x=>x.id===el.dataset.asset);if(a?.kind==='animation'){activePage='animator';state.animator.clip=a.name.replace('.anim','');setPage('animator')}else if(a?.kind==='particle'){activePage='particle';state.particle.name=a.name;setPage('particle')}else if(a?.kind==='prefab'){activePage='prefab';setPage('prefab')}renderInspector()}});
+ $$('[data-asset]').forEach(el=>{el.ondragstart=e=>{if(state.playMode!=='stopped'){e.preventDefault();return}e.dataTransfer.setData('text/asset',el.dataset.asset)};el.onclick=()=>{if(state.playMode!=='stopped')return;let a=state.assets.find(x=>x.id===el.dataset.asset);if(a?.kind==='animation'){state.animator.clip=a.name.replace('.anim','');setPage('animator')}else if(a?.kind==='particle'){state.particle.name=a.name;setPage('particle')}else if(a?.kind==='prefab')setPage('prefab');renderInspector()}});
 }
 function renderPanelCollapse(){
  $('#hierPanel').classList.toggle('collapsed',state.hierarchyCollapsed);$('#projectPanel').classList.toggle('collapsed',state.projectCollapsed);
@@ -1242,13 +1281,13 @@ function renderPostProcessPanel(){
  const panel=$('#postProcessPanel'),master=$('#postProcessMaster'),list=$('#postProcessList');if(!panel||!master||!list)return;
  master.classList.toggle('on',state.postProcess.enabled!==false);master.setAttribute('aria-checked',state.postProcess.enabled!==false?'true':'false');$('#postProcessBtn').classList.toggle('active',panel.classList.contains('show')||state.postProcess.enabled!==false&&state.postProcess.effects.some(effect=>effect.enabled!==false));
  list.innerHTML=state.postProcess.effects.map(effect=>{const fields=POST_PROCESS_FIELDS[effect.type]||[];return`<div class="post-effect ${effect.enabled===false?'off':''}"><div class="post-effect-head"><div class="toggle ${effect.enabled===false?'':'on'}" data-post-toggle="${esc(effect.id)}" role="switch" aria-checked="${effect.enabled===false?'false':'true'}"></div><b>${esc(effect.name)}</b><small>${esc(effect.type)}</small></div><div class="post-effect-fields">${fields.map(([key,label,min,max,step])=>{const value=Number.isFinite(Number(effect[key]))?Number(effect[key]):min;return`<div class="post-param"><label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${value}" data-post-effect="${esc(effect.id)}" data-post-param="${key}"><span class="post-value" data-post-value="${esc(effect.id)}:${key}">${Math.round(value*100)/100}</span></div>`}).join('')}</div></div>`}).join('');
- $$('[data-post-toggle]').forEach(toggle=>toggle.onclick=()=>{const effect=state.postProcess.effects.find(item=>item.id===toggle.dataset.postToggle);if(!effect)return;snapshot();effect.enabled=effect.enabled===false;renderPostProcessPanel();syncPostProcess();drawScene()});
- $$('[data-post-param]').forEach(input=>{input.onpointerdown=()=>snapshot();input.onkeydown=e=>{if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','PageUp','PageDown'].includes(e.key)&&!input.dataset.keyboardSnapshot){snapshot();input.dataset.keyboardSnapshot='1'}};input.onblur=()=>delete input.dataset.keyboardSnapshot;input.oninput=()=>{const effect=state.postProcess.effects.find(item=>item.id===input.dataset.postEffect);if(!effect)return;effect[input.dataset.postParam]=Number(input.value);const key=effect.id+':'+input.dataset.postParam,output=$$('[data-post-value]').find(item=>item.dataset.postValue===key);if(output)output.textContent=String(Math.round(Number(input.value)*100)/100);syncPostProcess();drawScene()}});
+ $$('[data-post-toggle]').forEach(toggle=>toggle.onclick=()=>{if(authoringMutationBlocked())return;const effect=state.postProcess.effects.find(item=>item.id===toggle.dataset.postToggle);if(!effect)return;snapshot();effect.enabled=effect.enabled===false;renderPostProcessPanel();syncPostProcess();drawScene()});
+ $$('[data-post-param]').forEach(input=>{input.onpointerdown=()=>{if(!authoringMutationBlocked())snapshot()};input.onkeydown=e=>{if(state.playMode!=='stopped')return;if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','PageUp','PageDown'].includes(e.key)&&!input.dataset.keyboardSnapshot){snapshot();input.dataset.keyboardSnapshot='1'}};input.onblur=()=>delete input.dataset.keyboardSnapshot;input.oninput=()=>{if(authoringMutationBlocked())return;const effect=state.postProcess.effects.find(item=>item.id===input.dataset.postEffect);if(!effect)return;effect[input.dataset.postParam]=Number(input.value);const key=effect.id+':'+input.dataset.postParam,output=$$('[data-post-value]').find(item=>item.dataset.postValue===key);if(output)output.textContent=String(Math.round(Number(input.value)*100)/100);syncPostProcess();drawScene()}});
 }
 $('#postProcessBtn').onclick=e=>{e.stopPropagation();$('#postProcessPanel').classList.toggle('show');renderPostProcessPanel()};
 $('#postProcessClose').onclick=()=>{$('#postProcessPanel').classList.remove('show');renderPostProcessPanel()};
-$('#postProcessMaster').onclick=()=>{snapshot();state.postProcess.enabled=!state.postProcess.enabled;renderPostProcessPanel();syncPostProcess();drawScene()};
-$('#postProcessReset').onclick=()=>{snapshot();state.postProcess=createDefaultPostProcess();renderPostProcessPanel();syncPostProcess();drawScene();toast('Post Process defaults restored')};
+$('#postProcessMaster').onclick=()=>{if(authoringMutationBlocked())return;snapshot();state.postProcess.enabled=!state.postProcess.enabled;renderPostProcessPanel();syncPostProcess();drawScene()};
+$('#postProcessReset').onclick=()=>{if(authoringMutationBlocked())return;snapshot();state.postProcess=createDefaultPostProcess();renderPostProcessPanel();syncPostProcess();drawScene();toast('Post Process defaults restored')};
 
 /* inspector */
 function sec(title,body,open=true){return`<div class="section ${open?'':'closed'}"><div class="section-head">${esc(title)}</div><div class="props">${body}</div></div>`}
@@ -1283,10 +1322,10 @@ function renderInspector(){
  }
  const mode=activePage==='prefab'?'prefab':'scene',multiIds=selectedIds(mode);
  if(multiIds.length>1){const picked=currentObjects().filter(o=>multiIds.includes(o.id));$('#inspectorIcon').textContent='▦';$('#inspectorName').textContent=`${picked.length} objects selected`;$('#inspectorSub').textContent='Multi-selection';root.innerHTML=sec('Selection',`<div class="small">${picked.map(o=>esc(o.name)).join(' • ')}</div>`)+sec('Group Actions',`<div class="small">Drag any selected object to move the group. Press Delete to remove all selected objects, or Escape to clear selection.</div>`);bindSections();return}
- let o=selectedObject();
+ const inspectorObjects=activePage==='edit'&&state.playMode!=='stopped'&&state.runtimeScene?state.runtimeScene:currentObjects();let o=inspectorObjects.find(item=>item.id===(activePage==='prefab'?state.prefabSelected:state.sceneSelected))||selectedObject();
  if(!o){$('#inspectorIcon').textContent='◇';$('#inspectorName').textContent='Scene';$('#inspectorSub').textContent='Physics & Document Settings';root.innerHTML=sec('Physics World',`<div class="row"><label>Backend</label><div class="field">Box2D / ${esc(ah2dEngine.physics?.backend||'builtin')}</div></div>`+compXY('world','Gravity',['x',state.worldGravity.x],['y',state.worldGravity.y])+compRow('world','Pixels / metre','pixelsPerMeter',ah2dEngine.physics?.pixelsPerMeter||100,.001,1))+sec('Document','<div class="small">Select a Game Object to edit Transform, Rigidbody and Collider components.</div>');bindWorldPhysics();return}
- $('#inspectorIcon').textContent=o.icon;$('#inspectorName').textContent=o.name;$('#inspectorSub').textContent=activePage==='prefab'?(o.component||o.kind):'Game Object';
- const local=editorLocalTransform(o),world=editorWorldObject(currentObjects(),o),round=value=>Math.round((Number(value)||0)*1000)/1000,parent=currentObjects().find(item=>item.id===o.parentId);
+ $('#inspectorIcon').textContent=o.icon;$('#inspectorName').textContent=o.name;$('#inspectorSub').textContent=activePage==='prefab'?(o.component||o.kind):state.playMode==='stopped'?'Game Object':'Runtime Game Object · Read only';
+ const local=editorLocalTransform(o),world=editorWorldObject(inspectorObjects,o),round=value=>Math.round((Number(value)||0)*1000)/1000,parent=inspectorObjects.find(item=>item.id===o.parentId);
  let html=sec('Transform · Local',xy('Position',['x',round(local.x)],['y',round(local.y)])+row('Rotation','rot',round(local.rot))+xy('Scale',['sx',round(local.sx)],['sy',round(local.sy)])+`<div class="row"><label>World Position</label><div class="xy"><div class="field">X ${round(world?.x)}</div><div class="field">Y ${round(world?.y)}</div></div></div><div class="row"><label>World Rotation</label><div class="field">${round(world?.rot)}°</div></div><div class="row"><label>World Scale</label><div class="xy"><div class="field">X ${round(world?.sx)}</div><div class="field">Y ${round(world?.sy)}</div></div></div>${parent?`<div class="row"><label>Parent</label><div class="field">${esc(parent.name)}</div></div>`:''}`);
  if(['character','platform','tree','lamp','crate','prop'].includes(o.kind))html+=sec('Sprite',`<div class="row"><label>Asset</label><div class="field">${esc(o.assetId||o.name)}</div></div><div class="row"><label>Color</label><input class="field" data-prop="color" type="color" value="${/^#[0-9a-f]{6}$/i.test(o.color)?o.color:'#ffffff'}"></div>`+row('Layer','layer',o.layer));
  if(o.kind==='collider'||o.kind==='hitbox')html+=sec(o.component||o.kind,`<div class="row"><label>Shape</label><select class="field"><option>Rectangle</option><option>Circle</option></select></div>`+xy('Size',['w',Math.round(o.w)],['h',Math.round(o.h)]));
@@ -1326,9 +1365,10 @@ function bindInspector(){
 
 /* workspaces / panels */
 function setPage(page){
+ if(state.playMode!=='stopped'&&page!=='edit'){toast('Stop Preview before leaving the Scene');return false}
  activePage=page;$$('.ws').forEach(b=>b.classList.toggle('active',b.dataset.page===page));$$('.workspace-page').forEach(p=>p.classList.toggle('active',p.dataset.page===page));
  $('#hierarchyTitle');
- renderHierarchy();renderProject();renderInspector();resizeAll()
+ renderHierarchy();renderProject();renderInspector();resizeAll();return true
 }
 $$('.ws').forEach(b=>b.onclick=()=>setPage(b.dataset.page));
 $('#leftHandle').onclick=()=>{state.leftClosed=!state.leftClosed;body.classList.toggle('left-closed',state.leftClosed);leftbar.classList.toggle('closed',state.leftClosed);$('#leftHandle').textContent=state.leftClosed?'›':'‹';resizeAll()};
@@ -1336,9 +1376,9 @@ $('#rightHandle').onclick=()=>{state.rightClosed=!state.rightClosed;body.classLi
 $('#assetSize').oninput=()=>{state.projectSize=+$('#assetSize').value;renderProject()};
 $('#hierSearch').oninput=renderHierarchy;$('#projectSearch').oninput=renderProject;
 $('#addEntityBtn').onclick=()=>{if(authoringMutationBlocked())return;if(activePage==='prefab'){snapshot();let o=entity('Node','anchor','⌖',0,0,24,24,state.prefab.length+1,'#6c9fff',{component:'Anchor'});state.prefab.push(o);setSelection('prefab',[o.id],o.id)}else{snapshot();let o=entity('Marker','prop','◎',960,540,40,40,6,'#6f91ff',{group:'Scene'});state.scene.push(o);setSelection('scene',[o.id],o.id)}renderAll()};
-$('#newFolderBtn').onclick=()=>{$('#folderModal').classList.add('show');$('#folderName').value='';setTimeout(()=>$('#folderName').focus(),30)};
+$('#newFolderBtn').onclick=()=>{if(authoringMutationBlocked())return;$('#folderModal').classList.add('show');$('#folderName').value='';setTimeout(()=>$('#folderName').focus(),30)};
 $$('[data-close-modal]').forEach(b=>b.onclick=()=>b.closest('.modal-backdrop')?.classList.remove('show'));
-$('#createFolder').onclick=()=>{let n=$('#folderName').value.trim();if(n&&!state.folders.includes(n)){state.folders.push(n);renderProject();toast('Folder created')}$('#folderModal').classList.remove('show')};
+$('#createFolder').onclick=()=>{if(authoringMutationBlocked())return;let n=$('#folderName').value.trim();if(n&&!state.folders.includes(n)){state.folders.push(n);renderProject();toast('Folder created')}$('#folderModal').classList.remove('show')};
 $('#sceneSelect').onchange=e=>switchScene(e.target.value);
 $('#newSceneBtn').onclick=openSceneModal;$('#saveSceneBtn').onclick=saveCurrentScene;
 $('#createSceneBtn').onclick=()=>{const name=$('#sceneName').value.trim();if(!name){toast('Enter a Scene name');$('#sceneName').focus();return}$('#sceneModal').classList.remove('show');createScene(name)};
@@ -1367,7 +1407,7 @@ function serializedScenes(){
 }
 function projectData(){const scenes=serializedScenes(),active=scenes.find(scene=>scene.id===state.currentSceneId)||scenes[0];return{format:'AH2D',version:4,dataModel:{...dataModelDescriptor},project:{name:state.projectName},engine:{name:'AH2D Engine',version:AH2D.VERSION,renderer:state.runtime,runtime:state.runtime,runtimeBackend:ah2dEngine.runtime?.backend||'editor-bridge',physics:'box2d',physicsBackend:ah2dEngine.physics?.backend||'builtin',gravity:state.worldGravity,pixelsPerMeter:ah2dEngine.physics?.pixelsPerMeter||100,compatibleRuntimes:['pixijs','phaserjs','custom']},meta:{name:state.projectName,units:'px',currentSceneId:state.currentSceneId},currentSceneId:state.currentSceneId,scenes,scene:cloneData(active?.objects||[]),postProcess:cloneData(state.postProcess),assets:state.assets.filter(a=>a.imageSrc).map(a=>({id:a.id,name:a.name,folder:a.folder,kind:a.kind,imageSrc:a.imageSrc,size:a.size})),folders:state.folders,prefab:prepareEditorEntities(state.prefab),animations:[{name:'Knight_Run',fps:12,frames:12,loop:true,events:[{frame:4,name:'Footstep'},{frame:9,name:'Footstep'}]}],particles:state.particleIncluded?[state.particle]:[]}}
 function dl(name,type,data){let a=document.createElement('a'),u=URL.createObjectURL(new Blob([data],{type}));a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000)}
-function saveLocal(message='Project saved'){commitActiveScene();try{localStorage.setItem(PROJECT_STORAGE_KEY,JSON.stringify(projectData()))}catch{}toast(message)}
+function saveLocal(message='Project saved'){if(authoringMutationBlocked())return false;commitActiveScene();try{localStorage.setItem(PROJECT_STORAGE_KEY,JSON.stringify(projectData()))}catch{}toast(message);return true}
 function exportProject(){dl('AH2D_Project.json','application/json',JSON.stringify(projectData(),null,2));toast('Universal JSON exported')}
 function exportParticle(){dl(state.particle.name+'.particle.json','application/json',JSON.stringify({format:'AH2D.Particle',version:1,...state.particle},null,2))}
 function exportAnimation(){dl(state.animator.clip+'.animation.json','application/json',JSON.stringify({format:'AH2D.Animation',version:1,name:state.animator.clip,fps:12,frames:12,loop:true,events:[{frame:4,name:'Footstep'},{frame:9,name:'Footstep'}]},null,2))}
@@ -1393,8 +1433,8 @@ function stageLoadedProject(d){
  return{projectName:String(d.project?.name||d.meta?.name||'Untitled Project').slice(0,80),scenes,currentSceneId,active,prefab,folders,assets,particle,particleIncluded,postProcess,worldGravity,pixelsPerMeter,runtime:d.engine?.runtime,hierarchyRepairs};
 }
 function loadProject(d){
+ if(state.playMode!=='stopped'){toast('Stop Preview before loading a Project');return null}
  const next=stageLoadedProject(d);
- if(state.playMode!=='stopped')stopPlayMode(true);
  state.projectName=next.projectName;$('#projectTitle').textContent=state.projectName+'⌄';
  state.scenes=next.scenes;state.currentSceneId=next.currentSceneId;state.scene=hydrateEditorObjects(cloneData(next.active.objects));state.sceneZoom=next.active.view.zoom;state.scenePan=cloneData(next.active.view.pan);$('#zoomLabel').textContent=Math.round(state.sceneZoom*100)+'%';
  state.prefab=hydrateEditorObjects(cloneData(next.prefab));state.folders=next.folders;state.assets=next.assets;state.particle=next.particle;state.particleIncluded=next.particleIncluded;
@@ -1403,11 +1443,11 @@ function loadProject(d){
  resetSceneSession();setSelection('prefab',[]);renderAll();
  const repairs=next.hierarchyRepairs;toast(repairs?`${state.scenes.length} Scene${state.scenes.length===1?'':'s'} loaded · repaired ${repairs} invalid hierarchy link${repairs===1?'':'s'}`:`${state.scenes.length} Scene${state.scenes.length===1?'':'s'} loaded`);
 }
-function newProject(){if(state.playMode!=='stopped')stopPlayMode(true);state.projectName='Untitled Project';$('#projectTitle').textContent=state.projectName+'⌄';state.scene=cloneData(starterSceneTemplate);state.prefab=[];state.particle=createDefaultParticle();state.particleIncluded=false;state.sceneZoom=1;state.scenePan={x:0,y:0};state.postProcess=createDefaultPostProcess();state.currentSceneId=uid();state.scenes=[{id:state.currentSceneId,name:'Main Scene',objects:cloneData(state.scene),updatedAt:Date.now(),view:{zoom:1,pan:{x:0,y:0}}}];resetSceneSession();setSelection('prefab',[]);$('#zoomLabel').textContent='100%';renderAll();toast('New project')}
-function importImages(files,world=null){[...files].filter(f=>f.type.startsWith('image/')).forEach((f,idx)=>{let fr=new FileReader();fr.onload=()=>{let im=new Image();im.onload=()=>{let scale=Math.min(1,240/Math.max(im.naturalWidth,im.naturalHeight)),a={id:uid(),name:f.name.replace(/\.[^.]+$/,''),folder:'Imported',kind:'prop',icon:'🖼️',color:'#fff',size:[Math.max(16,Math.round(im.naturalWidth*scale)),Math.max(16,Math.round(im.naturalHeight*scale))],imageSrc:fr.result};if(!state.folders.includes('Imported'))state.folders.push('Imported');state.assets.push(a);renderProject();if(world&&idx===0)addAssetToScene(a,world)};im.src=fr.result};fr.readAsDataURL(f)})}
+function newProject(){if(authoringMutationBlocked())return;state.projectName='Untitled Project';$('#projectTitle').textContent=state.projectName+'⌄';state.scene=cloneData(starterSceneTemplate);state.prefab=[];state.particle=createDefaultParticle();state.particleIncluded=false;state.sceneZoom=1;state.scenePan={x:0,y:0};state.postProcess=createDefaultPostProcess();state.currentSceneId=uid();state.scenes=[{id:state.currentSceneId,name:'Main Scene',objects:cloneData(state.scene),updatedAt:Date.now(),view:{zoom:1,pan:{x:0,y:0}}}];resetSceneSession();setSelection('prefab',[]);$('#zoomLabel').textContent='100%';renderAll();toast('New project')}
+function importImages(files,world=null){if(authoringMutationBlocked())return false;[...files].filter(f=>f.type.startsWith('image/')).forEach((f,idx)=>{let fr=new FileReader();fr.onload=()=>{if(state.playMode!=='stopped')return;let im=new Image();im.onload=()=>{if(state.playMode!=='stopped')return;let scale=Math.min(1,240/Math.max(im.naturalWidth,im.naturalHeight)),a={id:uid(),name:f.name.replace(/\.[^.]+$/,''),folder:'Imported',kind:'prop',icon:'🖼️',color:'#fff',size:[Math.max(16,Math.round(im.naturalWidth*scale)),Math.max(16,Math.round(im.naturalHeight*scale))],imageSrc:fr.result};if(!state.folders.includes('Imported'))state.folders.push('Imported');state.assets.push(a);renderProject();if(world&&idx===0)addAssetToScene(a,world)};im.src=fr.result};fr.readAsDataURL(f)});return true}
 $('#imageInput').onchange=e=>{importImages(e.target.files);e.target.value=''};
 $('#projectInput').onchange=e=>{let f=e.target.files[0];if(!f)return;let fr=new FileReader();fr.onload=()=>{try{loadProject(JSON.parse(fr.result))}catch(error){toast(error?.message||'Invalid project file')}};fr.readAsText(f);e.target.value=''};
-$$('[data-menu]').forEach(b=>b.onclick=()=>{const action=b.dataset.menu;$('#appMenu').classList.remove('show');if(action==='new')newProject();else if(action==='new-scene')openSceneModal();else if(action==='save-scene')saveCurrentScene();else if(action==='import')$('#imageInput').click();else if(action==='save')saveLocal();else if(action==='load')$('#projectInput').click();else if(action==='export')exportProject();else if(action==='recent'){try{const stored=localStorage.getItem(PROJECT_STORAGE_KEY)||localStorage.getItem(LEGACY_STORAGE_KEY);stored?loadProject(JSON.parse(stored)):toast('No recent project')}catch{toast('Recent projects are unavailable in this secure workspace')}}else if(action==='settings')toast('Project settings are stored in AH2D JSON');else if(action==='about')toast('AH2D — framework-neutral 2D authoring editor')});
+$$('[data-menu]').forEach(b=>b.onclick=()=>{const action=b.dataset.menu;$('#appMenu').classList.remove('show');if(state.playMode!=='stopped'&&['new','new-scene','save-scene','import','save','load','recent'].includes(action)){toast('Stop Preview before changing the Project');return}if(action==='new')newProject();else if(action==='new-scene')openSceneModal();else if(action==='save-scene')saveCurrentScene();else if(action==='import')$('#imageInput').click();else if(action==='save')saveLocal();else if(action==='load')$('#projectInput').click();else if(action==='export')exportProject();else if(action==='recent'){try{const stored=localStorage.getItem(PROJECT_STORAGE_KEY)||localStorage.getItem(LEGACY_STORAGE_KEY);stored?loadProject(JSON.parse(stored)):toast('No recent project')}catch{toast('Recent projects are unavailable in this secure workspace')}}else if(action==='settings')toast('Project settings are stored in AH2D JSON');else if(action==='about')toast('AH2D — framework-neutral 2D authoring editor')});
 $('#projectTitle').onclick=()=>toast(state.projectName);
 
 /* buttons */
@@ -1426,11 +1466,11 @@ $('#addCollider').onclick=()=>{if(authoringMutationBlocked())return;snapshot();l
 $('#addSocket').onclick=()=>{if(authoringMutationBlocked())return;snapshot();let o=entity('Socket '+(state.prefab.length+1),'socket','◎',100,0,24,24,state.prefab.length+1,'#ffc34f',{component:'Socket'});state.prefab.push(o);setSelection('prefab',[o.id],o.id);renderAll()};
 
 /* keyboard */
-document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;let mod=e.ctrlKey||e.metaKey;if(mod&&e.key.toLowerCase()==='s'){e.preventDefault();saveLocal()}if(mod&&e.key.toLowerCase()==='o'){e.preventDefault();$('#projectInput').click()}if(mod&&e.key.toLowerCase()==='i'){e.preventDefault();$('#imageInput').click()}if(mod&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redo():undo()}if(mod&&e.key.toLowerCase()==='a'&&(activePage==='edit'||activePage==='prefab')){e.preventDefault();const mode=activePage==='prefab'?'prefab':'scene',objects=mode==='prefab'?state.prefab:state.scene,graph=buildEditorSceneGraph(objects),ids=objects.filter(o=>graph.visibleById.get(o.id)&&!editorEntityLocked(o)).map(o=>o.id);setSelection(mode,ids,ids.at(-1));renderAll()}if(e.key==='Escape'){setSelection(activePage==='prefab'?'prefab':'scene',[]);renderAll()}if(e.key==='Delete'||e.key==='Backspace'){const mode=activePage==='prefab'?'prefab':'scene',objects=mode==='prefab'?state.prefab:state.scene,ids=selectedIds(mode).filter(id=>{const entity=objects.find(o=>o.id===id);return entity&&!editorEntityLocked(entity)});if(ids.length){e.preventDefault();if(authoringMutationBlocked())return;const checkpoint=snapshot();if(removeEditorEntities(objects,ids)){setSelection(mode,[]);renderAll()}else{rollbackSnapshot(checkpoint);toast('Remove would require an unsupported sheared transform')}}}});
+document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;let mod=e.ctrlKey||e.metaKey;if(state.playMode!=='stopped'){if(mod||['Delete','Backspace','Escape'].includes(e.key)){e.preventDefault();toast('Stop Preview before editing')}return}if(mod&&e.key.toLowerCase()==='s'){e.preventDefault();saveLocal()}if(mod&&e.key.toLowerCase()==='o'){e.preventDefault();$('#projectInput').click()}if(mod&&e.key.toLowerCase()==='i'){e.preventDefault();$('#imageInput').click()}if(mod&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redo():undo()}if(mod&&e.key.toLowerCase()==='a'&&(activePage==='edit'||activePage==='prefab')){e.preventDefault();const mode=activePage==='prefab'?'prefab':'scene',objects=mode==='prefab'?state.prefab:state.scene,graph=buildEditorSceneGraph(objects),ids=objects.filter(o=>graph.visibleById.get(o.id)&&!editorEntityLocked(o)).map(o=>o.id);setSelection(mode,ids,ids.at(-1));renderAll()}if(e.key==='Escape'){setSelection(activePage==='prefab'?'prefab':'scene',[]);renderAll()}if(e.key==='Delete'||e.key==='Backspace'){const mode=activePage==='prefab'?'prefab':'scene',objects=mode==='prefab'?state.prefab:state.scene,ids=selectedIds(mode).filter(id=>{const entity=objects.find(o=>o.id===id);return entity&&!editorEntityLocked(entity)});if(ids.length){e.preventDefault();const checkpoint=snapshot();if(removeEditorEntities(objects,ids)){setSelection(mode,[]);renderAll()}else{rollbackSnapshot(checkpoint);toast('Remove would require an unsupported sheared transform')}}}});
 
 /* animation / main loop */
 document.addEventListener('input',e=>{const i=e.target;if(i.matches('[data-prop][type="color"]')){const o=selectedObject();if(o&&!editorEntityLocked(o)&&!authoringMutationBlocked()){o.color=i.value;drawScene();drawPrefab()}}});
-function renderAll(){if(state.playMode==='stopped')syncEngineDocument();else syncEngineComponents();renderHierarchy();renderProject();renderInspector();renderSceneSwitcher();renderPostProcessPanel()}
+function renderAll(){if(state.playMode==='stopped')syncEngineDocument();renderHierarchy();renderProject();renderInspector();renderSceneSwitcher();renderPostProcessPanel()}
 let animAcc=0;
 function loop(now){let dt=Math.min(.04,(now-loop.last)/1000||0);loop.last=now;updatePlaySimulation(dt);if(state.animator.playing){animAcc+=dt;if(animAcc>=1/state.animator.fps){animAcc=0;setFrame(state.animator.frame+1)}}updateParticles(now);drawScene();drawPrefab();drawParticles();drawCurves();requestAnimationFrame(loop)}loop.last=performance.now();requestAnimationFrame(loop);
 
@@ -1439,7 +1479,7 @@ const hierMenu=document.createElement('div');hierMenu.className='hier-context';h
 let clipObject=null,cmId=null,cmMode='scene';
 document.addEventListener('click',()=>hierMenu.classList.remove('show'));
 document.addEventListener('contextmenu',e=>{
- const row=e.target.closest('[data-entity]');if(!row)return;e.preventDefault();cmId=row.dataset.entity;cmMode=activePage==='prefab'?'prefab':'scene';const objects=cmMode==='prefab'?state.prefab:state.scene,target=objects.find(x=>x.id===cmId),isPrefab=Boolean(target&&(target.prefab||target.kind==='prefab')),ub=hierMenu.querySelector('[data-cm="unpack"]'),mb=hierMenu.querySelector('[data-cm="makeprefab"]');
+ const row=e.target.closest('[data-entity]');if(!row)return;e.preventDefault();if(state.playMode!=='stopped'){toast('Stop Preview before editing the hierarchy');return}cmId=row.dataset.entity;cmMode=activePage==='prefab'?'prefab':'scene';const objects=cmMode==='prefab'?state.prefab:state.scene,target=objects.find(x=>x.id===cmId),isPrefab=Boolean(target&&(target.prefab||target.kind==='prefab')),ub=hierMenu.querySelector('[data-cm="unpack"]'),mb=hierMenu.querySelector('[data-cm="makeprefab"]');
  if(ub)ub.style.display=cmMode==='scene'&&isPrefab?'block':'none';if(mb)mb.style.display=cmMode==='scene'&&target&&!isPrefab?'block':'none';hierMenu.style.left=e.clientX+'px';hierMenu.style.top=e.clientY+'px';hierMenu.classList.add('show');
 });
 hierMenu.onclick=e=>{
@@ -1457,11 +1497,11 @@ hierMenu.onclick=e=>{
  hierMenu.classList.remove('show');
 };
 const panKeys={};let panRAF=0;
-function smoothPan(){const sp=panKeys.shift?18:8,dx=(panKeys.ArrowLeft?sp:0)-(panKeys.ArrowRight?sp:0),dy=(panKeys.ArrowUp?sp:0)-(panKeys.ArrowDown?sp:0);if(dx||dy){state.scenePan.x+=dx;state.scenePan.y+=dy;drawScene();panRAF=requestAnimationFrame(smoothPan)}else panRAF=0}
-window.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)){e.preventDefault();panKeys[e.key]=true;panKeys.shift=e.shiftKey;if(!panRAF)panRAF=requestAnimationFrame(smoothPan)}});
+function smoothPan(){if(state.playMode!=='stopped'){for(const key of Object.keys(panKeys))panKeys[key]=false;panRAF=0;return}const sp=panKeys.shift?18:8,dx=(panKeys.ArrowLeft?sp:0)-(panKeys.ArrowRight?sp:0),dy=(panKeys.ArrowUp?sp:0)-(panKeys.ArrowDown?sp:0);if(dx||dy){state.scenePan.x+=dx;state.scenePan.y+=dy;drawScene();panRAF=requestAnimationFrame(smoothPan)}else panRAF=0}
+window.addEventListener('keydown',e=>{if(state.playMode!=='stopped'||['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)){e.preventDefault();panKeys[e.key]=true;panKeys.shift=e.shiftKey;if(!panRAF)panRAF=requestAnimationFrame(smoothPan)}});
 window.addEventListener('keyup',e=>{if(panKeys[e.key]!==undefined)panKeys[e.key]=false;if(e.key==='Shift')panKeys.shift=false});
 function focusEditorSelection(){
- const mode=activePage==='prefab'?'prefab':'scene';if(activePage!=='edit'&&activePage!=='prefab')return false;const objects=mode==='prefab'?state.prefab:state.scene,center=selectedWorldCenter(objects,selectedIds(mode));if(!center)return false;const canvas=mode==='scene'?sc:pc,map=mode==='scene'?sceneW2S:prefabW2S,p=map(center.x,center.y),rect=canvas.getBoundingClientRect(),pan=mode==='scene'?state.scenePan:state.prefabPan;pan.x+=rect.width/2-p.x;pan.y+=rect.height/2-p.y;if(mode==='scene')drawScene();else drawPrefab();return true;
+ if(state.playMode!=='stopped')return false;const mode=activePage==='prefab'?'prefab':'scene';if(activePage!=='edit'&&activePage!=='prefab')return false;const objects=mode==='prefab'?state.prefab:state.scene,center=selectedWorldCenter(objects,selectedIds(mode));if(!center)return false;const canvas=mode==='scene'?sc:pc,map=mode==='scene'?sceneW2S:prefabW2S,p=map(center.x,center.y),rect=canvas.getBoundingClientRect(),pan=mode==='scene'?state.scenePan:state.prefabPan;pan.x+=rect.width/2-p.x;pan.y+=rect.height/2-p.y;if(mode==='scene')drawScene();else drawPrefab();return true;
 }
 window.addEventListener('keydown',e=>{if(e.code!=='Space'&&e.key.toLowerCase()!=='f')return;if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;if(focusEditorSelection()){e.preventDefault();e.stopImmediatePropagation()}},{capture:true});/* init */
 renderPanelCollapse();selectRuntime(state.runtime,true);updateRuntimeControls();renderAll();setFrame(0);setPage('edit');

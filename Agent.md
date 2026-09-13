@@ -394,22 +394,48 @@ Read `Transform.world` and `Renderable` for every visible Entity. `Transform.wor
 
 Skip Entities with the `Hidden` component. Keep loaded `Image`, `Texture`, and GPU resources in a renderer-owned cache keyed by `assetId` or `imageSrc`.
 
-### PixiJS and PhaserJS
+### PixiJS
 
-Selecting these runtimes does not automatically create Sprite objects. The game host must:
-
-1. Create renderer-native objects for ECS Entities.
-2. Cache them by Entity ID.
-3. Copy Transform/Renderable state each frame.
-4. Remove native objects when Entities disappear.
-5. Apply Camera, Light, Shadow, Animation, and Particle data as supported by that runtime.
+AH2D ships with PixiJS v8 as a dependency and its `pixijs` adapter owns the base ECS-to-display mapping. In a plain Browser page load the scripts in this order: `pixi.min.js`, `AH2DDataModel.js`, then `AH2DEngine.js`. With a bundler, import `pixi.js` and pass its namespace explicitly.
 
 ```js
-engine.useRuntime('pixijs', { PIXI: window.PIXI });
-console.log(engine.runtime.backend); // pixijs or editor-bridge
+engine.useRuntime('pixijs', {
+  PIXI,
+  designWidth: 1920,
+  designHeight: 1080,
+  fit: 'contain',
+  backgroundAlpha: 0,
+  textureResolver(renderable, entityId, engine, PIXI) {
+    return renderable.assetId
+      ? PIXI.Assets.load(`/assets/${renderable.assetId}.png`)
+      : null;
+  }
+});
+
+engine.start(target, { restoreOnStop: true });
+await engine.runtime.ready;
 ```
 
-If the library is unavailable, `runtime.backend` reports `editor-bridge`. Do not claim native rendering based only on `runtime.name`.
+The adapter creates one `PIXI.Container` for every Scene Graph Entity, mirrors parent/child links, applies exact local matrices, and creates a centered `PIXI.Sprite` or a color `PIXI.Graphics` child for `Renderable`. It reconciles Entity creation, deletion, reparenting, `Hidden`, `Renderable.visible`, and layer order on render. Do not add a second host loop that duplicates this synchronization.
+
+The default texture path is `Renderable.imageSrc`, then the matching `assetId` in `engine.document.assets`, then a directly usable `assetId`. Loading uses `PIXI.Assets.load()` and is asynchronous. A `textureResolver(renderable, entityId, engine, PIXI)` may return a Texture, a Promise for one, or a preloaded alias. Keep global `PIXI.Assets` ownership in the game host; the adapter deliberately does not destroy shared textures when an Entity disappears. Use `loadAssets: false` only when the host has preloaded every source.
+
+Use `designWidth`/`designHeight` or `viewport: { width, height, fit }` for the logical viewport. Supported fit modes are `none`, `contain`, `cover`, and `stretch`. The active Camera matrix and zoom are applied automatically; a Camera component with `active: true` is the fallback when `engine.camera.active` is unset. The target resizes automatically unless `resizeTo: false` is passed. `backgroundAlpha`, `clearColor`, and `applicationOptions` configure application creation.
+
+`engine.start()` returns synchronously while PixiJS v8 initializes asynchronously. Await `engine.runtime.ready` before reading the canvas or Display Tree. Pixi's own ticker is stopped; the AH2D Engine loop performs exactly one update and one render per Frame. `pause()` freezes the same mounted tree, `resume()` continues it, and `stop()` unmounts it. By default Stop restores the pre-Play ECS/Physics state as well as the original Universal document and active Scene, so subsequent `loadScene()` remains valid. Use `restoreOnStop: false`, `stop({ restore: false })`, or `snapshot: false` only deliberately.
+
+If PixiJS is unavailable or initialization fails, `runtime.backend` reports `editor-bridge` and `runtime.native` is false. Do not claim native rendering based only on `runtime.name`. Handle `runtime:error`, `runtime:fallback`, and `runtime:textureError` when the host needs error UI or recovery.
+
+PixiJS currently maps Transform, Renderable, Hidden, hierarchy, Camera, and resize. Animation frame slicing, Particle rendering, Light/Shadow, Tilemap drawing, and Post Process filters remain host responsibilities.
+
+### PhaserJS
+
+Phaser remains host-owned. Selecting `phaserjs` reports native availability when `Phaser.Game` exists, but the project must create and cache Game Objects, synchronize ECS Transform/Renderable state, remove stale objects, and apply Camera, Light, Shadow, Animation, Particle, Tilemap, and Post Process behavior.
+
+```js
+engine.useRuntime('phaserjs', { Phaser: window.Phaser });
+console.log(engine.runtime.backend); // phaserjs or editor-bridge
+```
 
 ## Animation, prefab, and particle rules
 
@@ -424,6 +450,8 @@ If the library is unavailable, `runtime.backend` reports `editor-bridge`. Do not
 Browser bootstrap:
 
 ```html
+<!-- Required before the Engine when the native PixiJS runtime is selected. -->
+<script src="./node_modules/pixi.js/dist/pixi.min.js"></script>
 <script src="./engine/AH2DDataModel.js"></script>
 <script src="./engine/AH2DEngine.js"></script>
 ```

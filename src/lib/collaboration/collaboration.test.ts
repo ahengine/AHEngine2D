@@ -363,10 +363,14 @@ async function main(): Promise<void> {
     ));
     assert.equal(frameResponse.status, 200);
     const frameSource = await frameResponse.text();
+    const framePixiIndex = frameSource.indexOf("var PIXI=(function");
     const frameDataModelIndex = frameSource.indexOf("root.AH2DDataModel = api");
     const frameRuntimeIndex = frameSource.indexOf("const DataModel = global.AH2DDataModel");
+    assert(framePixiIndex >= 0);
     assert(frameDataModelIndex >= 0);
     assert(frameRuntimeIndex > frameDataModelIndex);
+    assert(frameDataModelIndex > framePixiIndex);
+    assert.equal(frameSource.includes('<script src="./node_modules/pixi.js/dist/pixi.min.js"></script>'), false);
     assert.equal(frameSource.includes('<script src="./engine/AH2DEngine.js"></script>'), false);
     assert.equal(frameSource.includes('<script src="./engine/AH2DDataModel.js"></script>'), false);
 

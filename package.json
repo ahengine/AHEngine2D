@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "next": "16.3.5",
+    "pixi.js": "8.20.1",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },

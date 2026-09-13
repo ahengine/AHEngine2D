@@ -1709,16 +1709,536 @@
   }
 
   class PixiRuntimeAdapter extends RuntimeAdapter {
-    constructor(PIXI = global.PIXI) { super('pixijs'); this.PIXI = PIXI; this.objects = new Map(); this.native = Boolean(PIXI?.Application); this.backend = this.native ? 'pixijs' : 'editor-bridge'; }
-    mount(engine, target) {
-      super.mount(engine, target);
-      /* The editor owns its preview canvas. A host that provides PIXI can consume the
-         ECS through this adapter without the adapter inserting a second canvas. */
-      this.native = Boolean(this.PIXI?.Application);
+    constructor(PIXI = global.PIXI, options = {}) {
+      super('pixijs');
+      this.PIXI = PIXI;
+      this.options = { ...options };
+      delete this.options.PIXI;
+      this.objects = new Map();
+      this.nodes = new Map();
+      this.textureLoads = new Map();
+      this.app = null;
+      this.world = null;
+      this.ready = Promise.resolve(this);
+      this.error = null;
+      this._mounted = false;
+      this._mountGeneration = 0;
+      this._ownsApplication = !this.options.application;
+      this._appendedCanvas = null;
+      this.native = this._supportsNative();
       this.backend = this.native ? 'pixijs' : 'editor-bridge';
     }
-    render() { /* Entities are intentionally mapped by the host project. */ }
-    destroy() { this.app?.destroy?.(true); this.objects.clear(); super.destroy(); }
+    _supportsNative() {
+      return Boolean(
+        this.PIXI?.Container && this.PIXI?.Sprite &&
+        (this.options.application || this.PIXI?.Application)
+      );
+    }
+    _isCanvas(target) {
+      return String(target?.nodeName || target?.tagName || '').toUpperCase() === 'CANVAS';
+    }
+    _applicationOptions(target) {
+      const viewport = this.options.viewport || {};
+      const targetIsCanvas = this._isCanvas(target);
+      const width = finite(this.options.width ?? target?.clientWidth ?? viewport.width ?? this.options.designWidth, 0);
+      const height = finite(this.options.height ?? target?.clientHeight ?? viewport.height ?? this.options.designHeight, 0);
+      const output = {
+        autoStart: false,
+        antialias: this.options.antialias !== false,
+        autoDensity: this.options.autoDensity !== false,
+        backgroundAlpha: this.options.backgroundAlpha ?? 0,
+        resolution: finite(this.options.resolution, global.devicePixelRatio || 1) || 1
+      };
+      if (width > 0) output.width = width;
+      if (height > 0) output.height = height;
+      if (targetIsCanvas) { output.canvas = target; output.view = target; }
+      else if (target && this.options.resizeTo !== false) output.resizeTo = target;
+      // AH2D owns the only frame loop. Never allow Pixi's ticker to start a
+      // second simulation/render loop through nested application options.
+      return { ...output, ...(this.options.applicationOptions || {}), autoStart: false };
+    }
+    _createApplication(target) {
+      if (this.options.application) return { app: this.options.application, initialized: null };
+      const applicationOptions = this._applicationOptions(target);
+      const usesAsyncInit = typeof this.PIXI.Application?.prototype?.init === 'function';
+      if (usesAsyncInit) {
+        const app = new this.PIXI.Application();
+        return { app, initialized: app.init(applicationOptions) };
+      }
+      return { app: new this.PIXI.Application(applicationOptions), initialized: null };
+    }
+    _canvas() { return this.app?.canvas || this.app?.view || null; }
+    _appendCanvas() {
+      const canvas = this._canvas();
+      if (!canvas || this._isCanvas(this.target) || typeof this.target?.appendChild !== 'function') return;
+      if (canvas.parentNode !== this.target) {
+        this.target.appendChild(canvas);
+        this._appendedCanvas = canvas;
+      }
+    }
+    _finishMount(generation) {
+      if (generation !== this._mountGeneration || !this.app) return this;
+      const stage = this.app.stage;
+      if (!stage || typeof stage.addChild !== 'function') throw new Error('PixiJS Application did not provide a usable stage');
+      this.app.stop?.();
+      this.app.ticker?.stop?.();
+      stage.sortableChildren = true;
+      this.world = new this.PIXI.Container();
+      this.world.label = this.world.label || 'AH2D World';
+      this.world.name = this.world.name || 'AH2D World';
+      this.world.sortableChildren = true;
+      stage.addChild(this.world);
+      this._appendCanvas();
+      this._mounted = true;
+      this.error = null;
+      this.native = true;
+      this.backend = 'pixijs';
+      this._syncScene();
+      this._renderApplication();
+      this.engine?.events.emit('runtime:ready', { runtime: this, engine: this.engine });
+      return this;
+    }
+    _fallback(error, generation) {
+      if (generation !== this._mountGeneration) return this;
+      this.error = error;
+      this._mounted = false;
+      this.native = false;
+      this.backend = 'editor-bridge';
+      this._disposeApplication();
+      this.engine?.events.emit('runtime:fallback', { runtime: this, error, engine: this.engine });
+      return this;
+    }
+    mount(engine, target) {
+      if (this._mounted && this.engine === engine && this.target === target && this.app) {
+        this._syncScene();
+        this._renderApplication();
+        return this;
+      }
+      this._disposeApplication();
+      super.mount(engine, target);
+      this._ownsApplication = !this.options.application;
+      this.native = this._supportsNative();
+      this.backend = this.native ? 'pixijs' : 'editor-bridge';
+      this.error = null;
+      const generation = ++this._mountGeneration;
+      if (!this.native) {
+        this.ready = Promise.resolve(this);
+        return this;
+      }
+      try {
+        const created = this._createApplication(target);
+        this.app = created.app;
+        const ownsApplication = this._ownsApplication;
+        if (created.initialized && typeof created.initialized.then === 'function') {
+          this.ready = Promise.resolve(created.initialized)
+            .then(() => {
+              if (generation !== this._mountGeneration || this.app !== created.app) {
+                if (ownsApplication) this._destroyPixiApplication(created.app);
+                return this;
+              }
+              return this._finishMount(generation);
+            })
+            .catch(error => {
+              if (generation !== this._mountGeneration || this.app !== created.app) {
+                if (ownsApplication) this._destroyPixiApplication(created.app);
+                return this;
+              }
+              return this._fallback(error, generation);
+            });
+        } else {
+          this._finishMount(generation);
+          this.ready = Promise.resolve(this);
+        }
+      } catch (error) {
+        this._fallback(error, generation);
+        this.ready = Promise.resolve(this);
+      }
+      return this;
+    }
+    _container(name) {
+      const container = new this.PIXI.Container();
+      container.label = container.label || name;
+      container.name = container.name || name;
+      container.sortableChildren = true;
+      return container;
+    }
+    _ensureNode(id) {
+      let record = this.nodes.get(id);
+      if (record) return record;
+      const node = this._container(`AH2D Entity ${id}`);
+      const visualHost = this._container(`AH2D Visual ${id}`);
+      const childrenHost = this._container(`AH2D Children ${id}`);
+      visualHost.sortableChildren = false;
+      node.addChild(visualHost);
+      node.addChild(childrenHost);
+      record = { node, visualHost, childrenHost, visual: null, visualKind: null, sourceKey: null, textureGeneration: 0 };
+      this.nodes.set(id, record);
+      return record;
+    }
+    _removeNode(id) {
+      const record = this.nodes.get(id);
+      if (!record) return;
+      record.textureGeneration += 1;
+      // Entity nodes live below their parent's childrenHost. Detach them before
+      // destroying this record so deleting/reparenting a parent cannot
+      // recursively destroy DisplayObjects that still exist in the ECS graph.
+      for (const childNode of [...(record.childrenHost?.children || [])]) {
+        record.childrenHost.removeChild?.(childNode);
+        this.world?.addChild?.(childNode);
+      }
+      record.node.parent?.removeChild?.(record.node);
+      record.node.destroy?.({ children: true, texture: false, textureSource: false, baseTexture: false });
+      this.nodes.delete(id);
+      this.objects.delete(id);
+    }
+    _setChildIndex(parent, child, index) {
+      if (!parent || child.parent !== parent || typeof parent.setChildIndex !== 'function') return;
+      const current = typeof parent.getChildIndex === 'function' ? parent.getChildIndex(child) : -1;
+      if (current !== index) parent.setChildIndex(child, index);
+    }
+    _syncHierarchy(ids) {
+      const live = new Set(ids);
+      for (const id of [...this.nodes.keys()]) if (!live.has(id)) this._removeNode(id);
+      ids.forEach(id => this._ensureNode(id));
+      for (const id of ids) {
+        const record = this.nodes.get(id);
+        const parentId = this.engine.graph.getParent(id);
+        const target = parentId == null ? this.world : this.nodes.get(parentId)?.childrenHost;
+        if (target && record.node.parent !== target) target.addChild(record.node);
+      }
+      const roots = this.engine.graph.roots(ids);
+      roots.forEach((id, index) => this._setChildIndex(this.world, this.nodes.get(id)?.node, index));
+      for (const id of ids) {
+        const host = this.nodes.get(id)?.childrenHost;
+        this.engine.graph.getChildren(id).filter(child => live.has(child)).forEach((child, index) => {
+          this._setChildIndex(host, this.nodes.get(child)?.node, index);
+        });
+      }
+    }
+    _nativeMatrix(values) {
+      if (this.PIXI.Matrix) return new this.PIXI.Matrix(values[0], values[1], values[2], values[3], values[4], values[5]);
+      return { a: values[0], b: values[1], c: values[2], d: values[3], tx: values[4], ty: values[5] };
+    }
+    _applyMatrix(displayObject, values, fallbackTransform = null) {
+      const nativeMatrix = this._nativeMatrix(values);
+      if (typeof displayObject.setFromMatrix === 'function') displayObject.setFromMatrix(nativeMatrix);
+      else if (typeof displayObject.transform?.setFromMatrix === 'function') displayObject.transform.setFromMatrix(nativeMatrix);
+      else {
+        const local = fallbackTransform || decompose(values, { strict: false });
+        if (displayObject.position?.set) displayObject.position.set(local.x, local.y);
+        else { displayObject.x = local.x; displayObject.y = local.y; }
+        displayObject.rotation = finite(local.rotation, 0) * DEG_TO_RAD;
+        if (displayObject.scale?.set) displayObject.scale.set(finite(local.scaleX, 1), finite(local.scaleY, 1));
+        else { displayObject.scaleX = finite(local.scaleX, 1); displayObject.scaleY = finite(local.scaleY, 1); }
+      }
+    }
+    _localFromWorld(id) {
+      const world = this.engine.transform.getWorldMatrix(id);
+      const parentId = this.engine.graph.getParent(id);
+      if (parentId == null) return world;
+      try { return multiply(invert(this.engine.transform.getWorldMatrix(parentId)), world); }
+      catch (_) { return this.engine.transform.getLocalMatrix(id); }
+    }
+    _color(value, fallback = 0xffffff) {
+      if (value == null || value === '') return fallback;
+      if (Number.isFinite(Number(value))) return Number(value);
+      const source = String(value).trim();
+      if (/^#[0-9a-f]{3}$/i.test(source)) return Number.parseInt(source.slice(1).split('').map(part => part + part).join(''), 16);
+      if (/^#[0-9a-f]{6}$/i.test(source)) return Number.parseInt(source.slice(1), 16);
+      try {
+        const color = this.PIXI.Color ? new this.PIXI.Color(source) : null;
+        return color?.toNumber?.() ?? color?.toNumber ?? source;
+      } catch (_) { return fallback; }
+    }
+    _whiteTexture() { return this.PIXI.Texture?.WHITE || this.PIXI.Texture?.EMPTY || null; }
+    _assetSource(assetId) {
+      if (!assetId || !this.engine?.document?.assets) return null;
+      if (this._assetDocument !== this.engine.document) {
+        this._assetDocument = this.engine.document;
+        this._assetIndex = new Map();
+        const stack = [this.engine.document.assets], seen = new Set();
+        while (stack.length) {
+          const value = stack.pop();
+          if (!value || typeof value !== 'object' || seen.has(value)) continue;
+          seen.add(value);
+          if (!Array.isArray(value) && value.id != null) {
+            const source = value.imageSrc ?? value.src ?? value.url ?? value.dataUrl ?? value.dataURI;
+            if (source != null && source !== '') this._assetIndex.set(String(value.id), source);
+          }
+          if (Array.isArray(value)) value.forEach(item => stack.push(item));
+          else Object.values(value).forEach(item => { if (item && typeof item === 'object') stack.push(item); });
+        }
+      }
+      return this._assetIndex.get(String(assetId)) ?? null;
+    }
+    _textureSource(renderable) {
+      const source = renderable.imageSrc || this._assetSource(renderable.assetId) || renderable.assetId || null;
+      return {
+        key: `${renderable.assetId || ''}|${source == null ? '' : String(source)}`,
+        source,
+        hasTexture: source != null && source !== ''
+      };
+    }
+    _resolveTexture(renderable, id, source) {
+      const assets = this.PIXI.Assets;
+      const cached = (renderable.assetId && assets?.get?.(renderable.assetId)) ||
+        (source != null && source !== '' && assets?.get?.(source));
+      let resolved;
+      if (this.options.textureResolver) resolved = this.options.textureResolver(renderable, id, this.engine, this.PIXI);
+      else if (cached) resolved = cached;
+      else if (source != null && source !== '' && this.options.loadAssets !== false && assets?.load) {
+        if (!this.textureLoads.has(source)) {
+          const loading = assets.load(source);
+          this.textureLoads.set(source, loading);
+          if (loading && typeof loading.then === 'function') {
+            Promise.resolve(loading).catch(() => {
+              if (this.textureLoads.get(source) === loading) this.textureLoads.delete(source);
+            });
+          }
+        }
+        resolved = this.textureLoads.get(source);
+      } else resolved = source;
+      if (resolved == null || resolved === '') return this._whiteTexture();
+      if (typeof resolved === 'string' && this.PIXI.Texture?.from) return this.PIXI.Texture.from(resolved);
+      return resolved;
+    }
+    _createSprite(texture) {
+      try { return new this.PIXI.Sprite(texture || this._whiteTexture()); }
+      catch (_) { return new this.PIXI.Sprite({ texture: texture || this._whiteTexture() }); }
+    }
+    _destroyVisual(record) {
+      if (!record.visual) return;
+      record.visualHost.removeChild?.(record.visual);
+      record.visual.destroy?.({ texture: false, textureSource: false, baseTexture: false });
+      record.visual = null;
+      record.visualKind = null;
+      record.textureGeneration += 1;
+    }
+    _createVisual(record, kind) {
+      if (record.visual && record.visualKind === kind) return record.visual;
+      this._destroyVisual(record);
+      record.visual = kind === 'graphics'
+        ? new this.PIXI.Graphics()
+        : this._createSprite(this._whiteTexture());
+      record.visualKind = kind;
+      record.visualHost.addChild(record.visual);
+      return record.visual;
+    }
+    _setTexture(record, renderable, id) {
+      const { key, source, hasTexture } = this._textureSource(renderable);
+      if (record.sourceKey === key && record.visual) return;
+      record.sourceKey = key;
+      record.textureGeneration += 1;
+      if (!hasTexture && this.PIXI.Graphics) {
+        this._createVisual(record, 'graphics');
+        this.objects.set(id, record.visual);
+        return;
+      }
+      let resolved;
+      try { resolved = this._resolveTexture(renderable, id, source); }
+      catch (error) {
+        resolved = this._whiteTexture();
+        this.engine.events.emit('runtime:textureError', { runtime: this, entityId: id, source, error, engine: this.engine });
+      }
+      this._createVisual(record, 'sprite');
+      this.objects.set(id, record.visual);
+      const textureGeneration = ++record.textureGeneration;
+      if (resolved && typeof resolved.then === 'function') {
+        record.visual.texture = this._whiteTexture();
+        Promise.resolve(resolved).then(texture => {
+          if (this.nodes.get(id) !== record || record.textureGeneration !== textureGeneration || record.sourceKey !== key) return;
+          record.visual.texture = typeof texture === 'string' && this.PIXI.Texture?.from ? this.PIXI.Texture.from(texture) : (texture || this._whiteTexture());
+          this._renderApplication();
+        }).catch(error => {
+          if (this.nodes.get(id) === record && record.textureGeneration === textureGeneration) {
+            this.engine.events.emit('runtime:textureError', { runtime: this, entityId: id, source, error, engine: this.engine });
+          }
+        });
+      } else record.visual.texture = resolved || this._whiteTexture();
+    }
+    _drawGraphics(graphics, width, height, color, anchorX = 0.5, anchorY = 0.5) {
+      graphics.clear?.();
+      const x = -width * anchorX, y = -height * anchorY;
+      if (typeof graphics.rect === 'function' && typeof graphics.fill === 'function') {
+        graphics.rect(x, y, width, height).fill(color);
+      } else {
+        graphics.beginFill?.(color);
+        graphics.drawRect?.(x, y, width, height);
+        graphics.endFill?.();
+      }
+    }
+    _syncRenderable(id, record) {
+      const renderable = this.engine.ecs.get(id, 'Renderable');
+      if (!renderable) {
+        if (record.visual) {
+          this._destroyVisual(record);
+          record.sourceKey = null;
+          this.objects.delete(id);
+        }
+        record.node.visible = !this.engine.ecs.has(id, 'Hidden');
+        record.node.zIndex = 0;
+        return;
+      }
+      this._setTexture(record, renderable, id);
+      const visual = record.visual;
+      const anchor = renderable.anchor;
+      const anchorX = finite(renderable.anchorX ?? (Array.isArray(anchor) ? anchor[0] : anchor?.x), finite(this.options.defaultAnchor, 0.5));
+      const anchorY = finite(renderable.anchorY ?? (Array.isArray(anchor) ? anchor[1] : anchor?.y), finite(this.options.defaultAnchor, 0.5));
+      visual.anchor?.set?.(anchorX, anchorY);
+      const width = finite(renderable.width, 64);
+      const height = finite(renderable.height, 64);
+      const color = this._color(renderable.tint ?? renderable.color, 0xffffff);
+      if (record.visualKind === 'graphics') this._drawGraphics(visual, width, height, color, anchorX, anchorY);
+      else {
+        if (width >= 0) visual.width = width;
+        if (height >= 0) visual.height = height;
+        visual.tint = color;
+      }
+      visual.alpha = clamp(finite(renderable.alpha ?? renderable.opacity, 1), 0, 1);
+      visual.blendMode = renderable.blendMode ?? 'normal';
+      record.node.visible = !(this.engine.ecs.has(id, 'Hidden') || renderable.visible === false);
+      record.node.alpha = 1;
+      record.node.zIndex = finite(renderable.zIndex ?? renderable.zOrder ?? renderable.layer, 0);
+    }
+    _rendererSize() {
+      const renderer = this.app?.renderer;
+      const screen = this.app?.screen || renderer?.screen;
+      return {
+        width: finite(screen?.width ?? renderer?.width ?? this.target?.clientWidth ?? this.options.width, 0),
+        height: finite(screen?.height ?? renderer?.height ?? this.target?.clientHeight ?? this.options.height, 0)
+      };
+    }
+    _resizeRenderer() {
+      if (this.options.resizeTo === false || this._isCanvas(this.target)) return;
+      const width = finite(this.target?.clientWidth, 0), height = finite(this.target?.clientHeight, 0);
+      const current = this._rendererSize();
+      if (width > 0 && height > 0 && (Math.abs(current.width - width) > 0.5 || Math.abs(current.height - height) > 0.5)) {
+        this.app?.renderer?.resize?.(width, height);
+      }
+    }
+    _activeCamera() {
+      const explicit = this.engine.camera.active;
+      if (explicit && this.engine.ecs.has(explicit, 'Camera')) return explicit;
+      return this.engine.ecs.query('Camera').find(id => this.engine.ecs.get(id, 'Camera')?.active === true) || null;
+    }
+    _syncViewport() {
+      this._resizeRenderer();
+      const size = this._rendererSize();
+      const cameraId = this._activeCamera();
+      const camera = cameraId ? this.engine.ecs.get(cameraId, 'Camera') : null;
+      const configured = this.options.viewport || {};
+      const logicalWidth = finite(
+        camera?.viewportWidth ?? configured.width ?? this.options.viewportWidth ?? this.options.designWidth,
+        size.width
+      ) || size.width || 1;
+      const logicalHeight = finite(
+        camera?.viewportHeight ?? configured.height ?? this.options.viewportHeight ?? this.options.designHeight,
+        size.height
+      ) || size.height || 1;
+      const hasDesignViewport = Boolean(
+        this.options.viewport || this.options.viewportWidth || this.options.viewportHeight ||
+        this.options.designWidth || this.options.designHeight
+      );
+      const fit = camera?.fit || configured.fit || this.options.fit || (hasDesignViewport ? 'contain' : 'none');
+      let fitX = 1, fitY = 1;
+      if (size.width > 0 && size.height > 0 && logicalWidth > 0 && logicalHeight > 0) {
+        if (fit === 'stretch') { fitX = size.width / logicalWidth; fitY = size.height / logicalHeight; }
+        else if (fit === 'contain' || fit === 'cover') {
+          const scale = fit === 'cover'
+            ? Math.max(size.width / logicalWidth, size.height / logicalHeight)
+            : Math.min(size.width / logicalWidth, size.height / logicalHeight);
+          fitX = scale; fitY = scale;
+        }
+      }
+      const offsetX = (size.width - logicalWidth * fitX) / 2;
+      const offsetY = (size.height - logicalHeight * fitY) / 2;
+      let view = [fitX, 0, 0, fitY, offsetX, offsetY];
+      if (cameraId) {
+        const zoom = finite(camera?.zoom, 1) || 1;
+        const cameraWorld = this.engine.transform.getWorldMatrix(cameraId);
+        const logicalView = multiply(matrix(logicalWidth / 2, logicalHeight / 2, 0, zoom, zoom), invert(cameraWorld));
+        view = multiply(view, logicalView);
+      }
+      this._applyMatrix(this.world, view);
+      const clearColor = camera?.clearColor ?? this.options.clearColor;
+      const renderer = this.app?.renderer;
+      if (clearColor != null) {
+        const color = this._color(clearColor, 0x000000);
+        if (renderer?.background) renderer.background.color = color;
+        else if (renderer) renderer.backgroundColor = color;
+      }
+    }
+    _syncScene() {
+      if (!this._mounted || !this.engine || !this.world) return false;
+      this.engine.transform.update();
+      const ids = this.engine.graph.traverse();
+      this._syncHierarchy(ids);
+      for (const id of ids) {
+        const record = this.nodes.get(id);
+        const transform = this.engine.ecs.get(id, 'Transform');
+        this._applyMatrix(record.node, this._localFromWorld(id), transform);
+        this._syncRenderable(id, record);
+      }
+      this._syncViewport();
+      return true;
+    }
+    _renderApplication() {
+      if (!this._mounted || !this.app) return false;
+      if (typeof this.app.render === 'function') this.app.render();
+      else if (typeof this.app.renderer?.render === 'function') {
+        try { this.app.renderer.render(this.app.stage); }
+        catch (_) { this.app.renderer.render({ container: this.app.stage }); }
+      }
+      return true;
+    }
+    render() {
+      if (!this._syncScene()) return false;
+      return this._renderApplication();
+    }
+    resize(width, height) {
+      this.app?.renderer?.resize?.(finite(width, 0), finite(height, 0));
+      if (this._mounted) { this._syncViewport(); this._renderApplication(); }
+      return this;
+    }
+    _destroyPixiApplication(app) {
+      if (!app) return;
+      const canvas = app.canvas || app.view || null;
+      try { app.destroy?.(true, { children: true, texture: false, textureSource: false, baseTexture: false }); }
+      catch (_) { try { app.destroy?.({ removeView: true }, { children: true, texture: false, textureSource: false, baseTexture: false }); } catch (_) { /* Best-effort across Pixi versions. */ } }
+      if (canvas?.parentNode && typeof canvas.parentNode.removeChild === 'function') canvas.parentNode.removeChild(canvas);
+    }
+    _disposeApplication() {
+      this._mounted = false;
+      for (const id of [...this.nodes.keys()]) this._removeNode(id);
+      if (this.world) {
+        this.world.parent?.removeChild?.(this.world);
+        this.world.destroy?.({ children: true, texture: false, textureSource: false, baseTexture: false });
+      }
+      const app = this.app;
+      const appendedCanvas = this._appendedCanvas;
+      this.world = null;
+      this.app = null;
+      this._appendedCanvas = null;
+      this.objects.clear();
+      this.nodes.clear();
+      this.textureLoads.clear();
+      this._assetDocument = null;
+      this._assetIndex = null;
+      if (app && this._ownsApplication) this._destroyPixiApplication(app);
+      else if (appendedCanvas?.parentNode && typeof appendedCanvas.parentNode.removeChild === 'function') appendedCanvas.parentNode.removeChild(appendedCanvas);
+    }
+    unmount() {
+      ++this._mountGeneration;
+      this._disposeApplication();
+      this.ready = Promise.resolve(this);
+      return this;
+    }
+    destroy() {
+      this.unmount();
+      this.error = null;
+      super.destroy();
+      return this;
+    }
   }
 
   class PhaserRuntimeAdapter extends RuntimeAdapter {
@@ -1803,7 +2323,7 @@
       const target = this.runtimeTarget;
       this.runtime?.destroy();
       if (type instanceof RuntimeAdapter) this.runtime = type;
-      else if (type === 'pixijs') this.runtime = new PixiRuntimeAdapter(options.PIXI);
+      else if (type === 'pixijs') this.runtime = new PixiRuntimeAdapter(options.PIXI, options);
       else if (type === 'phaserjs') this.runtime = new PhaserRuntimeAdapter(options.Phaser);
       else this.runtime = new CustomRuntimeAdapter(options);
       if (this.running && target) this.runtime.mount(this, target);
@@ -2059,16 +2579,23 @@
     captureSnapshot() {
       this.transform.update();
       return {
-        document: clone(this.export()),
+        document: clone(this.document || this.export()),
+        runtime: clone(this.export()),
         physics: clone(this.physics.snapshot()),
         animationTime: this.animation.time,
-        activeCamera: this.camera.active
+        activeCamera: this.camera.active,
+        activeSceneId: this.activeSceneId
       };
     }
     restoreSnapshot(snapshot = this.playSnapshot) {
       if (!snapshot) return false;
-      const document = snapshot.document || snapshot;
-      this.load(clone(document));
+      const runtime = snapshot.runtime || snapshot.document || snapshot;
+      const authoringDocument = snapshot.runtime && snapshot.document ? clone(snapshot.document) : null;
+      this.load(clone(runtime));
+      if (authoringDocument) {
+        this.document = authoringDocument;
+        this.activeSceneId = snapshot.activeSceneId || authoringDocument.currentSceneId || null;
+      }
       this.animation.time = finite(snapshot.animationTime, 0);
       this.camera.active = snapshot.activeCamera || null;
       this.transform.update();
@@ -2081,9 +2608,19 @@
     }
     frame = time => {
       if (!this.running) return;
-      const dt = Math.min(0.05, (time - this.lastTime) / 1000 || 0);
-      this.lastTime = time; this.update(dt); this.runtime?.render(1);
-      this.frameHandle = this._requestFrame(this.frame);
+      try {
+        const dt = Math.min(0.05, (time - this.lastTime) / 1000 || 0);
+        this.lastTime = time;
+        this.update(dt);
+        if (!this.running) return;
+        this.runtime?.render(1);
+        if (this.running) this.frameHandle = this._requestFrame(this.frame);
+      } catch (error) {
+        this.running = false;
+        this.frameHandle = null;
+        try { this.runtime?.unmount?.(); } catch (_) { /* Preserve the frame error. */ }
+        try { this.events.emit('runtime:error', { runtime: this.runtime, error, engine: this }); } catch (_) { /* Preserve the frame error. */ }
+      }
     };
     _requestFrame(callback) {
       if (typeof global.requestAnimationFrame === 'function') return global.requestAnimationFrame(callback);
@@ -2130,9 +2667,15 @@
       this.running = false;
       this._cancelFrame(this.frameHandle); this.frameHandle = null;
       const shouldRestore = options.restore ?? this.restoreOnStop;
-      if (shouldRestore && this.playSnapshot) this.restoreSnapshot(this.playSnapshot);
-      this.events.emit('runtime:stop', { restored: Boolean(shouldRestore && this.playSnapshot), wasRunning, engine: this });
+      let stopError = null;
+      const retainError = error => { if (!stopError) stopError = error; };
+      try { if (shouldRestore && this.playSnapshot) this.restoreSnapshot(this.playSnapshot); } catch (error) { retainError(error); }
+      try { this.runtime?.unmount?.(); } catch (error) { retainError(error); }
+      try {
+        this.events.emit('runtime:stop', { restored: Boolean(shouldRestore && this.playSnapshot), wasRunning, engine: this });
+      } catch (error) { retainError(error); }
       if (!options.keepSnapshot) this.playSnapshot = null;
+      if (stopError) throw stopError;
       return this;
     }
   }

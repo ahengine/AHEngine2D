@@ -1436,6 +1436,453 @@ const testNativeBox2DPath = () => {
   assert.notStrictEqual(scaledCircleBody, initialCircleBody, 'inherited scale must rebuild native circle geometry');
 };
 
+const deferred = () => {
+  let resolve, reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+};
+
+const flushPromises = () => new Promise(resolve => setImmediate(resolve));
+
+const createFakePixi = ({ asyncInit = false, initDeferred = null, assetDeferred = null, assetLoader = null, assetCache = null } = {}) => {
+  const applications = [], assetLoads = [];
+  class Matrix {
+    constructor(a = 1, b = 0, c = 0, d = 1, tx = 0, ty = 0) {
+      Object.assign(this, { a, b, c, d, tx, ty });
+    }
+  }
+  class Container {
+    constructor() {
+      this.children = [];
+      this.parent = null;
+      this.localMatrix = [1, 0, 0, 1, 0, 0];
+      this.visible = true;
+      this.alpha = 1;
+      this.zIndex = 0;
+    }
+    addChild(child) {
+      child.parent?.removeChild?.(child);
+      this.children.push(child);
+      child.parent = this;
+      return child;
+    }
+    removeChild(child) {
+      const index = this.children.indexOf(child);
+      if (index >= 0) this.children.splice(index, 1);
+      if (child.parent === this) child.parent = null;
+      return child;
+    }
+    getChildIndex(child) { return this.children.indexOf(child); }
+    setChildIndex(child, index) {
+      const current = this.children.indexOf(child);
+      if (current < 0) return;
+      this.children.splice(current, 1);
+      this.children.splice(index, 0, child);
+    }
+    setFromMatrix(value) { this.localMatrix = [value.a, value.b, value.c, value.d, value.tx, value.ty]; }
+    destroy(options = {}) {
+      this.destroyed = true;
+      if (options.children) [...this.children].forEach(child => child.destroy?.(options));
+      [...this.children].forEach(child => this.removeChild(child));
+    }
+  }
+  class Sprite {
+    constructor(value) {
+      this.texture = value?.texture || value;
+      this.parent = null;
+      this.anchor = { x: 0, y: 0, set: (x, y) => { this.anchor.x = x; this.anchor.y = y; } };
+      this.alpha = 1;
+      this.tint = 0xffffff;
+    }
+    destroy() { this.destroyed = true; }
+  }
+  class Graphics {
+    constructor() { this.parent = null; this.commands = []; this.alpha = 1; }
+    clear() { this.commands = []; return this; }
+    rect(x, y, width, height) { this.pendingRect = { x, y, width, height }; return this; }
+    fill(color) { this.commands.push({ ...this.pendingRect, color }); return this; }
+    destroy() { this.destroyed = true; }
+  }
+  const setupApplication = (app, options = {}) => {
+    app.stage = new Container();
+    app.canvas = { nodeName: 'CANVAS', parentNode: null };
+    const screen = { width: options.width || 800, height: options.height || 600 };
+    app.renderer = {
+      screen,
+      background: {},
+      resize(width, height) { screen.width = width; screen.height = height; }
+    };
+    app.screen = screen;
+    app.ticker = { stopped: false, stop() { this.stopped = true; } };
+    app.renderCount = 0;
+    app.render = () => { app.renderCount += 1; };
+    app.stop = () => { app.stopped = true; };
+    app.destroy = () => { app.destroyed = true; app.destroyCount = (app.destroyCount || 0) + 1; };
+  };
+  let Application;
+  if (asyncInit) {
+    Application = class {
+      constructor() { applications.push(this); }
+      destroy() { this.destroyed = true; this.destroyCount = (this.destroyCount || 0) + 1; }
+      init(options) {
+        this.initOptions = options;
+        const pending = initDeferred ? initDeferred.promise : Promise.resolve();
+        return pending.then(() => { setupApplication(this, options); });
+      }
+    };
+  } else {
+    Application = class {
+      constructor(options) { this.initOptions = options; setupApplication(this, options); applications.push(this); }
+    };
+  }
+  const Texture = {
+    WHITE: { id: 'white' },
+    from(source) { return { id: String(source) }; }
+  };
+  const Assets = {
+    get(key) { return assetCache?.get(key) || null; },
+    load(source) {
+      assetLoads.push(source);
+      if (assetLoader) return assetLoader(source);
+      return assetDeferred ? assetDeferred.promise : Promise.resolve({ id: String(source) });
+    }
+  };
+  return { Application, Container, Sprite, Graphics, Matrix, Texture, Assets, applications, assetLoads };
+};
+
+const fakeHost = (width = 960, height = 600) => ({
+  clientWidth: width,
+  clientHeight: height,
+  children: [],
+  appendChild(child) {
+    child.parentNode?.removeChild?.(child);
+    this.children.push(child);
+    child.parentNode = this;
+  },
+  removeChild(child) {
+    const index = this.children.indexOf(child);
+    if (index >= 0) this.children.splice(index, 1);
+    if (child.parentNode === this) child.parentNode = null;
+  }
+});
+
+const testPixiV8AsyncMountAndNativeScene = async () => {
+  const initDeferred = deferred();
+  const PIXI = createFakePixi({ asyncInit: true, initDeferred });
+  const host = fakeHost(640, 360);
+  const engine = new AH2D.Engine({
+    physics: 'builtin',
+    runtime: 'pixijs',
+    runtimeOptions: { PIXI, applicationOptions: { autoStart: true } }
+  });
+  engine.load({
+    format: 'AH2D',
+    version: 4,
+    assets: [{ id: 'hero-image', imageSrc: '/textures/hero.png' }],
+    scene: [
+      {
+        id: 'native-parent',
+        components: {
+          Transform: { x: 20, y: 30, rotation: 30, scaleX: 2, scaleY: 3 },
+          Renderable: { width: 80, height: 40, color: '#336699', layer: 2 }
+        }
+      },
+      {
+        id: 'native-child',
+        parentId: 'native-parent',
+        components: {
+          Transform: { x: 7, y: -4, rotation: -15, scaleX: 0.5, scaleY: 1.25 },
+          Renderable: { assetId: 'hero-image', width: 32, height: 18, anchorX: 0.25, anchorY: 0.75, layer: 5 }
+        }
+      }
+    ]
+  });
+
+  const readyEvents = [];
+  engine.events.on('runtime:ready', event => readyEvents.push(event));
+  engine.start(host, { restoreOnStop: false });
+  const runtime = engine.runtime;
+  const app = PIXI.applications[0];
+  const ready = runtime.ready;
+
+  assert.ok(app, 'Pixi v8 Application must be constructed before asynchronous init');
+  assert.strictEqual(app.initOptions.autoStart, false, 'Pixi must not run a second ticker-driven game loop');
+  assert.strictEqual(app.initOptions.resizeTo, host, 'a host element must be supplied as the Pixi resize target');
+  assert.strictEqual(app.initOptions.width, 640);
+  assert.strictEqual(app.initOptions.height, 360);
+  assert.strictEqual(host.children.length, 0, 'the canvas must not mount until Application.init resolves');
+  assert.strictEqual(runtime.world, null);
+
+  initDeferred.resolve();
+  await ready;
+  await flushPromises();
+
+  assert.strictEqual(runtime.backend, 'pixijs');
+  assert.strictEqual(runtime.native, true);
+  assert.ok(runtime.world instanceof PIXI.Container, 'the native world must be a real PIXI.Container');
+  assert.strictEqual(app.stage.children[0], runtime.world);
+  assert.strictEqual(host.children[0], app.canvas, 'the v8 canvas must mount in the supplied host');
+  assert.strictEqual(app.stopped, true, 'Application ticker must remain stopped');
+  assert.strictEqual(app.ticker.stopped, true, 'the native ticker must remain stopped');
+  assert.strictEqual(readyEvents.length, 1);
+
+  const parent = runtime.nodes.get('native-parent');
+  const child = runtime.nodes.get('native-child');
+  assert.ok(parent.node instanceof PIXI.Container);
+  assert.ok(parent.visualHost instanceof PIXI.Container);
+  assert.ok(parent.childrenHost instanceof PIXI.Container);
+  assert.ok(parent.visual instanceof PIXI.Graphics, 'an untextured Renderable must use PIXI.Graphics');
+  assert.ok(child.visual instanceof PIXI.Sprite, 'a textured Renderable must use PIXI.Sprite');
+  assert.strictEqual(parent.node.parent, runtime.world);
+  assert.strictEqual(child.node.parent, parent.childrenHost, 'native nesting must mirror the AH2D Scene Graph');
+  matrixNear(parent.node.localMatrix, AH2D.Matrix2D.compose(20, 30, 30, 2, 3), 1e-8, 'Pixi parent local matrix');
+  matrixNear(child.node.localMatrix, AH2D.Matrix2D.compose(7, -4, -15, 0.5, 1.25), 1e-8, 'Pixi child local matrix');
+  assert.deepStrictEqual(parent.visual.commands, [{ x: -40, y: -20, width: 80, height: 40, color: 0x336699 }]);
+  assert.strictEqual(parent.node.zIndex, 2);
+  assert.strictEqual(child.node.zIndex, 5);
+  assert.strictEqual(child.visual.anchor.x, 0.25);
+  assert.strictEqual(child.visual.anchor.y, 0.75);
+  assert.deepStrictEqual(PIXI.assetLoads, ['/textures/hero.png']);
+  assert.deepStrictEqual(child.visual.texture, { id: '/textures/hero.png' });
+
+  engine.stop({ restore: false });
+  assert.strictEqual(app.destroyed, true);
+  assert.deepStrictEqual(host.children, [], 'stopping must remove an adapter-owned canvas');
+};
+
+const testPixiRuntimeMutationsAndAssetStaleness = async () => {
+  const slowA = deferred(), slowB = deferred(), slowC = deferred();
+  const pending = new Map([
+    ['/slow-a.png', slowA],
+    ['/slow-b.png', slowB],
+    ['/slow-c.png', slowC]
+  ]);
+  const PIXI = createFakePixi({ assetLoader: source => pending.get(source)?.promise || Promise.resolve({ id: source }) });
+  const host = fakeHost();
+  const engine = new AH2D.Engine({ runtime: 'pixijs', runtimeOptions: { PIXI }, physics: 'builtin' });
+  engine.load({ scene: [
+    { id: 'parent-a', x: 10, y: 0 },
+    { id: 'parent-b', x: 100, y: 0 },
+    {
+      id: 'mutable-sprite',
+      parentId: 'parent-a',
+      components: {
+        Transform: { x: 3, y: 4 },
+        Renderable: { imageSrc: '/slow-a.png', width: 20, height: 10, layer: 1 }
+      }
+    },
+    {
+      id: 'dedupe-sprite',
+      parentId: 'parent-b',
+      components: { Renderable: { imageSrc: '/slow-a.png', width: 6, height: 6 } }
+    }
+  ] });
+  engine.start(host, { restoreOnStop: false });
+  const runtime = engine.runtime;
+  const record = runtime.nodes.get('mutable-sprite');
+  const dedupeRecord = runtime.nodes.get('dedupe-sprite');
+  const sprite = record.visual;
+  assert.ok(sprite instanceof PIXI.Sprite);
+  assert.strictEqual(sprite.texture, PIXI.Texture.WHITE, 'pending textures must use a deterministic placeholder');
+
+  runtime.render();
+  runtime.render();
+  assert.deepStrictEqual(
+    PIXI.assetLoads,
+    ['/slow-a.png'],
+    'unchanged sources and a second Entity sharing that source must deduplicate Assets.load'
+  );
+
+  const renderable = engine.ecs.get('mutable-sprite', 'Renderable');
+  renderable.imageSrc = '/slow-b.png';
+  renderable.layer = 12;
+  engine.ecs.add('mutable-sprite', 'Hidden', {});
+  runtime.render();
+  assert.deepStrictEqual(PIXI.assetLoads, ['/slow-a.png', '/slow-b.png']);
+  assert.strictEqual(record.node.zIndex, 12, 'layer edits must synchronize to native zIndex');
+  assert.strictEqual(record.node.visible, false, 'Hidden must hide the complete native Entity node');
+
+  slowB.resolve({ id: 'texture-b' });
+  await flushPromises();
+  assert.deepStrictEqual(sprite.texture, { id: 'texture-b' });
+  slowA.resolve({ id: 'stale-texture-a' });
+  await flushPromises();
+  assert.deepStrictEqual(sprite.texture, { id: 'texture-b' }, 'a stale asset completion must not replace the current source');
+  assert.deepStrictEqual(dedupeRecord.visual.texture, { id: 'stale-texture-a' }, 'the shared load must still update an Entity whose source is current');
+
+  engine.ecs.remove('mutable-sprite', 'Hidden');
+  engine.reparent('mutable-sprite', 'parent-b');
+  runtime.render();
+  assert.strictEqual(record.node.visible, true);
+  assert.strictEqual(record.node.parent, runtime.nodes.get('parent-b').childrenHost, 'runtime reparenting must update native ownership');
+  matrixNear(record.node.localMatrix, AH2D.Matrix2D.compose(3, 4, 0, 1, 1), 1e-8, 'reparented Pixi local matrix');
+
+  engine.createEntity({
+    id: 'created-shape',
+    x: -8,
+    y: 6,
+    components: { Renderable: { width: 14, height: 12, color: '#abc', layer: -1 } }
+  });
+  runtime.render();
+  const created = runtime.nodes.get('created-shape');
+  assert.ok(created.visual instanceof PIXI.Graphics, 'new ECS Renderables must create native visuals on the next render');
+  assert.deepStrictEqual(created.visual.commands, [{ x: -7, y: -6, width: 14, height: 12, color: 0xaabbcc }]);
+  engine.destroyEntity('created-shape');
+  runtime.render();
+  assert.strictEqual(runtime.nodes.has('created-shape'), false);
+  assert.strictEqual(created.node.destroyed, true, 'deleted ECS Entities must destroy their native node');
+
+  renderable.imageSrc = null;
+  runtime.render();
+  assert.ok(record.visual instanceof PIXI.Graphics, 'removing a texture source must replace the Sprite with Graphics');
+  assert.strictEqual(sprite.destroyed, true, 'source-kind changes must clean up the obsolete visual');
+
+  renderable.imageSrc = '/slow-c.png';
+  runtime.render();
+  const pendingSprite = record.visual;
+  assert.ok(pendingSprite instanceof PIXI.Sprite);
+  assert.strictEqual(pendingSprite.texture, PIXI.Texture.WHITE);
+  engine.stop({ restore: false });
+  assert.strictEqual(pendingSprite.destroyed, true);
+  slowC.resolve({ id: 'late-after-stop' });
+  await flushPromises();
+  assert.strictEqual(pendingSprite.texture, PIXI.Texture.WHITE, 'asset completion after stop must not mutate a destroyed Sprite');
+  assert.strictEqual(runtime.nodes.size, 0);
+  assert.strictEqual(runtime.textureLoads.size, 0, 'unmount must release the adapter pending-load registry');
+  assert.deepStrictEqual(host.children, []);
+};
+
+const testPixiLiveChildrenSurviveParentDeletion = () => {
+  const PIXI = createFakePixi();
+  const engine = new AH2D.Engine({ runtime: 'pixijs', runtimeOptions: { PIXI }, physics: 'builtin' });
+  engine.load({ scene: [
+    { id: 'grandparent' },
+    { id: 'reparent-parent', parentId: 'grandparent' },
+    { id: 'reparent-child', parentId: 'reparent-parent', components: { Renderable: { width: 8, height: 6, color: '#123456' } } },
+    { id: 'detach-parent' },
+    { id: 'detach-child', parentId: 'detach-parent', components: { Renderable: { width: 9, height: 7, color: '#654321' } } }
+  ] });
+  engine.start(fakeHost(), { restoreOnStop: false });
+  const runtime = engine.runtime;
+  const reparentChild = runtime.nodes.get('reparent-child');
+  const detachChild = runtime.nodes.get('detach-child');
+
+  engine.destroyEntity('reparent-parent', { childPolicy: 'reparent' });
+  runtime.render();
+  assert.strictEqual(reparentChild.node.parent, runtime.nodes.get('grandparent').childrenHost);
+  assert.notStrictEqual(reparentChild.node.destroyed, true, 'a live child node must survive native parent deletion with childPolicy=reparent');
+  assert.notStrictEqual(reparentChild.visual.destroyed, true, 'a live child visual must survive native parent deletion with childPolicy=reparent');
+
+  engine.destroyEntity('detach-parent', { childPolicy: 'detach' });
+  runtime.render();
+  assert.strictEqual(detachChild.node.parent, runtime.world);
+  assert.notStrictEqual(detachChild.node.destroyed, true, 'a live child node must survive native parent deletion with childPolicy=detach');
+  assert.notStrictEqual(detachChild.visual.destroyed, true, 'a live child visual must survive native parent deletion with childPolicy=detach');
+  engine.stop({ restore: false });
+};
+
+const testPixiStopWhileInitializationPending = async () => {
+  const initDeferred = deferred();
+  const PIXI = createFakePixi({ asyncInit: true, initDeferred });
+  const host = fakeHost();
+  const engine = new AH2D.Engine({ runtime: 'pixijs', runtimeOptions: { PIXI }, physics: 'builtin' });
+  engine.load({ scene: [{ id: 'pending-init-shape', components: { Renderable: { width: 10, height: 10 } } }] });
+  engine.start(host, { restoreOnStop: false });
+  const runtime = engine.runtime;
+  const app = PIXI.applications[0];
+  const pendingReady = runtime.ready;
+  engine.stop({ restore: false });
+  assert.strictEqual(engine.running, false);
+  assert.strictEqual(app.destroyed, true, 'stop must dispose an Application whose init is pending');
+  assert.strictEqual(runtime.app, null);
+
+  initDeferred.resolve();
+  await pendingReady;
+  await flushPromises();
+  assert.strictEqual(app.destroyCount, 2, 'a stale init completion must dispose the now-initialized Application as well');
+  assert.strictEqual(runtime.app, null, 'stale Application.init completion must not remount after stop');
+  assert.strictEqual(runtime.world, null);
+  assert.strictEqual(runtime.nodes.size, 0);
+  assert.strictEqual(host.children.length, 0, 'stale init completion must not append a canvas');
+};
+
+const testMultiScenePlaySnapshotRestoreWithPixi = async () => {
+  const PIXI = createFakePixi();
+  const host = fakeHost();
+  const engine = new AH2D.Engine({ runtime: 'pixijs', runtimeOptions: { PIXI }, physics: 'builtin' });
+  engine.load({
+    format: 'AH2D',
+    version: 4,
+    currentSceneId: 'edit-scene',
+    customProjectData: { keep: true },
+    scenes: [
+      { id: 'edit-scene', name: 'Edit Scene', objects: [{ id: 'edit-object', x: 11, components: { Renderable: { width: 10, height: 10 } } }] },
+      { id: 'battle-scene', name: 'Battle Scene', customSceneData: { keep: true }, objects: [{ id: 'battle-object', x: 200, components: { Renderable: { width: 20, height: 20 } } }] }
+    ],
+    scene: [{ id: 'stale-mirror' }]
+  });
+  engine.start(host, { restoreOnStop: true });
+  const runtime = engine.runtime;
+  assert.ok(runtime.nodes.has('edit-object'));
+
+  engine.ecs.get('edit-object', 'Transform').x = 99;
+  engine.loadScene('battle-scene');
+  engine.createEntity({ id: 'play-only', x: 300, components: { Renderable: { width: 5, height: 5 } } });
+  engine.document.customProjectData.keep = false;
+  engine.document.scenes[1].customSceneData.keep = false;
+  runtime.render();
+  assert.ok(runtime.nodes.has('battle-object'));
+  assert.ok(runtime.nodes.has('play-only'));
+  assert.ok(!runtime.nodes.has('edit-object'));
+
+  engine.stop();
+  assert.strictEqual(engine.running, false);
+  assert.strictEqual(engine.activeSceneId, 'edit-scene', 'Stop must restore the Scene that was active before Play');
+  assert.strictEqual(engine.document.currentSceneId, 'edit-scene');
+  assert.deepStrictEqual(engine.document.scene, engine.document.scenes[0].objects, 'the restored compatibility mirror must match the restored active Scene');
+  assert.strictEqual(engine.document.customProjectData.keep, true, 'unknown project fields must survive Play snapshot restoration');
+  assert.strictEqual(engine.document.scenes[1].customSceneData.keep, true, 'inactive Scene data must survive Play snapshot restoration');
+  assert.deepStrictEqual(engine.document.scenes.map(scene => scene.id), ['edit-scene', 'battle-scene']);
+  assert.ok(engine.ecs.entities.has('edit-object'));
+  assert.ok(!engine.ecs.entities.has('battle-object'));
+  assert.ok(!engine.ecs.entities.has('play-only'));
+  assert.strictEqual(engine.ecs.get('edit-object', 'Transform').x, 11);
+  assert.strictEqual(runtime.nodes.size, 0, 'restoration followed by stop must leave the native runtime unmounted');
+  assert.deepStrictEqual(host.children, []);
+
+  engine.start(host, { restoreOnStop: false });
+  await runtime.ready;
+  assert.ok(runtime.nodes.has('edit-object'), 'the restored active Scene must remount on the next Play');
+  assert.ok(!runtime.nodes.has('battle-object'));
+  engine.stop({ restore: false });
+};
+
+const testFrameErrorStopsPixiRuntime = () => {
+  const PIXI = createFakePixi();
+  const host = fakeHost();
+  const engine = new AH2D.Engine({ runtime: 'pixijs', runtimeOptions: { PIXI }, physics: 'builtin' });
+  engine.load({ scene: [{ id: 'frame-error-shape', components: { Renderable: { width: 10, height: 10 } } }] });
+  const errors = [];
+  engine.events.on('runtime:error', event => errors.push(event));
+  engine.start(host, { restoreOnStop: false });
+  const runtime = engine.runtime;
+  const app = runtime.app;
+  const expected = new Error('fake Pixi render failure');
+  app.render = () => { throw expected; };
+
+  engine.frame(engine.lastTime + 16);
+  assert.strictEqual(engine.running, false, 'a frame failure must transition the Engine out of running state');
+  assert.strictEqual(engine.frameHandle, null, 'a failed frame must not remain scheduled');
+  assert.strictEqual(errors.length, 1);
+  assert.strictEqual(errors[0].error, expected);
+  assert.strictEqual(app.destroyed, true, 'a failed Pixi frame must unmount the native Application');
+  assert.strictEqual(runtime.app, null);
+  assert.deepStrictEqual(host.children, []);
+};
+
 const testEditorRuntimeContract = () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'AH2DEdtior.html'), 'utf8');
   for (const id of ['runtimeSelect', 'editorPlay', 'editorPause', 'editorStop', 'runtimeBackend', 'addComponentBtn', 'sceneSelect', 'newSceneBtn', 'saveSceneBtn', 'sceneModal', 'postProcessBtn', 'postProcessPanel', 'postProcessList', 'postProcessReset']) {
@@ -1450,43 +1897,56 @@ const testEditorRuntimeContract = () => {
   assert.ok(html.includes("renderer:state.runtime"), 'Universal JSON must persist the selected runtime');
 };
 
-testSceneGraphAndRuntimes();
-testNestedSceneGraphTransforms();
-testReparentAndWorldTransformAPI();
-testSetWorldReplacesInheritedShear();
-testAtomicGraphGuards();
-testDestroyPolicies();
-testNestedPhysicsUsesWorldTransform();
-testNestedDynamicPhysicsMatrixSync();
-testNegativeScaleTransformRepresentation();
-testTransactionalEntityLifecycle();
-testDeepHierarchyTraversal();
-testTransformRemovalInvalidatesDescendants();
-testHugeTranslationShearGuard();
-testChildFirstNestedDynamicPhysics();
-testMirroredNestedColliderOffset();
-testTransactionalDestroyListenerFailures();
-testDestroyCommitSurvivesCollisionEndListener();
-testDestroyReentryGuards();
-testStaticColliderFollowsDynamicParentSameFrame();
-testTransformlessColliderInheritsAncestorWorld();
-assert.ok(AH2D.Matrix2D, 'Matrix2D must be public for renderer adapters');
-testUnifiedComponentSchemas();
-testEntityValidationBeforeRuntimeClone();
-testDistinctColliderComponents();
-testMultiSceneLoading();
-testAtomicLoadValidation();
-testLoadCommitSurvivesCollisionEndListener();
-testLoadCommitSurvivesEntityCreateListener();
-testPostProcessProjectContract();
-testGravityAndSchemaSync();
-testStaticCollisionAndSleeping();
-testWideGroundBoxContact();
-testTriggers();
-testAutoMassAndCollisionFilters();
-testKinematicImpulseAndFixedRotation();
-testSnapshotRestore();
-testPauseResumeKeepsSimulationState();
-testNativeBox2DPath();
-testEditorRuntimeContract();
-console.log('AH2D Engine tests passed');
+const run = async () => {
+  testSceneGraphAndRuntimes();
+  testNestedSceneGraphTransforms();
+  testReparentAndWorldTransformAPI();
+  testSetWorldReplacesInheritedShear();
+  testAtomicGraphGuards();
+  testDestroyPolicies();
+  testNestedPhysicsUsesWorldTransform();
+  testNestedDynamicPhysicsMatrixSync();
+  testNegativeScaleTransformRepresentation();
+  testTransactionalEntityLifecycle();
+  testDeepHierarchyTraversal();
+  testTransformRemovalInvalidatesDescendants();
+  testHugeTranslationShearGuard();
+  testChildFirstNestedDynamicPhysics();
+  testMirroredNestedColliderOffset();
+  testTransactionalDestroyListenerFailures();
+  testDestroyCommitSurvivesCollisionEndListener();
+  testDestroyReentryGuards();
+  testStaticColliderFollowsDynamicParentSameFrame();
+  testTransformlessColliderInheritsAncestorWorld();
+  assert.ok(AH2D.Matrix2D, 'Matrix2D must be public for renderer adapters');
+  testUnifiedComponentSchemas();
+  testEntityValidationBeforeRuntimeClone();
+  testDistinctColliderComponents();
+  testMultiSceneLoading();
+  testAtomicLoadValidation();
+  testLoadCommitSurvivesCollisionEndListener();
+  testLoadCommitSurvivesEntityCreateListener();
+  testPostProcessProjectContract();
+  testGravityAndSchemaSync();
+  testStaticCollisionAndSleeping();
+  testWideGroundBoxContact();
+  testTriggers();
+  testAutoMassAndCollisionFilters();
+  testKinematicImpulseAndFixedRotation();
+  testSnapshotRestore();
+  testPauseResumeKeepsSimulationState();
+  testNativeBox2DPath();
+  await testPixiV8AsyncMountAndNativeScene();
+  await testPixiRuntimeMutationsAndAssetStaleness();
+  testPixiLiveChildrenSurviveParentDeletion();
+  await testPixiStopWhileInitializationPending();
+  await testMultiScenePlaySnapshotRestoreWithPixi();
+  testFrameErrorStopsPixiRuntime();
+  testEditorRuntimeContract();
+  console.log('AH2D Engine tests passed');
+};
+
+run().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
