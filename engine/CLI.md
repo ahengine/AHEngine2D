@@ -35,7 +35,7 @@ stdout is JSON by default:
 }
 ```
 
-Errors use the same protocol on stderr and a non-zero, categorized exit code. `capabilities` is the machine-readable discovery contract. `schema list` and `schema show --name project` expose JSON schemas. Human-readable output is opt-in with `--format text`.
+Errors use the same protocol on stderr and a non-zero, categorized exit code. `capabilities` is the machine-readable discovery contract. It reports `dataModel`, the three component-schema profiles, registry types, `unknownComponents: "preserve"`, and `precedence: "components"`. Human-readable output is opt-in with `--format text`.
 
 Exit codes:
 
@@ -99,9 +99,28 @@ npm run ah2d -- entity delete --file game.ah2d.json --scene main player --cascad
 
 Use `--root` to unparent an Entity explicitly; therefore an actual Entity whose ID is `root` remains addressable as a normal parent. Deleting an entity that has children requires either `--cascade` or `--reparent`. Cyclic parenting, dangling parents, duplicate IDs, and ambiguous names are rejected before writing.
 
+## Schema discovery
+
+Use the schema commands instead of scraping `--help` or copying assumptions from a renderer:
+
+```text
+npm run ah2d -- schema list --pretty
+npm run ah2d -- schema show --name project --pretty
+npm run ah2d -- schema show --component Transform --pretty
+npm run ah2d -- schema show component:Body --pretty
+```
+
+`schema list` returns the document schemas (`project`, `operation`, `batch`) and all built-in component types. `schema show --component TYPE` returns the canonical type, aliases, schema version, required/removable/tag flags, defaults, `authoring`/`runtime`/`snapshot` schemas, runtime-only fields, and storage metadata. Aliases resolve to the canonical descriptor, so `component:Body` reports `component:Rigidbody`.
+
 ## Components
 
-Rigidbody and Collider use the editor's lossless top-level dialect. ECS-style `components.Rigidbody`, `components.Collider`, `components.Transform`, and custom components remain in their original storage location.
+Universal Project version `4` is the authoring source of truth. New projects declare `dataModel: { id: "ah2d.ecs", version: 1, componentSchemaVersion: 1 }`; the version-`3` output of `ecs export` is a separate, lossy active-runtime snapshot.
+
+Component reads resolve `components.<CanonicalName>` first, then registered aliases in `components`, then legacy authoring locations. For example, `components.Rigidbody` wins over `components.RigidBody`, `components.Body`, `rigidbody`, and `rigidBody`; `components.Transform` wins over `transform` and flat `x/y/rot/sx/sy`. `component get` and `component list` report `storage`, `provenance`, and conflicting lower-precedence values; mutation results report `storage` and `provenance`.
+
+Component writes preserve the selected provenance. Therefore patching a value originally stored at `components.Rigidbody` keeps it there, while patching a legacy `rigidbody` keeps that spelling/location whenever it can represent the value. Other legacy copies, custom fields, unknown components, and unknown top-level data are not rewritten. Conflicting copies produce `E_COMPONENT_CONFLICT`: a warning in normal validation and an error under `--strict`.
+
+Compact flat `Transform` and `Renderable` are projections over Entity fields, so a write preserves omitted sibling properties there; a write to `components.*` replaces the component object. Use `component patch` for field-wise changes and canonical storage when full replace semantics must be independent of the Entity projection.
 
 ```text
 npm run ah2d -- component list --file game.ah2d.json --scene main player
@@ -113,6 +132,8 @@ npm run ah2d -- component delete --file game.ah2d.json --scene main player Colli
 ```
 
 Transform and Name are required and cannot be removed.
+
+Values must be JSON-safe objects or arrays, and component keys must be safe PascalCase names. The built-in registry is open-world: an unregistered custom type such as `Health` or `PlayerController` is accepted under `components.<Type>`, validated with the generic object/array schema, and preserved losslessly. Register its stronger schema with the Engine when runtime code needs defaults, normalization, aliases, or migrations; the standalone CLI exposes its built-in registry and does not load arbitrary game code.
 
 ## Runtime and physics
 
@@ -172,3 +193,9 @@ npm run ah2d -- ecs export --file project-v4.json --scene main --out main.ecs.js
 ```
 
 `ecs export` is intentionally lossy and exports only the chosen runtime Scene. It never replaces the Universal project automatically.
+
+`validate` applies the `authoring` component profile, reports exact JSON Pointers, checks JSON safety and registered schemas, and detects duplicate storage conflicts. Add `--strict` to promote compatibility conflicts (and other strict diagnostics) to errors; add `--warnings-as-errors` when CI must reject every warning. `--engine` additionally verifies that the selected project can be loaded by the Engine.
+
+Default compatibility validation accepts legacy numeric/boolean strings for schema inspection but does not coerce them. `--strict` rejects those values, and Engine runtime decoding is always strict; normalize authored values to real JSON numbers/booleans before execution.
+
+`migrate` upgrades the project container and Scene layout while preserving unknown top-level, Entity, and component data. It does not canonicalize component storage, discard legacy spellings, or inject the data-model descriptor into an already-version-4 document solely because the descriptor is absent. The Engine registry API runs component-schema migrations as ordered functions from each schema version to the next; a missing step fails rather than guessing a conversion.

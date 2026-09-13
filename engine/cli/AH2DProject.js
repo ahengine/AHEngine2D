@@ -1,6 +1,10 @@
 'use strict';
 
 const crypto = require('crypto');
+const {
+  DATA_MODEL_ID, DATA_MODEL_VERSION, COMPONENT_SCHEMA_VERSION, PROFILE_NAMES,
+  ComponentSchemaError, EntityCodec, createDefaultComponentRegistry
+} = require('../AH2DDataModel.js');
 
 const PROTOCOL = 'ah2d.cli/v1';
 const PROJECT_VERSION = 4;
@@ -9,6 +13,13 @@ const BODY_TYPES = new Set(['static', 'dynamic', 'kinematic']);
 const COLLIDER_SHAPES = new Set(['rectangle', 'box', 'circle']);
 const EXIT = Object.freeze({ OK: 0, USAGE: 2, IO: 3, VALIDATION: 4, NOT_FOUND: 5, CONFLICT: 6, ENGINE: 7, INTERNAL: 70 });
 const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+const componentRegistry = createDefaultComponentRegistry();
+const entityCodec = new EntityCodec(componentRegistry);
+const DATA_MODEL_DESCRIPTOR = Object.freeze({
+  id: DATA_MODEL_ID,
+  version: DATA_MODEL_VERSION,
+  componentSchemaVersion: COMPONENT_SCHEMA_VERSION
+});
 const DEFAULT_POST_PROCESS_EFFECTS = Object.freeze([
   { id: 'bloom', type: 'bloom', name: 'Bloom', enabled: false, intensity: 0.22, radius: 8, threshold: 0.72 },
   { id: 'vignette', type: 'vignette', name: 'Vignette', enabled: true, intensity: 0.24, softness: 0.68 },
@@ -30,6 +41,7 @@ class DomainError extends Error {
 }
 
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const isPlainObject = value => isObject(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 const clone = value => value == null ? value : JSON.parse(JSON.stringify(value));
 const now = () => new Date().toISOString();
 const generateId = kind => `${kind}_${crypto.randomBytes(6).toString('hex')}`;
@@ -40,6 +52,54 @@ const createDefaultPostProcess = () => ({ enabled: true, effects: clone(DEFAULT_
 
 function diagnostic(severity, code, message, pointer = '', details = {}) {
   return { severity, code, message, pointer, details };
+}
+
+function validateDataModelDescriptor(document, diagnostics) {
+  if (!Object.prototype.hasOwnProperty.call(document, 'dataModel')) return;
+  const value = document.dataModel;
+  if (!isPlainObject(value)) {
+    diagnostics.push(diagnostic('error', 'E_DATA_MODEL_TYPE', 'dataModel must be a plain object', '/dataModel'));
+    return;
+  }
+  if (value.id !== DATA_MODEL_DESCRIPTOR.id) {
+    diagnostics.push(diagnostic('error', 'E_DATA_MODEL_ID', `dataModel.id must be ${DATA_MODEL_DESCRIPTOR.id}`, '/dataModel/id', { expected: DATA_MODEL_DESCRIPTOR.id, actual: value.id ?? null }));
+  }
+  validateDataModelVersion(value.version, DATA_MODEL_DESCRIPTOR.version, {
+    pointer: '/dataModel/version', label: 'dataModel.version', typeCode: 'E_DATA_MODEL_VERSION_TYPE',
+    legacyCode: 'W_LEGACY_DATA_MODEL_VERSION', futureCode: 'E_FUTURE_DATA_MODEL_VERSION'
+  }, diagnostics);
+  validateDataModelVersion(value.componentSchemaVersion, DATA_MODEL_DESCRIPTOR.componentSchemaVersion, {
+    pointer: '/dataModel/componentSchemaVersion', label: 'dataModel.componentSchemaVersion', typeCode: 'E_COMPONENT_SCHEMA_VERSION_TYPE',
+    legacyCode: 'W_LEGACY_COMPONENT_SCHEMA_VERSION', futureCode: 'E_FUTURE_COMPONENT_SCHEMA_VERSION'
+  }, diagnostics);
+}
+
+function validateDataModelVersion(value, expected, contract, diagnostics) {
+  if (!Number.isInteger(value) || value < 0) {
+    diagnostics.push(diagnostic('error', contract.typeCode, `${contract.label} must be a non-negative integer`, contract.pointer, { expected, actual: value ?? null }));
+  } else if (value < expected) {
+    diagnostics.push(diagnostic('warning', contract.legacyCode, `${contract.label} ${value} is older than supported version ${expected}`, contract.pointer, { expected, actual: value }));
+  } else if (value > expected) {
+    diagnostics.push(diagnostic('error', contract.futureCode, `${contract.label} ${value} is newer than supported version ${expected}`, contract.pointer, { expected, actual: value }));
+  }
+}
+
+function componentCall(callback, fallbackPointer = '') {
+  try { return callback(); }
+  catch (error) {
+    if (!(error instanceof ComponentSchemaError)) throw error;
+    const pointer = error.pointer || fallbackPointer || '';
+    const diagnostics = error.diagnostics?.length
+      ? clone(error.diagnostics)
+      : [diagnostic('error', error.code, error.message, pointer, error.details || {})];
+    const exitCode = error.code === 'E_REQUIRED_COMPONENT' || error.code === 'E_COMPONENT_NAME'
+      ? EXIT.CONFLICT
+      : EXIT.VALIDATION;
+    throw new DomainError(error.code, error.message, {
+      exitCode, pointer,
+      details: { ...(error.details || {}), diagnostics }
+    });
+  }
 }
 
 function detectDialect(document) {
@@ -59,6 +119,7 @@ function createProject(options = {}) {
   return {
     format: 'AH2D',
     version: PROJECT_VERSION,
+    dataModel: clone(DATA_MODEL_DESCRIPTOR),
     engine: {
       name: 'AH2D Engine', version: options.engineVersion || '0.3.0',
       renderer: options.runtime || 'custom', runtime: options.runtime || 'custom',
@@ -149,7 +210,9 @@ function resolveEntity(scene, reference, options = {}) {
 }
 
 function entityName(entity) {
-  return String(entity?.name ?? entity?.components?.Name?.value ?? 'Game Object');
+  if (!isObject(entity)) return 'Game Object';
+  const resolved = componentCall(() => entityCodec.resolve(entity, 'Name'));
+  return String(resolved.value?.value ?? 'Game Object');
 }
 
 function syncActiveMirror(document, options = {}) {
@@ -178,6 +241,7 @@ function validateDocument(document, options = {}) {
   if (!Number.isInteger(Number(document.version))) diagnostics.push(diagnostic('error', 'E_VERSION_TYPE', 'version must be an integer', '/version'));
   else if (Number(document.version) > PROJECT_VERSION) diagnostics.push(diagnostic('error', 'E_FUTURE_VERSION', `version ${document.version} is not supported`, '/version'));
   else if (Number(document.version) < PROJECT_VERSION) diagnostics.push(diagnostic('warning', 'W_LEGACY_VERSION', `version ${document.version} should be migrated to ${PROJECT_VERSION}`, '/version'));
+  validateDataModelDescriptor(document, diagnostics);
   if (!Array.isArray(document.scenes) || !document.scenes.length) {
     diagnostics.push(diagnostic('error', 'E_NO_SCENES', 'scenes must be a non-empty array', '/scenes'));
     return diagnostics;
@@ -198,23 +262,13 @@ function validateDocument(document, options = {}) {
     scene.objects.forEach((entity, entityIndex) => {
       const pointer = `${base}/objects/${entityIndex}`;
       if (!isObject(entity)) { diagnostics.push(diagnostic('error', 'E_ENTITY_TYPE', 'Entity must be an object', pointer)); return; }
-      if (typeof entity.id !== 'string' || !entity.id.trim()) diagnostics.push(diagnostic('error', 'E_ENTITY_ID', 'Entity id must be a non-empty string', `${pointer}/id`));
-      else if (ids.has(entity.id)) diagnostics.push(diagnostic('error', 'E_DUPLICATE_ENTITY_ID', `Duplicate entity id: ${entity.id}`, `${pointer}/id`, { first: ids.get(entity.id) }));
-      else { ids.set(entity.id, `${pointer}/id`); byId.set(entity.id, entity); }
-      if (entity.id) {
+      diagnostics.push(...componentCall(() => entityCodec.validate(entity, { pointer, profile: 'authoring', mode: options.strict ? 'strict' : 'compat', strict: Boolean(options.strict) }), pointer));
+      if (typeof entity.id === 'string' && entity.id.trim()) {
+        if (ids.has(entity.id)) diagnostics.push(diagnostic('error', 'E_DUPLICATE_ENTITY_ID', `Duplicate entity id: ${entity.id}`, `${pointer}/id`, { first: ids.get(entity.id) }));
+        else { ids.set(entity.id, `${pointer}/id`); byId.set(entity.id, entity); }
         if (globalEntityIds.has(entity.id) && globalEntityIds.get(entity.id).sceneId !== scene.id) diagnostics.push(diagnostic(options.strict ? 'error' : 'warning', 'W_CROSS_SCENE_ENTITY_ID', `Entity id is reused across Scenes: ${entity.id}`, `${pointer}/id`, { first: globalEntityIds.get(entity.id) }));
         else globalEntityIds.set(entity.id, { sceneId: scene.id, pointer: `${pointer}/id` });
       }
-      for (const key of ['x', 'y', 'w', 'h', 'rot', 'sx', 'sy', 'layer']) if (entity[key] != null && !finite(entity[key])) diagnostics.push(diagnostic('error', 'E_TRANSFORM_NUMBER', `${key} must be finite`, `${pointer}/${key}`));
-      const flatTransform = ['x', 'y', 'rot', 'sx', 'sy'].some(key => entity[key] != null), ecsTransform = entity.components?.Transform;
-      if (flatTransform && isObject(ecsTransform)) diagnostics.push(diagnostic('warning', 'W_TRANSFORM_DIALECT_CONFLICT', 'Entity contains both flat Transform fields and components.Transform', pointer));
-      const rigidbody = entity.rigidbody || entity.rigidBody || entity.components?.Rigidbody || entity.components?.RigidBody;
-      if (entity.rigidbody && (entity.components?.Rigidbody || entity.components?.RigidBody)) diagnostics.push(diagnostic('warning', 'W_RIGIDBODY_DIALECT_CONFLICT', 'Entity contains flat and ECS Rigidbody definitions', pointer));
-      if (isObject(rigidbody)) validateRigidbody(rigidbody, `${pointer}/rigidbody`, diagnostics);
-      const colliders = entity.collider || entity.components?.Collider;
-      if (entity.collider && entity.components?.Collider) diagnostics.push(diagnostic('warning', 'W_COLLIDER_DIALECT_CONFLICT', 'Entity contains flat and ECS Collider definitions', pointer));
-      const colliderList = Array.isArray(colliders) ? colliders : (Array.isArray(colliders?.colliders) ? colliders.colliders : (colliders ? [colliders] : []));
-      colliderList.forEach((collider, index) => validateCollider(collider, `${pointer}/collider${colliderList.length > 1 ? `/${index}` : ''}`, diagnostics));
     });
     scene.objects.forEach((entity, entityIndex) => {
       if (!entity?.parentId) return;
@@ -266,22 +320,6 @@ function validateDocument(document, options = {}) {
   return diagnostics;
 }
 
-function validateRigidbody(body, pointer, diagnostics) {
-  if (body.type != null && !BODY_TYPES.has(String(body.type).toLowerCase())) diagnostics.push(diagnostic('error', 'E_BODY_TYPE', `Invalid Rigidbody type: ${body.type}`, `${pointer}/type`));
-  for (const key of ['mass', 'gravityScale', 'linearDamping', 'angularDamping', 'velocityX', 'velocityY', 'angularVelocity']) if (body[key] != null && !finite(body[key])) diagnostics.push(diagnostic('error', 'E_BODY_NUMBER', `${key} must be finite`, `${pointer}/${key}`));
-  if (body.mass != null && Number(body.mass) <= 0) diagnostics.push(diagnostic('error', 'E_BODY_MASS', 'mass must be greater than zero', `${pointer}/mass`));
-  for (const key of ['linearDamping', 'angularDamping']) if (body[key] != null && Number(body[key]) < 0) diagnostics.push(diagnostic('error', 'E_BODY_DAMPING', `${key} cannot be negative`, `${pointer}/${key}`));
-}
-
-function validateCollider(collider, pointer, diagnostics) {
-  if (!isObject(collider)) { diagnostics.push(diagnostic('error', 'E_COLLIDER_TYPE', 'Collider must be an object', pointer)); return; }
-  if (collider.shape != null && !COLLIDER_SHAPES.has(String(collider.shape).toLowerCase())) diagnostics.push(diagnostic('error', 'E_COLLIDER_SHAPE', `Invalid Collider shape: ${collider.shape}`, `${pointer}/shape`));
-  for (const key of ['width', 'height', 'radius', 'density']) if (collider[key] != null && (!finite(collider[key]) || Number(collider[key]) <= 0)) diagnostics.push(diagnostic('error', 'E_COLLIDER_SIZE', `${key} must be greater than zero`, `${pointer}/${key}`));
-  for (const key of ['offsetX', 'offsetY', 'rotation', 'friction', 'restitution', 'categoryBits', 'maskBits', 'groupIndex']) if (collider[key] != null && !finite(collider[key])) diagnostics.push(diagnostic('error', 'E_COLLIDER_NUMBER', `${key} must be finite`, `${pointer}/${key}`));
-  if (collider.friction != null && Number(collider.friction) < 0) diagnostics.push(diagnostic('error', 'E_COLLIDER_FRICTION', 'friction cannot be negative', `${pointer}/friction`));
-  if (collider.restitution != null && (Number(collider.restitution) < 0 || Number(collider.restitution) > 1)) diagnostics.push(diagnostic('error', 'E_COLLIDER_RESTITUTION', 'restitution must be between 0 and 1', `${pointer}/restitution`));
-}
-
 function assertValid(document, options = {}) {
   const diagnostics = validateDocument(document, options);
   const failures = diagnostics.filter(item => item.severity === 'error' || (options.warningsAsErrors && item.severity === 'warning'));
@@ -321,98 +359,70 @@ function defaultEntity(operation = {}) {
   };
 }
 
-const componentAlias = name => {
-  const key = String(name || '').replace(/[\s_-]/g, '').toLowerCase();
-  if (key === 'rigidbody' || key === 'body') return 'Rigidbody';
-  if (key === 'collider' || key === 'boxcollider' || key === 'circlecollider') return 'Collider';
-  if (key === 'transform') return 'Transform';
-  if (key === 'name') return 'Name';
-  return String(name || '').trim();
-};
-
-function assertSafeComponent(type) {
-  if (!type || FORBIDDEN_KEYS.has(String(type).toLowerCase())) throw new DomainError('E_COMPONENT_NAME', `Unsafe or empty Component name: ${type || '(empty)'}`, { exitCode: EXIT.CONFLICT });
+function componentAlias(name) {
+  const type = componentRegistry.resolve(name);
+  if (!type) return componentCall(() => { throw new ComponentSchemaError('E_COMPONENT_NAME', `Invalid or unknown Component name: ${name || '(empty)'}`); });
+  return type;
 }
 
 function defaultComponent(type, entity) {
-  if (type === 'Rigidbody') return { enabled: true, type: 'dynamic', mass: 1, useAutoMass: false, gravityScale: 1, linearDamping: 0.08, angularDamping: 0.08, fixedRotation: false, bullet: false, allowSleep: true, sleeping: false, velocityX: 0, velocityY: 0, angularVelocity: 0 };
-  if (type === 'Collider') return { enabled: true, shape: 'rectangle', width: Math.max(1, Math.abs(Number(entity.w) || 64)), height: Math.max(1, Math.abs(Number(entity.h) || 64)), radius: Math.max(1, Math.min(Math.abs(Number(entity.w) || 64), Math.abs(Number(entity.h) || 64)) / 2), offsetX: 0, offsetY: 0, rotation: 0, density: 1, friction: 0.35, restitution: 0.05, isTrigger: false, categoryBits: 1, maskBits: 65535, groupIndex: 0 };
-  if (type === 'Transform') return { x: Number(entity.x) || 0, y: Number(entity.y) || 0, rotation: Number(entity.rot) || 0, scaleX: Number(entity.sx) || 1, scaleY: Number(entity.sy) || 1 };
-  if (type === 'Name') return { value: entityName(entity) };
-  return {};
+  const canonical = componentAlias(type);
+  return componentCall(() => componentRegistry.create(canonical, {}, { entity, profile: 'authoring', mode: 'compat' }));
 }
 
 function getComponent(entity, name, create = false) {
   const type = componentAlias(name);
-  if (!type) throw new DomainError('E_COMPONENT_NAME', 'Component name is required', { exitCode: EXIT.USAGE });assertSafeComponent(type);
-  if (type === 'Rigidbody') {
-    if (entity.rigidbody !== undefined) return { type, value: entity.rigidbody, storage: 'rigidbody' };
-    if (entity.rigidBody !== undefined) return { type, value: entity.rigidBody, storage: 'rigidBody' };
-    const key = Object.keys(entity.components || {}).find(value => value.toLowerCase() === 'rigidbody');
-    if (key) return { type: key, value: entity.components[key], storage: `components.${key}` };
-    if (create) entity.rigidbody = defaultComponent(type, entity);
-    return { type, value: entity.rigidbody, storage: 'rigidbody' };
+  let resolved = componentCall(() => entityCodec.resolve(entity, type));
+  if (!resolved.found && create) {
+    componentCall(() => entityCodec.write(entity, type, undefined, { storage: 'preserve', profile: 'authoring', mode: 'compat' }));
+    resolved = componentCall(() => entityCodec.resolve(entity, type));
   }
-  if (type === 'Collider') {
-    if (entity.collider !== undefined) return { type, value: entity.collider, storage: 'collider' };
-    const key = Object.keys(entity.components || {}).find(value => value.toLowerCase() === 'collider');
-    if (key) return { type: key, value: entity.components[key], storage: `components.${key}` };
-    if (create) entity.collider = defaultComponent(type, entity);
-    return { type, value: entity.collider, storage: 'collider' };
-  }
-  if (type === 'Transform') {
-    const key = Object.keys(entity.components || {}).find(value => value.toLowerCase() === 'transform');
-    if (key) return { type: key, value: entity.components[key], storage: `components.${key}` };
-    return { type, value: defaultComponent(type, entity), storage: 'flat-transform' };
-  }
-  if (type === 'Name') {
-    const key = Object.keys(entity.components || {}).find(value => value.toLowerCase() === 'name');
-    if (key) return { type: key, value: entity.components[key], storage: `components.${key}` };
-    return { type, value: { value: entityName(entity) }, storage: 'flat-name' };
-  }
-  entity.components = isObject(entity.components) ? entity.components : {};
-  const existing = Object.keys(entity.components).find(key => key.toLowerCase() === type.toLowerCase()) || type;
-  if (entity.components[existing] == null && create) entity.components[existing] = {};
-  return { type: existing, value: entity.components[existing], storage: `components.${existing}` };
+  return resolved;
 }
 
-function putComponent(entity, name, value) {
-  const type = componentAlias(name);assertSafeComponent(type);const next = value === undefined ? defaultComponent(type, entity) : clone(value);
-  if (!isObject(next) && !Array.isArray(next)) throw new DomainError('E_COMPONENT_VALUE', 'Component value must be an object or array', { exitCode: EXIT.USAGE });
-  const existing = getComponent(entity, type);
-  if (existing.storage.startsWith('components.')) { entity.components[existing.type] = next; }
-  else if (existing.storage === 'rigidBody') entity.rigidBody = next;
-  else if (type === 'Rigidbody') entity.rigidbody = next;
-  else if (type === 'Collider') entity.collider = next;
-  else if (type === 'Transform') {
-    entity.x = Number(next.x ?? entity.x ?? 0);entity.y = Number(next.y ?? entity.y ?? 0);entity.rot = Number(next.rotation ?? next.rot ?? entity.rot ?? 0);entity.sx = Number(next.scaleX ?? next.sx ?? entity.sx ?? 1);entity.sy = Number(next.scaleY ?? next.sy ?? entity.sy ?? 1);
-  } else if (type === 'Name') entity.name = String(next.value ?? next.name ?? entityName(entity));
-  else { entity.components = isObject(entity.components) ? entity.components : {};entity.components[type] = next; }
-  return getComponent(entity, type).value;
+function putComponent(entity, name, value, options = {}) {
+  const type = componentAlias(name);
+  const current = componentCall(() => entityCodec.resolve(entity, type), options.pointer);
+  componentCall(() => entityCodec.write(entity, type, value, {
+    storage: options.storage || 'preserve',
+    provenance: options.provenance || current.provenance || undefined,
+    pointer: options.pointer || '', profile: 'authoring', mode: 'compat'
+  }), options.pointer);
+  return componentCall(() => entityCodec.resolve(entity, type), options.pointer).value;
 }
 
-function removeComponent(entity, name) {
-  const requested = componentAlias(name), component = getComponent(entity, name);
-  if (requested === 'Transform' || requested === 'Name') throw new DomainError('E_REQUIRED_COMPONENT', `${requested} cannot be removed`, { exitCode: EXIT.CONFLICT });
-  if (component.storage === 'rigidbody') delete entity.rigidbody;
-  else if (component.storage === 'collider') delete entity.collider;
-  else if (component.storage === 'rigidBody') delete entity.rigidBody;
-  else if (component.storage.startsWith('components.')) delete entity.components[component.type];
-  return component.value !== undefined;
+function removeComponent(entity, name, options = {}) {
+  const type = componentAlias(name);
+  return componentCall(() => entityCodec.remove(entity, type, { provenance: options.provenance, allLocations: Boolean(options.allLocations) }), options.pointer);
+}
+
+function componentStoragePointer(base, storage) {
+  if (storage?.startsWith('components.')) return `${base}/components/${escapePointer(storage.slice('components.'.length))}`;
+  if (storage === 'flat-name') return `${base}/name`;
+  if (storage === 'flat-hidden') return `${base}/visible`;
+  if (storage === 'flat-locked') return `${base}/locked`;
+  if (storage === 'flat-prefab') return `${base}/prefab`;
+  if (storage === 'flat-transform' || storage === 'flat-renderable') return base;
+  return `${base}/${escapePointer(storage || '')}`;
+}
+
+function componentValuePointer(document, scene, entity, type) {
+  const sceneIndex = document.scenes.indexOf(scene), entityIndex = scene.objects.indexOf(entity);
+  const base = `/scenes/${sceneIndex}/objects/${entityIndex}`;
+  const resolved = getComponent(entity, type);
+  const storage = resolved.found ? resolved.storage : componentRegistry.describe(type)?.storage?.preferred;
+  return componentStoragePointer(base, storage || `components.${type}`);
 }
 
 function renameEntityValue(entity, name) {
   const value = String(name || '').trim();if (!value) throw new DomainError('E_ENTITY_NAME', 'Entity name is required', { exitCode: EXIT.USAGE });
-  if (!entity.components?.Name || Object.prototype.hasOwnProperty.call(entity, 'name')) entity.name = value;
-  if (entity.components?.Name) entity.components.Name.value = value;
+  putComponent(entity, 'Name', { ...getComponent(entity, 'Name').value, value });
   return value;
 }
 
 function offsetEntityValue(entity, x, y) {
-  const transform = entity.components?.Transform;
-  const hasFlat = ['x', 'y', 'rot', 'sx', 'sy'].some(key => Object.prototype.hasOwnProperty.call(entity, key));
-  if (transform && !hasFlat) { transform.x = Number(transform.x || 0) + x;transform.y = Number(transform.y || 0) + y; }
-  else { entity.x = Number(entity.x || 0) + x;entity.y = Number(entity.y || 0) + y; }
+  const transform = getComponent(entity, 'Transform').value;
+  putComponent(entity, 'Transform', { ...transform, x: Number(transform.x ?? 0) + x, y: Number(transform.y ?? 0) + y });
 }
 
 function pathSegments(path) {
@@ -506,12 +516,25 @@ function applyOperationMutable(document, operation) {
   }
   if (op.startsWith('component.')) {
     const scene = operationScene(document, operation), entity = resolveEntity(scene, operation.entityId || operation.id || operation.entityName, { allowName: operation.entityName != null }), type = componentAlias(operation.component || operation.type);
-    if (op === 'component.put') return { sceneId: scene.id, entityId: entity.id, component: type, value: clone(putComponent(entity, type, operation.value)) };
+    const pointer = componentValuePointer(document, scene, entity, type);
+    if (op === 'component.put') {
+      const value = putComponent(entity, type, operation.value, { pointer }), written = getComponent(entity, type);
+      return { sceneId: scene.id, entityId: entity.id, component: type, storage: written.storage, provenance: written.provenance, value: clone(value) };
+    }
     const component = getComponent(entity, type);
     if (component.value === undefined) throw new DomainError('E_COMPONENT_NOT_FOUND', `Component not found: ${type}`, { exitCode: EXIT.NOT_FOUND });
-    if (op === 'component.patch') return { sceneId: scene.id, entityId: entity.id, component: type, value: clone(putComponent(entity, type, mergePatch(component.value, requireObjectPatch(operation.patch, op)))) };
-    if (op === 'component.set') { const next = clone(component.value);setPath(next, operation.path, operation.value);return { sceneId: scene.id, entityId: entity.id, component: type, value: clone(putComponent(entity, type, next)) }; }
-    if (op === 'component.delete') return { sceneId: scene.id, entityId: entity.id, component: type, deleted: removeComponent(entity, type) };
+    if (op === 'component.patch') {
+      const value = putComponent(entity, type, mergePatch(component.value, requireObjectPatch(operation.patch, op)), { pointer, provenance: component.provenance });
+      const written = getComponent(entity, type);
+      return { sceneId: scene.id, entityId: entity.id, component: type, storage: written.storage, provenance: written.provenance, value: clone(value) };
+    }
+    if (op === 'component.set') {
+      const next = clone(component.value);setPath(next, operation.path, operation.value);
+      const value = putComponent(entity, type, next, { pointer, provenance: component.provenance });
+      const written = getComponent(entity, type);
+      return { sceneId: scene.id, entityId: entity.id, component: type, storage: written.storage, provenance: written.provenance, value: clone(value) };
+    }
+    if (op === 'component.delete') return { sceneId: scene.id, entityId: entity.id, component: type, storage: component.storage, provenance: component.provenance, deleted: removeComponent(entity, type, { pointer, provenance: component.provenance }) };
   }
   if (op === 'runtime.set') {
     document.engine = isObject(document.engine) ? document.engine : {};
@@ -554,11 +577,10 @@ function resourceField(type, document) {
 }
 
 function listComponents(entity) {
-  const result = [{ type: 'Name', storage: 'flat-name' }, { type: 'Transform', storage: 'flat-transform' }];
-  if (entity.rigidbody || entity.rigidBody) result.push({ type: 'Rigidbody', storage: entity.rigidbody ? 'rigidbody' : 'rigidBody' });
-  if (entity.collider) result.push({ type: 'Collider', storage: 'collider' });
-  for (const type of Object.keys(entity.components || {})) if (!result.some(item => item.type.toLowerCase() === type.toLowerCase())) result.push({ type, storage: `components.${type}` });
-  return result;
+  return componentCall(() => entityCodec.list(entity, { clone: true })).map(component => ({
+    type: component.type, storage: component.storage, provenance: component.provenance,
+    conflicts: clone(component.conflicts)
+  }));
 }
 
 function listEntities(scene, options = {}) {
@@ -622,8 +644,9 @@ function documentHash(value) {
 
 module.exports = {
   PROTOCOL, PROJECT_VERSION, RUNTIMES, BODY_TYPES, COLLIDER_SHAPES, EXIT, DomainError,
+  DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES: PROFILE_NAMES, componentRegistry, entityCodec,
   clone, generateId, detectDialect, createProject, createDefaultPostProcess, migrateDocument, syncActiveMirror,
   validateDocument, assertValid, resolveScene, resolveEntity, entityName,
   applyOperations, applyJsonPatch, mergePatch, setPath, getPointer,
-  listComponents, listEntities, getComponent, resourceField, documentHash, escapePointer
+  listComponents, listEntities, getComponent, putComponent, removeComponent, resourceField, documentHash, escapePointer
 };

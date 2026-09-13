@@ -38,6 +38,11 @@ const MAX_DOCUMENT_BYTES = Number(process.env.AH2D_MAX_PROJECT_BYTES) || 16 * 10
 const projectContract = createRequire(path.join(process.cwd(), "package.json"))(
   "./engine/cli/AH2DProject.js",
 ) as {
+  createProject: (options?: { name?: string }) => Record<string, unknown>;
+  syncActiveMirror: (
+    document: Record<string, unknown>,
+    options?: { touch?: boolean },
+  ) => unknown;
   validateDocument: (document: unknown, options?: { strict?: boolean }) => Array<{
     severity: "error" | "warning";
     code: string;
@@ -113,6 +118,35 @@ function validateDocument(document: unknown): unknown {
     throw new CollaborationError("INVALID_PROJECT_DOCUMENT", "The project document must be JSON serializable.");
   }
   assertCollaboration(serialized !== undefined, "INVALID_PROJECT_DOCUMENT", "The project document is not serializable.");
+  let copy: Record<string, unknown>;
+  try {
+    copy = structuredClone(document) as Record<string, unknown>;
+  } catch {
+    throw new CollaborationError(
+      "INVALID_PROJECT_DOCUMENT",
+      "The project document must contain only cloneable JSON data.",
+    );
+  }
+  let mirrorFailure: {
+    severity: "error";
+    code: string;
+    message: string;
+    pointer?: string;
+  } | undefined;
+  try {
+    projectContract.syncActiveMirror(copy, { touch: false });
+  } catch (error) {
+    const contractError = error as { code?: unknown; pointer?: unknown };
+    mirrorFailure = {
+      severity: "error",
+      code: typeof contractError.code === "string" ? contractError.code : "E_ACTIVE_MIRROR",
+      message: error instanceof Error
+        ? error.message
+        : "The active Scene mirror could not be synchronized.",
+      ...(typeof contractError.pointer === "string" ? { pointer: contractError.pointer } : {}),
+    };
+  }
+  serialized = JSON.stringify(copy);
   assertCollaboration(
     Buffer.byteLength(serialized, "utf8") <= MAX_DOCUMENT_BYTES,
     "PROJECT_DOCUMENT_TOO_LARGE",
@@ -120,9 +154,11 @@ function validateDocument(document: unknown): unknown {
     413,
     { maximumBytes: MAX_DOCUMENT_BYTES },
   );
-  const copy = structuredClone(document);
   const diagnostics = projectContract.validateDocument(copy, { strict: true });
   const failures = diagnostics.filter((item) => item.severity === "error");
+  if (mirrorFailure && failures.length === 0) {
+    failures.push(mirrorFailure);
+  }
   if (failures.length) {
     throw new CollaborationError(
       "INVALID_AH2D_PROJECT",
@@ -139,30 +175,7 @@ function documentSha256(document: unknown): string {
 }
 
 function defaultDocument(name: string): Record<string, unknown> {
-  return {
-    format: "AH2D",
-    version: 4,
-    project: { name },
-    currentSceneId: "scene-main",
-    scenes: [{ id: "scene-main", name: "Main", objects: [] }],
-    scene: [],
-    prefab: [],
-    prefabs: [],
-    animations: [],
-    particles: [],
-    assets: [],
-    postProcess: {
-      enabled: true,
-      effects: [
-        { id: "bloom", type: "bloom", name: "Bloom", enabled: false, intensity: 0.22, radius: 8, threshold: 0.72 },
-        { id: "vignette", type: "vignette", name: "Vignette", enabled: true, intensity: 0.24, softness: 0.68 },
-        { id: "color-adjust", type: "colorAdjust", name: "Color Adjust", enabled: true, brightness: 1, contrast: 1, saturation: 1, hue: 0 },
-        { id: "chromatic-aberration", type: "chromaticAberration", name: "Chromatic Aberration", enabled: false, amount: 3, intensity: 0.32 },
-        { id: "pixelate", type: "pixelate", name: "Pixelate", enabled: false, size: 4 },
-        { id: "crt", type: "crt", name: "CRT", enabled: false, scanlines: 0.18, noise: 0.04, curvature: 0.12 },
-      ],
-    },
-  };
+  return projectContract.createProject({ name });
 }
 
 function assertRevision(expected: unknown, actual: number): asserts expected is number {

@@ -8,6 +8,8 @@ Use the AH2D CLI for project JSON changes instead of rewriting project files by 
 
 ```text
 npm run ah2d -- capabilities --pretty
+npm run ah2d -- schema list --pretty
+npm run ah2d -- schema show --component Transform --pretty
 npm run ah2d -- inspect --file <project.json> --pretty
 npm run ah2d -- validate --file <project.json> --engine --pretty
 ```
@@ -19,11 +21,15 @@ npm run ah2d -- entity create --file <project.json> --scene main --id player --n
 npm run ah2d -- entity create --file <project.json> --scene main --id player --name Player --write --expect-sha256 <hash>
 ```
 
-For multiple related changes, prefer one atomic `apply` call with an operations JSON file. Discover the supported operations and enums through `capabilities`; do not parse human help text. CLI stdout is `ah2d.cli/v1` JSON by default. Use `--format text` only for humans.
+For multiple related changes, prefer one atomic `apply` call with an operations JSON file. Discover operations/enums through `capabilities` and component contracts through `schema list` plus `schema show --component`; do not parse human help text. CLI stdout is `ah2d.cli/v1` JSON by default. Use `--format text` only for humans.
 
 Use `--scene-name` and `--entity-name` only for explicit name lookup; ordinary selectors are stable IDs. Use `entity reparent ... --root` to unparent rather than overloading a possible Entity ID such as `root`.
 
 Do not replace a universal project with `Engine.export()`. That method intentionally exports the active ECS runtime snapshot. Use `ecs export` only when an ECS snapshot is explicitly required.
+
+Universal Project version `4` is the authoring source of truth. New projects use `dataModel: { id: "ah2d.ecs", version: 1, componentSchemaVersion: 1 }`; this descriptor and the lossy ECS snapshot version `3` are independent version axes. Persist with the `authoring` component profile, use `runtime` inside systems, and use `snapshot` only for active ECS exports.
+
+Component values must be JSON-safe objects or arrays with safe PascalCase names. `components.<canonical-or-alias>` has precedence over legacy flat/top-level storage. Preserve reported `storage` and `provenance`, unknown fields/components, and conflicting lower-precedence copies unless an explicit migration says otherwise. Compatibility validation warns on duplicate-location conflicts; strict validation rejects them. Register custom schemas before Engine load/create when defaults, aliases, per-profile rules, normalization, or component migrations are required.
 
 Do not edit `.ah2d-data/collaboration/*.json` directly. A Studio-managed project must be changed through `/api/projects/:projectId/document` with the latest numeric `expectedRevision` and an idempotent `clientMutationId`. The Studio revision is not the CLI SHA-256 precondition. On `REVISION_CONFLICT`, fetch, merge, and retry as a new mutation.
 

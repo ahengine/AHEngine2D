@@ -18,13 +18,17 @@ Keep Studio identity and collaboration concerns outside the framework-neutral En
 ## Source-of-truth rules
 
 - The source of truth is a Universal project with `format: "AH2D"`, `version: 4`, and a non-empty `scenes` array.
+- New project documents declare `dataModel: { id: "ah2d.ecs", version: 1, componentSchemaVersion: 1 }`. Treat project version, data-model version, and component-schema version as separate compatibility axes; tolerate an otherwise valid legacy v4 document with no descriptor.
 - `currentSceneId` selects the active Scene.
 - Top-level `scene` is a compatibility mirror of the active Scene's `objects`; do not update it independently.
 - Use stable Scene and Entity IDs in code. Do not bind gameplay to display names.
 - `Engine.export()` and `ah2d ecs export` produce a lossy active ECS snapshot with version `3`. Never overwrite a Universal version `4` project with that snapshot.
 - Preserve unknown fields. They may belong to game code, a renderer adapter, or a future Editor version. Use the CLI for lossless mutations because the current HTML Editor reconstructs several top-level sections during Load/Export.
-- Components must contain JSON-serializable data. Keep functions, DOM nodes, textures, sockets, and circular references in runtime-side Maps.
-- The Editor's authoring dialect uses flat `x/y/rot/sx/sy`, `rigidbody`, and `collider`. Generic ECS components live under `components`.
+- Components must be JSON-safe objects or arrays. Keep functions, `undefined`, non-finite numbers, DOM nodes, textures, sockets, class instances, and circular references in runtime-side Maps.
+- Component keys use safe PascalCase. The Editor's authoring dialect uses flat `x/y/rot/sx/sy`, `rigidbody`, and `collider`; generic ECS components live under `components`.
+- When the same component exists in multiple locations, `components.<canonical-or-alias>` has precedence over legacy/flat authoring fields. Preserve the selected `storage`/`provenance`; do not silently merge, delete, or canonicalize duplicate locations. Normal validation warns on conflicts and strict validation rejects them.
+- Use the `authoring` schema profile for persisted project data, `runtime` for Engine/system values, and `snapshot` only for active ECS exports. Authoring normalization removes registered runtime-derived fields while preserving unknown JSON extensions.
+- Compatibility validation may accept legacy numeric/boolean strings without coercing them; runtime decoding remains strict. Normalize authored scalar types before Engine load, and use `--strict` in CI.
 - Top-level `postProcess` is project authoring data. Preserve effect IDs, unknown effect types, ordering, and unknown parameters unless the task explicitly changes them.
 - A CLI-managed file uses a SHA-256 precondition (`--expect-sha256`). A Studio-managed project uses a numeric document `revision` (`expectedRevision`). These are separate concurrency domains and must not be substituted for one another.
 
@@ -36,11 +40,12 @@ Run these commands from the repository root:
 npm run ah2d -- doctor --pretty
 npm run ah2d -- capabilities --pretty
 npm run ah2d -- schema list --pretty
+npm run ah2d -- schema show --component Transform --pretty
 npm run check
 npm run test:server
 ```
 
-Do not scrape human help text to discover commands. Use the machine-readable result of `capabilities` and `schema show`.
+Do not scrape human help text to discover commands. Use the machine-readable result of `capabilities`, `schema list`, and `schema show --component <Type>`. The component descriptor includes aliases, all three profiles, defaults, runtime-only fields, and storage metadata.
 
 For an existing game project:
 
@@ -254,6 +259,13 @@ engine.graph.detach('sword');
 
 ## Component workflow
 
+Inspect the registered contract before mutating a built-in component:
+
+```powershell
+npm run ah2d -- schema list --pretty
+npm run ah2d -- schema show --component Rigidbody --pretty
+```
+
 Add physics and game-specific data through components:
 
 ```powershell
@@ -272,6 +284,10 @@ PlayerController: { speed: 260, jumpImpulse: 420 }
 EnemyAI: { state: 'idle', detectionRadius: 300 }
 Collectible: { score: 10, consumed: false }
 ```
+
+The default registry is open-world, so an unknown PascalCase custom component under `components.<Type>` survives CLI reads, validation, migration, and writes with its unknown fields intact. If game code needs a stronger contract, call `engine.registerComponent(definition)` before `engine.load()` or `engine.createEntity()`, or pass a prepared `AH2D.ComponentSchemaRegistry` into the Engine. Define `authoring`, `runtime`, and `snapshot` schemas when they differ; otherwise omitted runtime/snapshot profiles inherit authoring. Add ordered migrations for every schema-version step and fail on a missing step rather than guessing.
+
+CLI component mutations preserve the resolved provenance. If both `components.Rigidbody` and `rigidbody` exist, the former is effective and only it is changed or deleted; the legacy copy becomes effective only after the higher-precedence copy is removed. Review reported conflicts before writing. The standalone CLI knows the built-in registry and generic open-world custom values; it does not execute a game's registration code.
 
 Implement behavior in game systems:
 
@@ -387,6 +403,7 @@ If the library is unavailable, `runtime.backend` reports `editor-bridge`. Do not
 Browser bootstrap:
 
 ```html
+<script src="./engine/AH2DDataModel.js"></script>
 <script src="./engine/AH2DEngine.js"></script>
 ```
 
@@ -419,12 +436,13 @@ npm run ah2d -- validate --file game.ah2d.json --engine --pretty
 When a task requires changing `engine/AH2DEngine.js`:
 
 1. Preserve the framework-neutral Universal data model.
-2. Keep Custom, PixiJS, and PhaserJS runtime selection functional.
-3. Preserve the built-in deterministic physics fallback.
-4. Add or update `engine/AH2DEngine.test.js`.
-5. Update `README.md` when the public API or serialized contract changes.
-6. Update CLI migration/validation when project data changes.
-7. Bump versions only when the task explicitly defines a release/versioning change or repository policy requires it.
+2. Keep the shared `ah2d.ecs` registry, all three component profiles, storage/provenance resolution, validation, and migration behavior aligned across Engine and CLI.
+3. Keep Custom, PixiJS, and PhaserJS runtime selection functional.
+4. Preserve the built-in deterministic physics fallback.
+5. Add or update `engine/AH2DEngine.test.js` and the focused data-model/CLI tests when applicable.
+6. Update `README.md` when the public API or serialized contract changes.
+7. Update CLI schema discovery, migration, and validation when project data changes.
+8. Bump versions only when the task explicitly defines a release/versioning change or repository policy requires it.
 
 Do not silently convert project version `4` to the ECS snapshot version `3`.
 
@@ -437,6 +455,8 @@ A game-development task is complete only when all applicable items are true:
 - Runtime choice is explicit and renderer-host responsibilities are implemented.
 - Physics data validates and deterministic behavior is tested where relevant.
 - Universal project data remains version `4` and unknown fields are preserved.
+- The `dataModel` descriptor and component profile/version changes are deliberate, and Universal data has not been confused with snapshot version `3`.
+- Component storage provenance, `components.*` precedence, legacy copies, and unknown custom components are preserved unless explicit migration requirements say otherwise.
 - `scene` mirrors the active Scene.
 - Post Process effect IDs, ordering, custom parameters, and project-specific values are preserved.
 - Dry-run was reviewed before material project writes.

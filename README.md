@@ -30,6 +30,7 @@ AH2D Studio (Next.js)
 - `src/lib/auth`: session، password hashing و RBAC سراسری.
 - `src/lib/collaboration`: ذخیرهٔ پروژه، RBAC پروژه، comment، history، presence و event stream.
 - `engine/AH2DEngine.js`: هستهٔ Runtime، ECS، Scene Graph و Physics.
+- `engine/AH2DDataModel.js`: قرارداد واحد Entity/Component، رجیستری schema، validation، migration و codec سازگار با داده‌های قدیمی.
 - `engine/cli/ah2d.js`: CLI بدون dependency برای Agent و CI.
 - `engine/CLI.md`: مرجع کامل فرمان‌های CLI.
 - `docs/COLLABORATION.md`: قرارداد کامل Auth، RBAC و API مشارکت.
@@ -143,6 +144,47 @@ Editor تعبیه‌شده فقط پس از Login تحویل داده می‌ش�
 
 هیچ‌وقت فایل Universal نسخهٔ ۴ را با نتیجهٔ `Engine.export()` جایگزین نکنید؛ snapshot نسخهٔ ۳ Sceneها و resourceهای پروژه را ندارد.
 
+### قرارداد واحد ECS و Component Schema
+
+Universal Project نسخهٔ ۴ منبع حقیقت **Authoring** است. پروژه‌های جدید descriptor زیر را حمل می‌کنند تا مصرف‌کننده بتواند قرارداد ECS را مستقل از نسخهٔ فایل پروژه تشخیص دهد:
+
+```json
+{
+  "dataModel": {
+    "id": "ah2d.ecs",
+    "version": 1,
+    "componentSchemaVersion": 1
+  }
+}
+```
+
+`version: 4` نسخهٔ container پروژه و `componentSchemaVersion: 1` نسخهٔ schema مربوط به componentها است؛ این دو را با snapshot نسخهٔ `3` یکی نگیرید. descriptor در پروژه‌های جدید و ECS snapshotها صادر می‌شود. پروژهٔ قدیمیِ معتبر که `dataModel` ندارد همچنان در حالت سازگار خوانده می‌شود و migration صرفاً برای افزودن descriptor، storage موجود را بازنویسی نمی‌کند.
+
+یک component سه profile دارد:
+
+| Profile | کاربرد | فیلدهای مشتق‌شدهٔ Runtime |
+| --- | --- | --- |
+| `authoring` | دادهٔ قابل‌ویرایش و قابل‌ذخیره در Universal Project | حذف می‌شوند؛ فیلدهای ناشناختهٔ JSON حفظ می‌شوند |
+| `runtime` | مقدار normalizeشده‌ای که Engine و systemها مصرف می‌کنند | مجازند، مانند `Transform.world` و جرم/اینرسی مشتق‌شده |
+| `snapshot` | وضعیت فعال ECS در `Engine.export()` / `ah2d ecs export` | برای بازسازی وضعیت Runtime حفظ می‌شوند |
+
+حالت `compat` برای بررسی پروژه‌های قدیمی، رشته‌های عددی/بولی را از نظر schema می‌پذیرد اما آن‌ها را تبدیل نمی‌کند؛ مسیر `runtime` عمداً strict است. بنابراین پیش از اجرای Engine باید این مقادیر در Authoring به نوع واقعی `number`/`boolean` تبدیل شوند یا validation با `--strict` اجرا شود.
+
+مقادیر component باید object یا array و کاملاً JSON-serializable باشند؛ function، `undefined`، عدد غیرمتناهی، object با prototype خاص و reference دوری رد می‌شوند. نام componentها PascalCase امن (`^[A-Z][A-Za-z0-9]*$`) است.
+
+#### precedence، storage و provenance
+
+یک component built-in ممکن است هم در dialect تخت Editor و هم در `components` وجود داشته باشد. ترتیب resolution همیشه چنین است:
+
+1. `components.<CanonicalName>`؛ سپس aliasهای ثبت‌شده در `components`، مانند `components.RigidBody` یا `components.Body`.
+2. محل‌های legacy/تخت همان component، مانند `transform` یا `x/y/rot/sx/sy`، `rigidbody`/`rigidBody` و `collider`.
+
+پس `components.*` بر legacy precedence دارد. اگر دو محل مقدار متفاوتی داشته باشند، API/CLI محل انتخاب‌شده را در `storage` و `provenance` برمی‌گرداند و conflict را گزارش می‌کند؛ validation عادی آن را warning و `--strict` آن را error می‌داند. mutationهای `component put|set|patch|delete` provenance موجود را حفظ می‌کنند و فقط همان محل مؤثر را تغییر می‌دهند. مقدار legacy دیگر و تمام componentها/فیلدهای ناشناخته دست‌نخورده می‌مانند. برای canonicalization صریح می‌توان از API codec با storage برابر `canonical` استفاده کرد؛ migration پروژه storage را صرفاً برای یکدست‌سازی جابه‌جا نمی‌کند.
+
+در storage فشردهٔ flat، `Transform` و `Renderable` روی خود Entity پخش شده‌اند؛ به همین دلیل نوشتن مقدار جدید، propertyهای sibling حذف‌شده را نگه می‌دارد. در `components.*`، مقدار component به‌طور کامل جایگزین می‌شود. برای تغییر فیلدی از `patch` و برای replace کاملاً مستقل از canonical storage استفاده کنید.
+
+Registry پیش‌فرض این componentها را می‌شناسد: `Name`، `Transform`، `Renderable`، `Rigidbody` (با aliasهای `RigidBody` و `Body`)، `Collider`، `Hidden`، `Locked`، `PrefabInstance`، `Camera`، `Light`، `ShadowCaster`، `Animation`، `Tilemap`، `ParticleEmitter`، `BoxCollider`، `BoxCollider2D`، `CircleCollider` و `CircleCollider2D`. registry به‌صورت پیش‌فرض open-world است: component سفارشیِ PascalCase زیر `components.<Type>` حفظ و به‌عنوان object/array اعتبارسنجی می‌شود، حتی اگر هنوز schema اختصاصی ثبت نشده باشد.
+
 ### ساختار Universal JSON
 
 نمونهٔ فشردهٔ خروجی واقعی Editor:
@@ -151,6 +193,11 @@ Editor تعبیه‌شده فقط پس از Login تحویل داده می‌ش�
 {
   "format": "AH2D",
   "version": 4,
+  "dataModel": {
+    "id": "ah2d.ecs",
+    "version": 1,
+    "componentSchemaVersion": 1
+  },
   "engine": {
     "name": "AH2D Engine",
     "version": "0.3.0",
@@ -298,7 +345,7 @@ Shortcutهای ورودی و component متناظر در Runtime:
 | `prefab: true` | `PrefabInstance` |
 | `rigidbody` یا `rigidBody` | `Rigidbody` |
 | `collider` | `Collider` |
-| `components.*` | همان component سفارشی |
+| `components.*` | component canonical یا سفارشی؛ در تداخل با shortcutهای بالا precedence دارد |
 
 ## کار امن با پروژه از طریق CLI
 
@@ -306,7 +353,9 @@ Shortcutهای ورودی و component متناظر در Runtime:
 
 ```powershell
 npm run ah2d -- capabilities --pretty
+npm run ah2d -- schema list --pretty
 npm run ah2d -- schema show --name project --pretty
+npm run ah2d -- schema show --component Transform --pretty
 npm run ah2d -- inspect --file game.ah2d.json --pretty
 npm run ah2d -- validate --file game.ah2d.json --engine --pretty
 ```
@@ -345,6 +394,7 @@ my-game/
 ├── index.html
 ├── game.ah2d.json
 ├── engine/
+│   ├── AH2DDataModel.js
 │   └── AH2DEngine.js
 ├── src/
 │   ├── main.js
@@ -374,6 +424,7 @@ my-game/
   </head>
   <body>
     <canvas id="game" width="1920" height="1080"></canvas>
+    <script src="./engine/AH2DDataModel.js"></script>
     <script src="./engine/AH2DEngine.js"></script>
     <script type="module" src="./src/main.js"></script>
   </body>
@@ -408,7 +459,7 @@ console.log('Scene:', engine.activeSceneId);
 console.log('Entities:', [...engine.ecs.entities]);
 ```
 
-فایل `AH2DEngine.js` فعلاً ES Module/CommonJS export ندارد و در Browser روی `window.AH2D` قرار می‌گیرد.
+در Browser، `AH2DDataModel.js` قرارداد را روی `window.AH2DDataModel` و `AH2DEngine.js` API اجرا را روی `window.AH2D` قرار می‌دهد؛ در Node، خود Engine وابستگی DataModel را با `require` بارگذاری می‌کند.
 
 ### حلقهٔ بازی و Custom Canvas Renderer
 
@@ -559,7 +610,30 @@ for (const id of engine.ecs.query('Health', 'EnemyAI')) {
 engine.ecs.remove(enemyId, 'Damage');
 ```
 
-Componentها باید دادهٔ JSON-serializable باشند. Function، DOM node، texture object یا referenceهای circular را داخل component ذخیره نکنید؛ resourceهای Runtime را در Mapهای جدا و بر اساس Entity ID نگه دارید.
+Componentها باید object/array کاملاً JSON-safe باشند. Function، `undefined`، `NaN`/`Infinity`، DOM node، texture/class instance یا referenceهای circular را داخل component ذخیره نکنید؛ resourceهای Runtime را در Mapهای جدا و بر اساس Entity ID نگه دارید.
+
+Registry پیش‌فرض open-world است و `Health`/`EnemyAI` را با schema عمومی حفظ می‌کند. برای defaults و validation دقیق، component سفارشی را پیش از load/create ثبت کنید:
+
+```js
+engine.registerComponent({
+  type: 'Health',
+  schemaVersion: 1,
+  schemas: {
+    authoring: {
+      type: 'object',
+      required: ['current', 'maximum'],
+      properties: {
+        current: { type: 'number', minimum: 0 },
+        maximum: { type: 'number', exclusiveMinimum: 0 }
+      },
+      additionalProperties: true
+    }
+  },
+  defaults: { current: 100, maximum: 100 }
+});
+```
+
+اگر schemaهای `runtime` یا `snapshot` داده نشوند، از `authoring` ارث می‌برند. definition همچنین می‌تواند `aliases`، `runtimeOnlyFields`، `normalize`، `storage` و migrationهای ترتیبی داشته باشد. برای policy بسته، `new AH2D.ComponentSchemaRegistry({ openWorld: false })` بسازید و آن را با گزینهٔ `componentSchemas` به Engine بدهید. CLI مستقل، registry built-in و schema عمومی componentهای سفارشی را می‌شناسد ولی کد registration بازی را اجرا نمی‌کند.
 
 ### Parent / Child و Scene Graph
 
@@ -833,6 +907,7 @@ npm run ah2d -- simulate --file game.ah2d.json --scene level-1 --steps 600 --dt 
 
 ```js
 new AH2D.Engine(options)
+engine.registerComponent(definition)
 engine.load(project, { sceneId })
 engine.loadScene(sceneId)
 engine.createEntity(data)
@@ -892,6 +967,8 @@ engine.events.emit(type, payload)
 
 ```powershell
 npm run check
+npm run ah2d -- schema list --pretty
+npm run ah2d -- schema show --component Transform --pretty
 npm test
 npm run ah2d -- validate --file game.ah2d.json --engine --pretty
 ```

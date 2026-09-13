@@ -1,6 +1,11 @@
 (function (global) {
   'use strict';
 
+  const DataModel = global.AH2DDataModel || (
+    typeof module === 'object' && module.exports ? require('./AH2DDataModel.js') : null
+  );
+  if (!DataModel) throw new Error('AH2DDataModel must be loaded before AH2DEngine');
+
   const VERSION = '0.3.0';
   const uid = () => `ah2d_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -11,13 +16,29 @@
   }
 
   class ECS {
-    constructor(events) { this.events = events; this.entities = new Set(); this.components = new Map(); }
-    create(id = uid()) { this.entities.add(id); this.events.emit('entity:create', id); return id; }
+    constructor(events, schemas = DataModel.createDefaultComponentRegistry()) {
+      this.events = events;
+      this.schemas = schemas;
+      this.entities = new Set();
+      this.components = new Map();
+    }
+    create(id = uid()) {
+      if (typeof id !== 'string' || !id.trim()) throw new DataModel.ComponentSchemaError('E_ENTITY_ID', 'Entity id must be a non-empty string');
+      if (this.entities.has(id)) throw new DataModel.ComponentSchemaError('E_ENTITY_EXISTS', `Entity already exists: ${id}`);
+      this.entities.add(id); this.events.emit('entity:create', id); return id;
+    }
     destroy(id) { this.entities.delete(id); this.components.forEach(store => store.delete(id)); this.events.emit('entity:destroy', id); }
-    add(id, type, value = {}) { if (!this.entities.has(id)) this.create(id); const store = this.components.get(type) || new Map(); store.set(id, value); this.components.set(type, store); return value; }
-    get(id, type) { return this.components.get(type)?.get(id); }
-    has(id, type) { return this.components.get(type)?.has(id) || false; }
-    remove(id, type) { this.components.get(type)?.delete(id); }
+    add(id, type, value = {}) {
+      const canonical = this.schemas.resolve(type);
+      if (!canonical) throw new DataModel.ComponentSchemaError('E_COMPONENT_NAME', `Invalid or unknown Component name: ${type || '(empty)'}`);
+      const normalized = this.schemas.assert(canonical, value, { profile: DataModel.PROFILES.RUNTIME });
+      if (!this.entities.has(id)) this.create(id);
+      const store = this.components.get(canonical) || new Map();
+      store.set(id, normalized); this.components.set(canonical, store); return normalized;
+    }
+    get(id, type) { const canonical = this.schemas.resolve(type); return canonical ? this.components.get(canonical)?.get(id) : undefined; }
+    has(id, type) { const canonical = this.schemas.resolve(type); return canonical ? (this.components.get(canonical)?.has(id) || false) : false; }
+    remove(id, type) { const canonical = this.schemas.resolve(type); if (canonical) this.components.get(canonical)?.delete(id); }
     query(...types) { return [...this.entities].filter(id => types.every(type => this.has(id, type))); }
     clear() { this.entities.clear(); this.components.clear(); }
   }
@@ -166,6 +187,36 @@
   const normalize = value => {
     const length = Math.hypot(value.x, value.y);
     return length > PHYSICS_EPSILON ? { x: value.x / length, y: value.y / length } : { x: 1, y: 0 };
+  };
+  const isPlainObject = value => {
+    if (!value || Object.prototype.toString.call(value) !== '[object Object]') return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  };
+  const assertDataModelCompatibility = document => {
+    if (!Object.prototype.hasOwnProperty.call(document, 'dataModel')) return;
+    const descriptor = document.dataModel;
+    const fail = (code, message, pointer, details) => {
+      const item = { severity: 'error', code, message, pointer };
+      if (details !== undefined) item.details = details;
+      throw new DataModel.ComponentSchemaError(code, message, { pointer, details, diagnostics: [item] });
+    };
+    if (!isPlainObject(descriptor)) fail('E_DATA_MODEL_TYPE', 'dataModel must be a plain object', '/dataModel');
+    if (descriptor.id !== DataModel.DATA_MODEL_ID) {
+      fail('E_DATA_MODEL_ID', `Unsupported data model id: ${descriptor.id == null ? '(missing)' : descriptor.id}`, '/dataModel/id', {
+        expected: DataModel.DATA_MODEL_ID,
+        actual: descriptor.id
+      });
+    }
+    for (const [key, supported, typeCode, futureCode] of [
+      ['version', DataModel.DATA_MODEL_VERSION, 'E_DATA_MODEL_VERSION_TYPE', 'E_FUTURE_DATA_MODEL_VERSION'],
+      ['componentSchemaVersion', DataModel.COMPONENT_SCHEMA_VERSION, 'E_COMPONENT_SCHEMA_VERSION_TYPE', 'E_FUTURE_COMPONENT_SCHEMA_VERSION']
+    ]) {
+      const value = descriptor[key];
+      const pointer = `/dataModel/${key}`;
+      if (!Number.isInteger(value) || value < 0) fail(typeCode, `${key} must be a non-negative integer`, pointer, { actual: value });
+      if (value > supported) fail(futureCode, `Unsupported future ${key}: ${value}`, pointer, { supported, actual: value });
+    }
   };
   const clone = value => {
     if (value == null) return value;
@@ -414,21 +465,27 @@
       engine.ecs.entities.forEach(entityId => {
         const rigidbody = engine.ecs.get(entityId, 'Rigidbody') || engine.ecs.get(entityId, 'RigidBody');
         const generic = engine.ecs.get(entityId, 'Collider');
-        const box = engine.ecs.get(entityId, 'BoxCollider2D') || engine.ecs.get(entityId, 'BoxCollider');
-        const circle = engine.ecs.get(entityId, 'CircleCollider2D') || engine.ecs.get(entityId, 'CircleCollider');
-        if (!rigidbody && !generic && !box && !circle) return;
+        const box2D = engine.ecs.get(entityId, 'BoxCollider2D');
+        const box = engine.ecs.get(entityId, 'BoxCollider');
+        const circle2D = engine.ecs.get(entityId, 'CircleCollider2D');
+        const circle = engine.ecs.get(entityId, 'CircleCollider');
+        if (!rigidbody && !generic && !box2D && !box && !circle2D && !circle) return;
         eligible.add(entityId);
         const transform = engine.ecs.get(entityId, 'Transform') || {};
         const renderable = engine.ecs.get(entityId, 'Renderable') || {};
         const colliderSources = [];
-        const append = source => {
+        const append = (source, forcedShape) => {
           if (!source) return;
-          if (Array.isArray(source)) colliderSources.push(...source);
-          else if (Array.isArray(source.colliders)) colliderSources.push(...source.colliders);
-          else if (Array.isArray(source.shapes)) colliderSources.push(...source.shapes);
-          else colliderSources.push(source);
+          const entries = Array.isArray(source)
+            ? source
+            : (Array.isArray(source.colliders) ? source.colliders : (Array.isArray(source.shapes) ? source.shapes : [source]));
+          entries.filter(Boolean).forEach(item => colliderSources.push(forcedShape && typeof item === 'object' ? { ...item, shape: forcedShape } : item));
         };
-        append(generic); if (box) append({ ...box, shape: 'box' }); if (circle) append({ ...circle, shape: 'circle' });
+        append(generic);
+        append(box2D, 'box');
+        append(box, 'box');
+        append(circle2D, 'circle');
+        append(circle, 'circle');
         let body = this.bodies.get(entityId);
         const isNew = !body;
         if (!body) body = this.createBody(entityId, { transform, rigidbody: rigidbody || { type: 'static' }, collider: colliderSources, renderable, managedByECS: true });
@@ -953,7 +1010,17 @@
   class Engine {
     constructor(options = {}) {
       this.events = new EventBus();
-      this.ecs = new ECS(this.events);
+      if (options.entityCodec instanceof DataModel.EntityCodec) {
+        this.entityCodec = options.entityCodec;
+        this.componentSchemas = options.entityCodec.registry;
+      } else {
+        this.componentSchemas = options.componentSchemas instanceof DataModel.ComponentSchemaRegistry
+          ? options.componentSchemas
+          : DataModel.createDefaultComponentRegistry();
+        this.entityCodec = new DataModel.EntityCodec(this.componentSchemas);
+      }
+      this.schemas = this.componentSchemas;
+      this.ecs = new ECS(this.events, this.componentSchemas);
       this.graph = new SceneGraph(this.events);
       this.transform = new TransformSystem(this);
       this.camera = new CameraSystem(this);
@@ -981,6 +1048,10 @@
       this.activeSceneId = null;
       if (options.runtime) this.useRuntime(options.runtime, options.runtimeOptions);
     }
+    registerComponent(definition) {
+      this.componentSchemas.register(definition);
+      return this.componentSchemas.describe(definition.type);
+    }
     useRuntime(type, options = {}) {
       const target = this.runtimeTarget;
       this.runtime?.destroy();
@@ -992,36 +1063,34 @@
       this.events.emit('runtime:change', { runtime: this.runtime, name: this.runtime.name });
       return this.runtime;
     }
+    _decodeEntity(data = {}) {
+      const input = data === undefined ? {} : data;
+      const source = isPlainObject(input) && (!Object.prototype.hasOwnProperty.call(input, 'id') || input.id == null)
+        ? { ...input, id: uid() }
+        : input;
+      return this.entityCodec.decodeToRuntime(source, { profile: DataModel.PROFILES.RUNTIME });
+    }
     createEntity(data = {}) {
-      const id = this.ecs.create(data.id);
-      const components = data.components && typeof data.components === 'object' ? data.components : {};
-      const transformSource = components.Transform || data.transform || {};
-      this.ecs.add(id, 'Name', clone(components.Name || { value: data.name || 'Game Object' }));
-      this.ecs.add(id, 'Transform', {
-        ...clone(transformSource),
-        x: finite(transformSource.x ?? data.x, 0),
-        y: finite(transformSource.y ?? data.y, 0),
-        rotation: finite(transformSource.rotation ?? data.rotation ?? data.rot, 0),
-        scaleX: finite(transformSource.scaleX ?? data.scaleX ?? data.sx, 1),
-        scaleY: finite(transformSource.scaleY ?? data.scaleY ?? data.sy, 1),
-        world: Array.isArray(transformSource.world) ? [...transformSource.world] : [1, 0, 0, 1, 0, 0]
-      });
-      Object.entries(components).forEach(([type, value]) => {
-        if (type !== 'Name' && type !== 'Transform') this.ecs.add(id, type, clone(value));
-      });
-      if (data.visible === false && !this.ecs.has(id, 'Hidden')) this.ecs.add(id, 'Hidden', {});
-      if (data.locked && !this.ecs.has(id, 'Locked')) this.ecs.add(id, 'Locked', {});
-      if (data.kind && !this.ecs.has(id, 'Renderable')) this.ecs.add(id, 'Renderable', { kind: data.kind, width: data.w, height: data.h, color: data.color, assetId: data.assetId, imageSrc: data.imageSrc });
-      if (data.prefab && !this.ecs.has(id, 'PrefabInstance')) this.ecs.add(id, 'PrefabInstance', { assetId: data.assetId || null });
-      const rigidbody = data.rigidbody || data.rigidBody;
-      if (rigidbody && !this.ecs.has(id, 'Rigidbody')) this.ecs.add(id, 'Rigidbody', clone(rigidbody));
-      if (data.collider && !this.ecs.has(id, 'Collider')) this.ecs.add(id, 'Collider', clone(data.collider));
-      this.graph.attach(id, data.parentId || null);
+      const decoded = this._decodeEntity(data);
+      if (this.ecs.entities.has(decoded.id)) throw new DataModel.ComponentSchemaError('E_ENTITY_EXISTS', `Entity already exists: ${decoded.id}`);
+      if (decoded.parentId && (decoded.id === decoded.parentId || this.graph.isDescendant(decoded.parentId, decoded.id))) {
+        throw new Error('SceneGraph cycle detected');
+      }
+      const id = this.ecs.create(decoded.id);
+      Object.entries(decoded.components).forEach(([type, value]) => this.ecs.add(id, type, clone(value)));
+      this.graph.attach(id, decoded.parentId);
+      if (decoded.conflicts.length) {
+        this.events.emit('component:conflict', { entityId: id, conflicts: clone(decoded.conflicts) });
+      }
       return id;
     }
     load(document, options = {}) {
       if (typeof options === 'string') options = { sceneId: options };
-      const source = document && typeof document === 'object' ? document : {};
+      if (!isPlainObject(document)) {
+        throw new DataModel.ComponentSchemaError('E_DOCUMENT_TYPE', 'Project document must be a plain object');
+      }
+      const source = document;
+      assertDataModelCompatibility(source);
       const scenes = Array.isArray(source.scenes) ? source.scenes : [];
       const requestedSceneId = options.sceneId || source.currentSceneId || source.meta?.currentSceneId || null;
       const activeScene = scenes.length
@@ -1031,15 +1100,57 @@
       const entities = activeScene
         ? (Array.isArray(activeScene.objects) ? activeScene.objects : (Array.isArray(activeScene.scene) ? activeScene.scene : []))
         : (Array.isArray(source.scene) ? source.scene : (Array.isArray(source.entities) ? source.entities : []));
-      this.document = clone(source);
-      this.activeSceneId = activeScene?.id || null;
-      this.postProcess.load(source.postProcess);
+      const nextDocument = clone(source);
       if (activeScene) {
-        this.document.currentSceneId = activeScene.id;
-        if (this.document.meta && typeof this.document.meta === 'object') this.document.meta.currentSceneId = activeScene.id;
+        nextDocument.currentSceneId = activeScene.id;
+        if (nextDocument.meta && typeof nextDocument.meta === 'object') nextDocument.meta.currentSceneId = activeScene.id;
       }
+      const stagedPostProcess = new PostProcessSystem(null);
+      stagedPostProcess.load(source.postProcess);
+      const nextPostProcess = stagedPostProcess.toJSON();
+      const stagedEvents = new EventBus();
+      const stagedEcs = new ECS(stagedEvents, this.componentSchemas);
+      const stagedGraph = new SceneGraph(stagedEvents);
+      const decodedEntities = entities.map(entity => this._decodeEntity(entity));
+      const nextActiveScene = activeScene && Array.isArray(nextDocument.scenes)
+        ? nextDocument.scenes[scenes.indexOf(activeScene)]
+        : null;
+      const nextEntities = nextActiveScene
+        ? (Array.isArray(activeScene.objects) ? nextActiveScene.objects : nextActiveScene.scene)
+        : (Array.isArray(source.scene) ? nextDocument.scene : nextDocument.entities);
+      if (Array.isArray(nextEntities)) {
+        decodedEntities.forEach((decoded, index) => {
+          const entity = nextEntities[index];
+          if (entity && typeof entity === 'object' && (!Object.prototype.hasOwnProperty.call(entity, 'id') || entity.id == null)) entity.id = decoded.id;
+        });
+      }
+      if (nextActiveScene) nextDocument.scene = Array.isArray(nextEntities) ? clone(nextEntities) : [];
+      const stagedIds = new Set(decodedEntities.map(entity => entity.id));
+      const dangling = decodedEntities.find(entity => entity.parentId && !stagedIds.has(entity.parentId));
+      if (dangling) {
+        throw new DataModel.ComponentSchemaError('E_DANGLING_PARENT', `Parent does not exist in this Scene: ${dangling.parentId}`, {
+          details: { entityId: dangling.id, parentId: dangling.parentId }
+        });
+      }
+      decodedEntities.forEach(decoded => {
+        stagedEcs.create(decoded.id);
+        Object.entries(decoded.components).forEach(([type, value]) => stagedEcs.add(decoded.id, type, value));
+        stagedGraph.attach(decoded.id, decoded.parentId);
+      });
+
       this.physics.clear(); this.ecs.clear(); this.graph.clear();
-      entities.forEach(entity => this.createEntity(entity));
+      stagedEcs.entities.forEach(id => this.ecs.entities.add(id));
+      stagedEcs.components.forEach((store, type) => this.ecs.components.set(type, store));
+      stagedGraph.parent.forEach((parent, child) => this.graph.parent.set(child, parent));
+      stagedGraph.children.forEach((children, id) => this.graph.children.set(id, children));
+      this.document = nextDocument;
+      this.activeSceneId = activeScene?.id || null;
+      this.postProcess.load(nextPostProcess);
+      decodedEntities.forEach(decoded => {
+        this.events.emit('entity:create', decoded.id);
+        this.events.emit('graph:attach', { child: decoded.id, parent: decoded.parentId });
+        if (decoded.conflicts.length) this.events.emit('component:conflict', { entityId: decoded.id, conflicts: clone(decoded.conflicts) });
+      });
       this.transform.update(); this.events.emit('document:load', source);
       if (activeScene) this.events.emit('scene:change', { id: activeScene.id, name: activeScene.name || 'Scene', scene: activeScene, engine: this });
       return this;
@@ -1051,12 +1162,24 @@
     export() {
       return {
         format: 'AH2D', version: 3, engine: VERSION,
+        dataModel: {
+          id: DataModel.DATA_MODEL_ID,
+          version: DataModel.DATA_MODEL_VERSION,
+          componentSchemaVersion: DataModel.COMPONENT_SCHEMA_VERSION
+        },
         postProcess: this.postProcess.toJSON(),
         entities: [...this.ecs.entities].map(id => ({
           id,
           name: this.ecs.get(id, 'Name')?.value,
           parentId: this.graph.getParent(id),
-          components: Object.fromEntries([...this.ecs.components].filter(([, store]) => store.has(id)).map(([type, store]) => [type, clone(store.get(id))]))
+          components: Object.fromEntries(
+            [...this.ecs.components]
+              .filter(([, store]) => store.has(id))
+              .map(([type, store]) => [type, this.componentSchemas.normalize(type, store.get(id), {
+                profile: DataModel.PROFILES.SNAPSHOT,
+                filterRuntimeOnly: false
+              })])
+          )
         }))
       };
     }
@@ -1167,6 +1290,11 @@
 
   global.AH2D = Object.freeze({
     VERSION, Engine, EventBus, ECS, SceneGraph, TransformSystem, CameraSystem,
+    DataModel,
+    ComponentSchemaRegistry: DataModel.ComponentSchemaRegistry,
+    EntityCodec: DataModel.EntityCodec,
+    createDefaultComponentRegistry: DataModel.createDefaultComponentRegistry,
+    createDefaultEntityCodec: DataModel.createDefaultEntityCodec,
     LightingSystem, ShadowSystem, AnimationSystem, PostProcessSystem, TilemapSystem,
     DEFAULT_POST_PROCESS_EFFECTS, createDefaultPostProcess,
     BODY_TYPES, COLLIDER_SHAPES, PhysicsAdapter, Box2DPhysicsAdapter,

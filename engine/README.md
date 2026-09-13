@@ -26,6 +26,47 @@ npm run ah2d -- validate --file game.ah2d.json --engine
 
 See [`CLI.md`](./CLI.md) for Scene, Entity, component, runtime, physics, simulation, JSON Patch, and atomic batch workflows.
 
+## Unified ECS and Component Schema contract
+
+Universal Project `format: "AH2D"`, version `4`, is the authoring source of truth. New projects also declare the independent data-model descriptor:
+
+```js
+dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 }
+```
+
+The same descriptor is included in the lossy active ECS snapshot returned by `Engine.export()`, whose document version remains `3`. Project version, data-model version, and component-schema version are separate compatibility axes. Do not save a version-3 snapshot over the version-4 Universal Project.
+
+Every registered component exposes `authoring`, `runtime`, and `snapshot` schemas. Authoring normalization removes registered runtime-derived fields while preserving unknown JSON extensions. Runtime normalization supplies/accepts system state such as `Transform.world`; snapshot normalization retains that runtime state for an ECS export. Component values must be JSON-safe objects or arrays.
+
+The built-in registry contains `Name`, `Transform`, `Renderable`, `Rigidbody` (`RigidBody`/`Body` aliases), `Collider`, `Hidden`, `Locked`, `PrefabInstance`, `Camera`, `Light`, `ShadowCaster`, `Animation`, `Tilemap`, `ParticleEmitter`, `BoxCollider`, `BoxCollider2D`, `CircleCollider`, and `CircleCollider2D`. It is open-world by default, so safe PascalCase custom component keys remain usable and are preserved under `components.<Type>` even without a registered specialized schema.
+
+When a built-in component occurs in more than one authoring location, `components.<canonical-or-alias>` has precedence over legacy locations such as flat transforms, `rigidbody`/`rigidBody`, and `collider`. Resolution returns the selected `storage` and `provenance`; differing lower-precedence values are conflicts. Writes default to `storage: 'preserve'`, update the effective provenance, and leave all other locations and unknown fields untouched. Compact legacy storage is promoted to `components.<CanonicalName>` only when it cannot represent the value being written.
+
+Register a game-specific schema before loading or creating its entities:
+
+```js
+const engine = new AH2D.Engine();
+
+engine.registerComponent({
+  type: 'Health',
+  schemaVersion: 1,
+  schemas: {
+    authoring: {
+      type: 'object',
+      required: ['current', 'maximum'],
+      properties: {
+        current: { type: 'number', minimum: 0 },
+        maximum: { type: 'number', exclusiveMinimum: 0 }
+      },
+      additionalProperties: true
+    }
+  },
+  defaults: { current: 100, maximum: 100 }
+});
+```
+
+Missing `runtime` or `snapshot` schemas fall back to the authoring schema. A definition may also provide aliases, per-profile schemas, `runtimeOnlyFields`, a normalizer, ordered `migrations`, and storage metadata. Registration rejects unsafe names and name/alias collisions. Pass a prepared `ComponentSchemaRegistry` as `new AH2D.Engine({ componentSchemas: registry })` when registry policy, such as `openWorld: false`, must be shared explicitly.
+
 ## Multi-Scene projects
 
 Universal project JSON stores every Scene independently and keeps a legacy `scene` copy of the active Scene for older runtimes:

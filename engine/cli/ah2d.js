@@ -5,9 +5,10 @@ const fs = require('fs');
 const path = require('path');
 const {
   PROTOCOL, PROJECT_VERSION, EXIT, DomainError, clone, detectDialect, createProject,
+  DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES, componentRegistry,
   migrateDocument, syncActiveMirror, validateDocument, assertValid, resolveScene,
   resolveEntity, entityName, applyOperations, applyJsonPatch, mergePatch, getPointer,
-  listComponents, listEntities, getComponent, resourceField, documentHash
+  listComponents, listEntities, getComponent, putComponent, resourceField, documentHash
 } = require('./AH2DProject.js');
 
 const CLI_VERSION = '0.3.0';
@@ -233,9 +234,9 @@ function simulate(context, options) {
   const active = resolveScene(migrated.document, scene.id);
   for (const entity of active.objects) {
     const transform = engine.ecs.get(entity.id, 'Transform'), body = engine.ecs.get(entity.id, 'Rigidbody');if (!transform) continue;
-    if (entity.components?.Transform) Object.assign(entity.components.Transform, { x: transform.x, y: transform.y, rotation: transform.rotation, scaleX: transform.scaleX, scaleY: transform.scaleY });
-    else Object.assign(entity, { x: transform.x, y: transform.y, rot: transform.rotation, sx: transform.scaleX, sy: transform.scaleY });
-    if (body) { const target = entity.rigidbody || entity.rigidBody || entity.components?.Rigidbody || entity.components?.RigidBody;if (target) Object.assign(target, { velocityX: body.velocityX, velocityY: body.velocityY, angularVelocity: body.angularVelocity, sleeping: body.sleeping }); }
+    const authoredTransform = getComponent(entity, 'Transform');
+    putComponent(entity, 'Transform', { ...authoredTransform.value, x: transform.x, y: transform.y, rotation: transform.rotation, scaleX: transform.scaleX, scaleY: transform.scaleY }, { provenance: authoredTransform.provenance });
+    if (body) { const authoredBody = getComponent(entity, 'Rigidbody');if (authoredBody.value !== undefined) putComponent(entity, 'Rigidbody', { ...authoredBody.value, velocityX: body.velocityX, velocityY: body.velocityY, angularVelocity: body.angularVelocity, sleeping: body.sleeping }, { provenance: authoredBody.provenance }); }
   }
   migrated.document.currentSceneId = scene.id;syncActiveMirror(migrated.document);
   assertValid(migrated.document);
@@ -253,6 +254,14 @@ function integerOption(value, fallback, min, max, label) {
 function capabilities() {
   return {
     protocol: PROTOCOL, cliVersion: CLI_VERSION, projectVersion: PROJECT_VERSION, defaultFormat: 'json',
+    dataModel: clone(DATA_MODEL_DESCRIPTOR),
+    componentSchemas: {
+      version: DATA_MODEL_DESCRIPTOR.componentSchemaVersion,
+      profiles: [...COMPONENT_SCHEMA_PROFILES],
+      unknownComponents: 'preserve',
+      precedence: 'components',
+      types: componentSchemaTypes()
+    },
     commands: {
       project: ['init', 'show', 'patch'], scene: ['list', 'get', 'create', 'clone', 'rename', 'select', 'delete', 'export', 'import'],
       entity: ['list', 'get', 'create', 'clone', 'rename', 'set', 'patch', 'reparent', 'delete'],
@@ -272,11 +281,30 @@ function capabilities() {
   };
 }
 
+function componentSchemaTypes() {
+  return componentRegistry.list().map(component => component.type);
+}
+
 const schemas = {
-  project: { $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'AH2D Project', type: 'object', required: ['format', 'version', 'currentSceneId', 'scenes'], properties: { format: { const: 'AH2D' }, version: { type: 'integer', maximum: PROJECT_VERSION }, currentSceneId: { type: 'string' }, scenes: { type: 'array', minItems: 1, items: { $ref: '#/$defs/scene' } } }, $defs: { scene: { type: 'object', required: ['id', 'name', 'objects'], properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string' }, objects: { type: 'array', items: { type: 'object', required: ['id'] } } } } } },
+  project: { $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'AH2D Project', type: 'object', required: ['format', 'version', 'currentSceneId', 'scenes'], properties: { format: { const: 'AH2D' }, version: { type: 'integer', maximum: PROJECT_VERSION }, dataModel: { type: 'object', required: ['id', 'version', 'componentSchemaVersion'], properties: { id: { const: DATA_MODEL_DESCRIPTOR.id }, version: { const: DATA_MODEL_DESCRIPTOR.version }, componentSchemaVersion: { const: DATA_MODEL_DESCRIPTOR.componentSchemaVersion } }, additionalProperties: true }, currentSceneId: { type: 'string' }, scenes: { type: 'array', minItems: 1, items: { $ref: '#/$defs/scene' } } }, $defs: { scene: { type: 'object', required: ['id', 'name', 'objects'], properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string' }, objects: { type: 'array', items: { type: 'object', required: ['id'] } } } } } },
   operation: { type: 'object', required: ['op'], properties: { op: { type: 'string', pattern: '^(scene|entity|component|resource|runtime|physics|project)\\.' } }, additionalProperties: true },
   batch: { type: 'array', minItems: 1, items: { $ref: '#/$defs/operation' }, $defs: { operation: { type: 'object', required: ['op'], properties: { op: { type: 'string' } } } } }
 };
+
+function schemaCommand(positionals, options) {
+  const action = (positionals.shift() || 'list').toLowerCase();
+  if (action === 'list') return { command: 'schema.list', data: { schemas: Object.keys(schemas), components: componentSchemaTypes() } };
+  const name = options.name || positionals.shift();
+  const prefixed = typeof name === 'string' && /^component:/i.test(name) ? name.slice(name.indexOf(':') + 1) : null;
+  const componentReference = options.component || prefixed;
+  if (componentReference) {
+    const component = componentRegistry.describe(componentReference);
+    if (!component?.registered) throw new DomainError('E_SCHEMA_NOT_FOUND', `Component schema not found: ${componentReference}`, { exitCode: EXIT.NOT_FOUND });
+    return { command: 'schema.show', data: { name: `component:${component.type}`, component } };
+  }
+  if (!schemas[name]) throw new DomainError('E_SCHEMA_NOT_FOUND', `Schema not found: ${name}`, { exitCode: EXIT.NOT_FOUND });
+  return { command: 'schema.show', data: { name, schema: schemas[name] } };
+}
 
 const HELP = `AH2D Engine CLI ${CLI_VERSION}
 
@@ -285,7 +313,7 @@ Usage:
 
 Agent discovery:
   ah2d capabilities
-  ah2d schema list|show --name project
+  ah2d schema list|show --name project|--component Transform
 
 Core:
   ah2d init --file game.ah2d.json --name Game
@@ -315,7 +343,7 @@ function dispatch(parsed) {
   if (!command || command === 'help' || options.help) return { command: 'help', data: { help: HELP } };
   if (command === 'version') return { command: 'version', data: { cli: CLI_VERSION, protocol: PROTOCOL, project: PROJECT_VERSION, node: process.version } };
   if (command === 'capabilities') return { command, data: capabilities() };
-  if (command === 'schema') { const action = (positionals.shift() || 'list').toLowerCase();if (action === 'list') return { command: 'schema.list', data: { schemas: Object.keys(schemas) } };const name = options.name || positionals.shift();if (!schemas[name]) throw new DomainError('E_SCHEMA_NOT_FOUND', `Schema not found: ${name}`, { exitCode: EXIT.NOT_FOUND });return { command: 'schema.show', data: { name, schema: schemas[name] } }; }
+  if (command === 'schema') return schemaCommand(positionals, options);
   if (command === 'doctor') { let engine = null, error = null;try { engine = loadEngine().VERSION; } catch (caught) { error = caught.message; }return { command, data: { ok: !error, cliVersion: CLI_VERSION, node: process.version, platform: process.platform, cwd: process.cwd(), engineVersion: engine, enginePath: path.join(__dirname, '..', 'AH2DEngine.js'), error } }; }
   if (command === 'init') return initProject({ positionals, options });
   if (command === 'project') {
@@ -401,7 +429,7 @@ function componentCommand(context, positionals, options) {
   const hasEntitySelector = options.entity != null || options['entity-id'] != null || options['entity-name'] != null, entityReference = hasEntitySelector ? null : positionals.shift(), entitySelect = entitySelector(options, entityReference), entity = resolveEntity(scene, entitySelect.entityId, { allowName: Boolean(entitySelect.entityName) });
   if (action === 'list') return { command: 'component.list', data: { file: context.file, sceneId: scene.id, entityId: entity.id, components: listComponents(entity) } };
   const type = options.component || options.type || positionals.shift();
-  if (action === 'get') { const component = getComponent(entity, type);if (component.value === undefined) throw new DomainError('E_COMPONENT_NOT_FOUND', `Component not found: ${type}`, { exitCode: EXIT.NOT_FOUND });return { command: 'component.get', data: { file: context.file, sceneId: scene.id, entityId: entity.id, component: component.type, storage: component.storage, value: clone(component.value) } }; }
+  if (action === 'get') { const component = getComponent(entity, type);if (component.value === undefined) throw new DomainError('E_COMPONENT_NOT_FOUND', `Component not found: ${type}`, { exitCode: EXIT.NOT_FOUND });return { command: 'component.get', data: { file: context.file, sceneId: scene.id, entityId: entity.id, component: component.type, storage: component.storage, provenance: component.provenance, conflicts: clone(component.conflicts), value: clone(component.value) } }; }
   let operation;
   if (action === 'put' || action === 'add') operation = { op: 'component.put', ...sceneSelect, ...entitySelect, component: type, value: options.value !== undefined ? readValue(options.value, options) : undefined };
   else if (action === 'patch') {

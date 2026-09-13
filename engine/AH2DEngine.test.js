@@ -30,6 +30,115 @@ const testSceneGraphAndRuntimes = () => {
   assert.strictEqual(engine.physics.backend, 'builtin', 'Box2D adapter must have a dependency-free fallback');
 };
 
+const testUnifiedComponentSchemas = () => {
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  const conflicts = [];
+  engine.events.on('component:conflict', event => conflicts.push(event));
+  engine.createEntity({
+    id: 'mixed-storage',
+    x: 1,
+    rigidbody: { type: 'dynamic', mass: 9 },
+    components: {
+      Transform: { x: 12, y: 8 },
+      Rigidbody: { type: 'dynamic', mass: 2 },
+      FutureGameplay: { score: 7, extension: { keep: true } }
+    }
+  });
+  assert.strictEqual(engine.ecs.get('mixed-storage', 'Transform').x, 12);
+  assert.strictEqual(engine.ecs.get('mixed-storage', 'Transform').y, 8);
+  assert.strictEqual(engine.ecs.get('mixed-storage', 'Body').mass, 2);
+  assert.deepStrictEqual(engine.ecs.get('mixed-storage', 'FutureGameplay'), { score: 7, extension: { keep: true } });
+  assert.ok(conflicts.length > 0, 'mixed component storage must emit conflict diagnostics');
+
+  const snapshot = engine.export();
+  assert.strictEqual(snapshot.version, 3, 'runtime snapshot compatibility remains version 3');
+  assert.deepStrictEqual(snapshot.dataModel, { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 });
+  assert.strictEqual(snapshot.entities[0].components.FutureGameplay.extension.keep, true);
+
+  const descriptor = engine.registerComponent({
+    type: 'Health',
+    defaults: { current: 100 },
+    schema: {
+      type: 'object',
+      required: ['current'],
+      properties: { current: { type: 'number', minimum: 0 } },
+      additionalProperties: true
+    }
+  });
+  assert.strictEqual(descriptor.type, 'Health');
+  engine.createEntity({ id: 'custom-component', components: { Health: { current: 75 } } });
+  assert.strictEqual(engine.ecs.get('custom-component', 'Health').current, 75);
+  assert.throws(
+    () => engine.ecs.add('custom-component', 'Health', { current: -1 }),
+    error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === 'E_COMPONENT_MINIMUM'
+  );
+
+  const lowLevelId = engine.ecs.create('low-level-alias');
+  engine.ecs.add(lowLevelId, 'RigidBody', { type: 'static', mass: 1 });
+  assert.strictEqual(engine.ecs.get(lowLevelId, 'Rigidbody').type, 'static');
+  const transform = engine.ecs.add(lowLevelId, 'Transform', { x: 0, y: 0, rot: 45, sx: 0, sy: 2 });
+  assert.strictEqual(transform.rotation, 45);
+  assert.strictEqual(transform.scaleX, 0);
+  assert.strictEqual(transform.scaleY, 2);
+};
+
+const testEntityValidationBeforeRuntimeClone = () => {
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  assert.throws(
+    () => engine.createEntity({ id: '', name: 'Invalid' }),
+    error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === 'E_ENTITY_ID'
+  );
+  assert.throws(
+    () => engine.createEntity({ id: 'non-json', components: { FutureData: { keep: true, callback() {} } } }),
+    error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === 'E_COMPONENT_JSON_TYPE'
+  );
+  assert.throws(
+    () => engine.createEntity(42),
+    error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === 'E_ENTITY_VALUE'
+  );
+  assert.throws(
+    () => engine.createEntity(null),
+    error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === 'E_ENTITY_VALUE'
+  );
+  assert.throws(
+    () => engine.createEntity({ id: 'runtime-invalid', rigidbody: { fixedRotation: 'false' } }),
+    error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === 'E_COMPONENT_TYPE' && error.pointer === '/rigidbody/fixedRotation'
+  );
+  assert.strictEqual(engine.ecs.entities.has('runtime-invalid'), false, 'runtime validation failures must not leave a partial Entity');
+  assert.throws(() => engine.createEntity({ id: 'self-parent', parentId: 'self-parent' }), /cycle/);
+  assert.strictEqual(engine.ecs.entities.has('self-parent'), false, 'graph validation failures must not leave a partial Entity');
+  assert.strictEqual(engine.ecs.entities.size, 0);
+
+  const generated = engine.createEntity({ name: 'Generated' });
+  assert.strictEqual(typeof generated, 'string');
+  assert.ok(generated.length > 0);
+
+  engine.createEntity({ id: 'duplicate', components: { Health: { current: 1 } } });
+  assert.throws(
+    () => engine.createEntity({ id: 'duplicate', components: { Mana: { current: 2 } } }),
+    error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === 'E_ENTITY_EXISTS'
+  );
+  assert.deepStrictEqual(engine.ecs.get('duplicate', 'Health'), { current: 1 });
+  assert.strictEqual(engine.ecs.get('duplicate', 'Mana'), undefined);
+};
+
+const testDistinctColliderComponents = () => {
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  engine.createEntity({
+    id: 'multi-collider',
+    components: {
+      BoxCollider2D: { id: 'box-2d', width: 10, height: 10 },
+      BoxCollider: [{ id: 'box-a', width: 12, height: 12 }, { id: 'box-b', width: 14, height: 14 }],
+      CircleCollider2D: { id: 'circle-2d', radius: 4 },
+      CircleCollider: { colliders: [{ id: 'circle-a', radius: 5 }, { id: 'circle-b', radius: 6 }] }
+    }
+  });
+  engine.update(0);
+  const colliders = engine.physics.getBody('multi-collider').colliders;
+  assert.deepStrictEqual(colliders.map(collider => collider.id).sort(), ['box-2d', 'box-a', 'box-b', 'circle-2d', 'circle-a', 'circle-b']);
+  for (const collider of colliders.filter(item => item.id.startsWith('box'))) assert.strictEqual(collider.shape, 'box');
+  for (const collider of colliders.filter(item => item.id.startsWith('circle'))) assert.strictEqual(collider.shape, 'circle');
+};
 const testMultiSceneLoading = () => {
   const engine = new AH2D.Engine({ physics: 'builtin' });
   const project = {
@@ -44,11 +153,89 @@ const testMultiSceneLoading = () => {
   assert.strictEqual(engine.activeSceneId, 'level-b', 'project currentSceneId must choose the active Scene');
   assert.ok(engine.ecs.entities.has('b-object'));
   assert.ok(!engine.ecs.entities.has('legacy-object'), 'multi-Scene projects must not fall back to the legacy active scene');
+  assert.deepStrictEqual(engine.document.scene, engine.document.scenes[1].objects, 'top-level scene must mirror the active Scene objects');
   engine.loadScene('level-a');
   assert.strictEqual(engine.activeSceneId, 'level-a');
   assert.ok(engine.ecs.entities.has('a-object'));
   assert.ok(!engine.ecs.entities.has('b-object'));
+  assert.strictEqual(engine.document.currentSceneId, 'level-a');
+  assert.deepStrictEqual(engine.document.scene, engine.document.scenes[0].objects, 'loadScene must synchronize the compatibility mirror');
   assert.throws(() => engine.loadScene('missing-scene'), /Unknown Scene/);
+};
+
+const testAtomicLoadValidation = () => {
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  engine.load({
+    scene: [{ id: 'stable', name: 'Stable', components: { Health: { current: 10 } } }],
+    postProcess: { enabled: true, effects: [{ id: 'stable-grade', type: 'custom', enabled: true, extension: { keep: true } }] }
+  });
+  const beforeDocument = JSON.stringify(engine.document);
+  const beforeSnapshot = JSON.stringify(engine.export());
+
+  assert.throws(
+    () => engine.load({ scene: [{ id: 'staged-good' }, { id: 'staged-bad', components: { Rigidbody: { mass: -1 } } }] }),
+    error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === 'E_COMPONENT_EXCLUSIVE_MINIMUM'
+  );
+  assert.strictEqual(JSON.stringify(engine.document), beforeDocument);
+  assert.strictEqual(JSON.stringify(engine.export()), beforeSnapshot);
+  assert.ok(engine.ecs.entities.has('stable'));
+  assert.ok(!engine.ecs.entities.has('staged-good'));
+
+  assert.throws(
+    () => engine.load({ scene: [{ id: 'cycle-a', parentId: 'cycle-b' }, { id: 'cycle-b', parentId: 'cycle-a' }] }),
+    /cycle/
+  );
+  assert.strictEqual(JSON.stringify(engine.document), beforeDocument);
+  assert.strictEqual(JSON.stringify(engine.export()), beforeSnapshot);
+  assert.ok(engine.ecs.entities.has('stable'));
+
+  assert.throws(
+    () => engine.load({ scene: [{ id: 'orphan', parentId: 'missing' }] }),
+    error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === 'E_DANGLING_PARENT'
+  );
+  assert.strictEqual(JSON.stringify(engine.document), beforeDocument);
+  assert.strictEqual(JSON.stringify(engine.export()), beforeSnapshot);
+
+  assert.throws(
+    () => engine.load(42),
+    error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === 'E_DOCUMENT_TYPE'
+  );
+  assert.throws(
+    () => engine.load({ scene: [null] }),
+    error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === 'E_ENTITY_VALUE'
+  );
+  for (const [dataModel, code, pointer] of [
+    [null, 'E_DATA_MODEL_TYPE', '/dataModel'],
+    [{ id: 'other.ecs', version: 1, componentSchemaVersion: 1 }, 'E_DATA_MODEL_ID', '/dataModel/id'],
+    [{ id: 'ah2d.ecs', componentSchemaVersion: 1 }, 'E_DATA_MODEL_VERSION_TYPE', '/dataModel/version'],
+    [{ id: 'ah2d.ecs', version: 1 }, 'E_COMPONENT_SCHEMA_VERSION_TYPE', '/dataModel/componentSchemaVersion'],
+    [{ id: 'ah2d.ecs', version: 2, componentSchemaVersion: 1 }, 'E_FUTURE_DATA_MODEL_VERSION', '/dataModel/version'],
+    [{ id: 'ah2d.ecs', version: 1, componentSchemaVersion: 2 }, 'E_FUTURE_COMPONENT_SCHEMA_VERSION', '/dataModel/componentSchemaVersion']
+  ]) {
+    assert.throws(
+      () => engine.load({ dataModel, scene: [] }),
+      error => error instanceof AH2D.DataModel.ComponentSchemaError && error.code === code && error.pointer === pointer
+    );
+  }
+  assert.strictEqual(JSON.stringify(engine.document), beforeDocument);
+  assert.strictEqual(JSON.stringify(engine.export()), beforeSnapshot);
+
+  const olderDataModel = new AH2D.Engine({ physics: 'builtin' });
+  olderDataModel.load({ dataModel: { id: 'ah2d.ecs', version: 0, componentSchemaVersion: 0 }, scene: [] });
+  assert.strictEqual(olderDataModel.ecs.entities.size, 0, 'older declared data-model versions remain loadable');
+
+  const generated = new AH2D.Engine({ physics: 'builtin' });
+  generated.load({ scene: [{ name: 'Generated ID' }] });
+  const generatedId = [...generated.ecs.entities][0];
+  assert.strictEqual(generated.document.scene[0].id, generatedId);
+  generated.load(generated.document);
+  assert.deepStrictEqual([...generated.ecs.entities], [generatedId]);
+
+  const generatedV4 = new AH2D.Engine({ physics: 'builtin' });
+  generatedV4.load({ format: 'AH2D', version: 4, currentSceneId: 'main', scenes: [{ id: 'main', objects: [{ name: 'Generated v4 ID' }] }], scene: [] });
+  const generatedV4Id = [...generatedV4.ecs.entities][0];
+  assert.strictEqual(generatedV4.document.scenes[0].objects[0].id, generatedV4Id);
+  assert.strictEqual(generatedV4.document.scene[0].id, generatedV4Id);
 };
 
 const testPostProcessProjectContract = () => {
@@ -248,15 +435,21 @@ const testEditorRuntimeContract = () => {
   for (const id of ['runtimeSelect', 'editorPlay', 'editorPause', 'editorStop', 'runtimeBackend', 'addComponentBtn', 'sceneSelect', 'newSceneBtn', 'saveSceneBtn', 'sceneModal', 'postProcessBtn', 'postProcessPanel', 'postProcessList', 'postProcessReset']) {
     assert.ok(html.includes(`id="${id}"`), `editor runtime control #${id} is missing`);
   }
-  for (const token of ['data-add-component="rigidbody"', 'data-add-component="box-collider"', 'data-add-component="circle-collider"', 'ah2dEngine.pause()', 'ah2dEngine.resume()', 'pullSceneTransformsFromEngine()', 'function switchScene(', 'function createScene(', 'function saveCurrentScene()', 'currentSceneId:state.currentSceneId', 'scenes,scene:', 'postProcess:cloneData(state.postProcess)', 'function applyScenePostProcess(']) {
+  for (const token of ['data-add-component="rigidbody"', 'data-add-component="box-collider"', 'data-add-component="circle-collider"', 'ah2dEngine.pause()', 'ah2dEngine.resume()', 'pullSceneTransformsFromEngine()', 'function switchScene(', 'function createScene(', 'function saveCurrentScene()', 'currentSceneId:state.currentSceneId', 'scenes,scene:', 'dataModel:{...dataModelDescriptor}', "componentSchemas.create('Rigidbody'", 'writeEditorComponent(', 'postProcess:cloneData(state.postProcess)', 'function applyScenePostProcess(']) {
     assert.ok(html.includes(token), `editor integration token is missing: ${token}`);
   }
+  const dataModelScript = html.indexOf('./engine/AH2DDataModel.js'), engineScript = html.indexOf('./engine/AH2DEngine.js');
+  assert.ok(dataModelScript >= 0 && engineScript > dataModelScript, 'DataModel must load before the Engine');
   assert.ok(!html.includes('fallbackPhysicsSubstep'), 'editor must not run a second competing physics solver');
   assert.ok(html.includes("renderer:state.runtime"), 'Universal JSON must persist the selected runtime');
 };
 
 testSceneGraphAndRuntimes();
+testUnifiedComponentSchemas();
+testEntityValidationBeforeRuntimeClone();
+testDistinctColliderComponents();
 testMultiSceneLoading();
+testAtomicLoadValidation();
 testPostProcessProjectContract();
 testGravityAndSchemaSync();
 testStaticCollisionAndSleeping();

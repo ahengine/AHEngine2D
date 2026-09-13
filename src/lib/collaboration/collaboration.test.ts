@@ -13,6 +13,8 @@ import { createLocalUser, loginWithCredentials, SESSION_COOKIE_NAME } from "../a
 import { POST as createProjectRoute } from "../../app/api/projects/route";
 import { POST as addMemberRoute } from "../../app/api/projects/[projectId]/members/route";
 import { PATCH as updateMemberRoute } from "../../app/api/projects/[projectId]/members/[userId]/route";
+import { GET as getEditorEngineRoute } from "../../app/api/editor/engine/route";
+import { GET as getEditorFrameRoute } from "../../app/api/editor/frame/route";
 
 const owner: CollaborationActor = { id: "owner-1", name: "Owner", email: "owner@example.test" };
 const editor: CollaborationActor = { id: "editor-1", name: "Editor", email: "editor@example.test" };
@@ -64,22 +66,39 @@ async function main(): Promise<void> {
         format: "AH2D",
         version: 4,
         currentSceneId: "main",
-        scenes: [{ id: "main", name: "Main", objects: [] }],
-        scene: [],
+        scenes: [{
+          id: "main",
+          name: "Main",
+          objects: [{ id: "platform-1", name: "Platform" }],
+        }],
+        scene: [{ id: "stale-mirror", name: "Stale" }],
         futureExtension: { preserved: true },
       },
     });
     const projectId = created.project.id;
     assert.equal(created.project.revision, 1);
     assert.equal(created.project.role, "owner");
+    const normalizedSnapshot = await service.getDocument(owner, projectId);
+    const normalizedDocument = normalizedSnapshot.document as {
+      scenes: Array<{ objects: unknown[] }>;
+      scene: unknown[];
+      meta: { currentSceneId: string };
+    };
+    assert.deepEqual(normalizedDocument.scene, normalizedDocument.scenes[0].objects);
+    assert.equal(normalizedDocument.meta.currentSceneId, "main");
+
 
     const defaults = await service.createProject(owner, { name: "Default Contract" });
     const defaultSnapshot = await service.getDocument(owner, defaults.project.id);
     const defaultDocument = defaultSnapshot.document as Record<string, unknown>;
     assert.deepEqual(defaultDocument.prefab, []);
-    assert.deepEqual(defaultDocument.prefabs, []);
     assert.deepEqual(defaultDocument.animations, []);
     assert.deepEqual(defaultDocument.particles, []);
+    assert.equal((defaultDocument.meta as { name?: string }).name, "Default Contract");
+    assert.equal((defaultDocument.engine as { runtime?: string }).runtime, "custom");
+    assert.equal(defaultDocument.currentSceneId, "main");
+    assert.equal((defaultDocument.scenes as Array<{ id: string }>)[0].id, "main");
+    assert.deepEqual(defaultDocument.dataModel, { id: "ah2d.ecs", version: 1, componentSchemaVersion: 1 });
     const defaultEffects = (defaultDocument.postProcess as {
       enabled: boolean;
       effects: Array<{ id: string }>;
@@ -96,6 +115,55 @@ async function main(): Promise<void> {
         document: { format: "AH2D", version: 4, scenes: [] },
       }),
       "INVALID_AH2D_PROJECT",
+    );
+
+    const legacyDescriptorProject = await service.createProject(owner, {
+      name: "Legacy Data Model",
+      document: {
+        format: "AH2D",
+        version: 4,
+        dataModel: { id: "ah2d.ecs", version: 0, componentSchemaVersion: 0 },
+        currentSceneId: "main",
+        scenes: [{ id: "main", name: "Main", objects: [] }],
+      },
+    });
+    const legacyDescriptorSnapshot = await service.getDocument(owner, legacyDescriptorProject.project.id);
+    assert.deepEqual(
+      (legacyDescriptorSnapshot.document as Record<string, unknown>).dataModel,
+      { id: "ah2d.ecs", version: 0, componentSchemaVersion: 0 },
+      "Studio strict validation must retain supported older descriptor versions",
+    );
+
+    await assert.rejects(
+      () => service.createProject(owner, {
+        name: "Future Data Model",
+        document: {
+          format: "AH2D",
+          version: 4,
+          dataModel: { id: "ah2d.ecs", version: 2, componentSchemaVersion: 1 },
+          currentSceneId: "main",
+          scenes: [{ id: "main", name: "Main", objects: [] }],
+        },
+      }),
+      (error: unknown) => {
+        if (!(error instanceof CollaborationError) || error.code !== "INVALID_AH2D_PROJECT") return false;
+        const diagnostics = (error.details as { diagnostics?: Array<{ code?: string; pointer?: string }> } | undefined)?.diagnostics ?? [];
+        return diagnostics.some(item => item.code === "E_FUTURE_DATA_MODEL_VERSION" && item.pointer === "/dataModel/version");
+      },
+    );
+
+    await rejectsCode(
+      () => service.createProject(owner, {
+        name: "Non JSON Contract",
+        document: {
+          format: "AH2D",
+          version: 4,
+          currentSceneId: "main",
+          scenes: [{ id: "main", name: "Main", objects: [] }],
+          runtimeHandle: () => undefined,
+        },
+      }),
+      "INVALID_PROJECT_DOCUMENT",
     );
 
     await rejectsCode(
@@ -277,6 +345,31 @@ async function main(): Promise<void> {
       Cookie: `${SESSION_COOKIE_NAME}=${routeSession.token}`,
       Origin: "http://localhost",
     };
+    const editorHeaders = { Cookie: `${SESSION_COOKIE_NAME}=${routeSession.token}` };
+    const engineResponse = await getEditorEngineRoute(new Request(
+      "http://localhost/api/editor/engine",
+      { headers: editorHeaders },
+    ));
+    assert.equal(engineResponse.status, 200);
+    const engineBundle = await engineResponse.text();
+    const engineDataModelIndex = engineBundle.indexOf("root.AH2DDataModel = api");
+    const engineRuntimeIndex = engineBundle.indexOf("const DataModel = global.AH2DDataModel");
+    assert(engineDataModelIndex >= 0);
+    assert(engineRuntimeIndex > engineDataModelIndex);
+
+    const frameResponse = await getEditorFrameRoute(new Request(
+      "http://localhost/api/editor/frame",
+      { headers: editorHeaders },
+    ));
+    assert.equal(frameResponse.status, 200);
+    const frameSource = await frameResponse.text();
+    const frameDataModelIndex = frameSource.indexOf("root.AH2DDataModel = api");
+    const frameRuntimeIndex = frameSource.indexOf("const DataModel = global.AH2DDataModel");
+    assert(frameDataModelIndex >= 0);
+    assert(frameRuntimeIndex > frameDataModelIndex);
+    assert.equal(frameSource.includes('<script src="./engine/AH2DEngine.js"></script>'), false);
+    assert.equal(frameSource.includes('<script src="./engine/AH2DDataModel.js"></script>'), false);
+
     const routeProjectResponse = await createProjectRoute(new Request("http://localhost/api/projects", {
       method: "POST",
       headers: routeHeaders,

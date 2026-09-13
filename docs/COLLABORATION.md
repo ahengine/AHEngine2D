@@ -22,17 +22,21 @@ Browser
 
 Studio سند Universal نسخهٔ ۴ را داخل record مشارکت نگه می‌دارد. `revision` فقط با تغییر document افزایش پیدا می‌کند؛ `activitySequence` با هر Action ذخیره‌شده، از جمله comment یا member، افزایش پیدا می‌کند.
 
+Universal Project نسخهٔ `4` منبع Authoring است. سند پیش‌فرض Studio همچنین `dataModel: { id: "ah2d.ecs", version: 1, componentSchemaVersion: 1 }` دارد؛ این descriptor با نسخهٔ container پروژه و ECS snapshot نسخهٔ `3` سه محور مستقل‌اند. API مشارکت فقط سند کامل Universal را نگه می‌دارد؛ خروجی lossyِ `Engine.export()` یا `ah2d ecs export` نباید جای document پروژه PUT شود. سند قدیمیِ معتبرِ نسخهٔ ۴ که descriptor ندارد برای سازگاری قابل‌خواندن است و نباید فقط به قصد canonicalization بازنویسی شود.
+
+Componentهای document با profile `authoring` اعتبارسنجی می‌شوند. `components.<canonical-or-alias>` بر محل‌های legacy/تخت precedence دارد و تفاوت دو محل conflict است. چون Studio validation را در حالت strict اجرا می‌کند، چنین conflictی پیش از ذخیره با `422 INVALID_AH2D_PROJECT` و diagnostic دارای JSON Pointer رد می‌شود؛ client باید تعارض را آگاهانه حل کند، نه اینکه یکی از copyها را بی‌صدا حذف کند. componentها و فیلدهای ناشناختهٔ JSON بخشی از قرارداد forward-compatible سند هستند و باید در read/merge/write حفظ شوند.
+
 ## Editor bridge و Autosave
 
 صفحهٔ `/projects/:projectId` Editor موجود را از Route احرازشدهٔ `/api/editor/frame` بارگذاری می‌کند. iframe عمداً `allow-same-origin` ندارد و با `sandbox="allow-scripts allow-downloads allow-modals"` اجرا می‌شود؛ بنابراین document داخل Frame یک origin ایزوله و مبهم (`null`) دارد و به cookie، storage یا DOM صفحهٔ والد دسترسی مستقیم ندارد. form، popup، navigation سطح بالا و اجرای object/plugin نیز مجاز نیستند.
 
-Frame فقط بعد از session معتبر HTML را تحویل می‌دهد. Engine داخل همان پاسخ inline می‌شود و CSP آن را به `default-src 'none'`، script/style inline، تصویر `data:`/`blob:`، font از `data:` و `connect-src 'none'` محدود می‌کند؛ `object-src`، `base-uri` و `form-action` نیز `none` هستند و `frame-ancestors 'self'` embedding خارجی را رد می‌کند. پاسخ همچنین `Referrer-Policy: no-referrer` و `X-Content-Type-Options: nosniff` دارد. Route مستقیم `/api/editor/engine` نیز Auth می‌خواهد.
+Frame فقط بعد از session معتبر HTML را تحویل می‌دهد. DataModel و سپس Engine داخل همان پاسخ inline می‌شوند و CSP آن را به `default-src 'none'`، script/style inline، تصویر `data:`/`blob:`، font از `data:` و `connect-src 'none'` محدود می‌کند؛ `object-src`، `base-uri` و `form-action` نیز `none` هستند و `frame-ancestors 'self'` embedding خارجی را رد می‌کند. پاسخ همچنین `Referrer-Policy: no-referrer` و `X-Content-Type-Options: nosniff` دارد. Route مستقیم `/api/editor/engine` نیز Auth می‌خواهد.
 
 ارتباط فقط از bridge محدود `postMessage` انجام می‌شود. چون target origin Frame مبهم است، ارسال به `*` لازم است. Receiver والد، `event.source === iframe.contentWindow`، origin موردانتظار (`null` برای sandbox و origin صفحه برای fallback) و marker `source: "ah2d-editor"` را باهم بررسی می‌کند. Receiver داخل Frame فقط پیام همان `window.parent` با marker `source: "ah2d-studio"` را می‌پذیرد؛ CSP `frame-ancestors 'self'` والد را به همین Site محدود می‌کند. این کنترل‌ها را هنگام تغییر bridge حذف یا شل نکنید و payload را صرفاً بر اساس marker متنی معتبر فرض نکنید.
 
 Workspace سند versioned سرور را با `AH2D_LOAD_PROJECT` داخل Editor می‌فرستد و snapshotهای تغییرکرده را با `AH2D_PROJECT_CHANGED` دریافت می‌کند. وقتی هم نقش حساب (`OWNER/ADMIN/EDITOR`) و هم نقش پروژه (`owner/admin/editor`) نوشتن document را اجازه دهند، تغییرها به‌صورت debounce و با `PUT document` ذخیره می‌شوند؛ در غیر این صورت روی Editor سپر read-only قرار می‌گیرد. کامنت‌گذاری با تقاطع مستقل `project:comment` حساب و `comment:create` پروژه کنترل می‌شود.
 
-Autosave نیز optimistic است. اگر همکار دیگری زودتر ذخیره کند، client باید حالت conflict را نشان دهد، snapshot جدید را از سرور بخواند و از overwrite خاموش خودداری کند. `localStorage` داخل Editor جایگزین revisioned storage Studio نیست؛ در Workspace منبع حقیقت همان Project API است.
+Autosave نیز optimistic است. اگر همکار دیگری زودتر ذخیره کند، client باید حالت conflict را نشان دهد، snapshot جدید را از سرور بخواند و از overwrite خاموش خودداری کند. merge باید تمام `dataModel`، `components`، storage legacy/provenance و extensionهای ناشناختهٔ هر دو revision را لحاظ کند. `localStorage` داخل Editor جایگزین revisioned storage Studio نیست؛ در Workspace منبع حقیقت همان Project API است.
 
 ## راه‌اندازی
 
@@ -273,7 +277,7 @@ JSON Patch از `add`، `remove`، `replace` و `test` پشتیبانی می‌�
 
 در conflict سند جدید را دوباره بگیرید، تغییر محلی و remote را آگاهانه merge کنید و mutation تازه را با revision و `clientMutationId` تازه بفرستید. retry کور روی نسخهٔ قدیمی مجاز نیست.
 
-`PUT` برای autosave کامل Editor مناسب است:
+`PUT` برای autosave کامل Editor مناسب است، به شرط آنکه snapshot روی همان revision پایه ساخته شده و تمام بخش‌های ناشناختهٔ سند را حفظ کرده باشد:
 
 ```js
 await fetch(`/api/projects/${projectId}/document`, {
@@ -288,6 +292,8 @@ await fetch(`/api/projects/${projectId}/document`, {
 ```
 
 حد پیش‌فرض document برابر ۱۶ MiB است. assetهای Base64 جزو همین اندازه‌اند.
+
+هر `PUT` و نتیجهٔ هر `PATCH` پیش از commit با قرارداد مشترک CLI در حالت strict اعتبارسنجی و آینهٔ `scene` آن با Scene فعال هماهنگ می‌شود. خطای schema/component یا conflict چند storage با `422 INVALID_AH2D_PROJECT` برمی‌گردد؛ این خطا با `409 REVISION_CONFLICT` که فقط به concurrency مربوط است متفاوت است.
 
 ## Comments
 
