@@ -1,44 +1,90 @@
-# AH2D Studio authentication and collaboration
+# AH2D Studio collaboration
 
-این سند قرارداد سمت سرور Studio مبتنی بر Next.js را توضیح می‌دهد: Auth، دو سطح RBAC، پروژهٔ versioned، comment، action history، presence و Server-Sent Events. قرارداد فایل Universal AH2D و CLI در [`../README.md`](../README.md) و [`../engine/CLI.md`](../engine/CLI.md) قرار دارد.
+این سند قرارداد سمت سرور Studio مبتنی بر Next.js را توضیح می‌دهد: پروژهٔ versioned، comment، Action History، presence و Server-Sent Events. قرارداد Universal AH2D و CLI در [`../README.md`](../README.md) و [`../engine/CLI.md`](../engine/CLI.md) قرار دارد.
 
-## تصویر کلی
+## مدل اعتماد: Studio عمومی و محلی
+
+Studio در حالت **no-auth/open local-trusted** اجرا می‌شود. هیچ ورود، حساب، نشست، نقش یا عضویت پروژه‌ای وجود ندارد. هر client شبکه‌ای که بتواند به Studio برسد می‌تواند همهٔ پروژه‌ها را فهرست کند، بخواند، بسازد و تغییر دهد؛ همچنین می‌تواند هر comment را تغییر دهد یا حذف کند و به streamهای realtime متصل شود.
+
+این مدل فقط برای دستگاه محلی یا شبکهٔ کاملاً قابل‌اعتماد مناسب است. Same-Origin check درخواست‌های mutation مرورگر، sandbox مربوط به Editor و CSP همچنان برقرارند، اما هیچ‌کدام مجوز دسترسی به API نیستند. درخواست مستقیم بدون header `Origin` نیز قابل‌پذیرش است. اگر سرویس از شبکهٔ قابل‌اعتماد بیرون می‌رود، آن را پشت محدودسازی شبکه، VPN یا reverse proxy دارای کنترل دسترسی مستقل قرار دهید.
 
 ```text
-Browser
+Browser or API client
 ├── Next.js App Router UI
-├── embedded AH2D Editor
-└── same-origin API client
-    ├── /api/auth/*                    signed session
-    └── /api/projects/*                project membership RBAC
-        ├── document + revision
-        ├── comments + history
-        ├── members
-        └── SSE events + presence
-                 │
-                 ├── local JSON project store
-                 └── in-process event/presence hub
+├── public sandboxed AH2D Editor
+└── /api/projects/*
+    ├── document + optimistic revision
+    ├── comments + Action History
+    └── SSE events + presence
+             │
+             ├── local JSON project store
+             └── in-process event/presence hub
 ```
 
-Studio سند Universal نسخهٔ ۴ را داخل record مشارکت نگه می‌دارد. `revision` فقط با تغییر document افزایش پیدا می‌کند؛ `activitySequence` با هر Action ذخیره‌شده، از جمله comment یا member، افزایش پیدا می‌کند.
+## Actor label غیرقابل‌اعتماد
 
-Universal Project نسخهٔ `4` منبع Authoring است. سند پیش‌فرض Studio همچنین `dataModel: { id: "ah2d.ecs", version: 1, componentSchemaVersion: 1 }` دارد؛ این descriptor با نسخهٔ container پروژه و ECS snapshot نسخهٔ `3` سه محور مستقل‌اند. API مشارکت فقط سند کامل Universal را نگه می‌دارد؛ خروجی lossyِ `Engine.export()` یا `ah2d ecs export` نباید جای document پروژه PUT شود. سند قدیمیِ معتبرِ نسخهٔ ۴ که descriptor ندارد برای سازگاری قابل‌خواندن است و نباید فقط به قصد canonicalization بازنویسی شود.
+API برای نمایش نام عامل تغییر، دو label اختیاری می‌پذیرد:
 
-Componentهای document با profile `authoring` اعتبارسنجی می‌شوند. `components.<canonical-or-alias>` بر محل‌های legacy/تخت precedence دارد و تفاوت دو محل conflict است. چون Studio validation را در حالت strict اجرا می‌کند، چنین conflictی پیش از ذخیره با `422 INVALID_AH2D_PROJECT` و diagnostic دارای JSON Pointer رد می‌شود؛ client باید تعارض را آگاهانه حل کند، نه اینکه یکی از copyها را بی‌صدا حذف کند. componentها و فیلدهای ناشناختهٔ JSON بخشی از قرارداد forward-compatible سند هستند و باید در read/merge/write حفظ شوند.
+- `x-ah2d-actor-id`: شناسهٔ نمایشی با ۱ تا ۱۶۰ کاراکتر امن.
+- `x-ah2d-actor-name`: نام نمایشی با حداکثر ۱۶۰ کاراکتر و بدون control character.
+
+اگر label فرستاده نشود، fallback برابر `id: "local"` و `name: "Local User"` است. UI یک label محلی را در `localStorage` نگه می‌دارد و آن را به requestها اضافه می‌کند. این مقدار credential نیست، امضا نمی‌شود و هر client می‌تواند آن را جعل یا تکرار کند. از actor ID یا name برای permission، مالکیت، moderation، audit امنیتی یا تصمیم دیگری دربارهٔ دسترسی استفاده نکنید.
+
+برای `fetch` می‌توان headerها را مستقیم فرستاد:
+
+```js
+const actorHeaders = {
+  'x-ah2d-actor-id': 'local-tab-7f3a',
+  'x-ah2d-actor-name': 'Local User'
+};
+
+await fetch('/api/projects', {
+  headers: actorHeaders,
+  cache: 'no-store'
+});
+```
+
+`EventSource` امکان header سفارشی ندارد؛ بنابراین endpoint رویدادها همان labelها را از query string نیز می‌پذیرد:
+
+```js
+const params = new URLSearchParams({
+  clientId: crypto.randomUUID(),
+  actorId: 'local-tab-7f3a',
+  actorName: 'Local User'
+});
+const events = new EventSource(`/api/projects/${projectId}/events?${params}`);
+```
+
+`clientMutationId` با actor ID ارسالی برای deduplication استفاده می‌شود. چون actor ID قابل‌جعل است، این رفتار فقط idempotency عملیاتی است و مرز امنیتی یا هویت معتبر ایجاد نمی‌کند.
+
+## رکورد Collaboration نسخهٔ ۲
+
+Studio سند Universal نسخهٔ ۴ را داخل رکورد `ah2d.collaboration/project-v2` نگه می‌دارد:
+
+```text
+schema, id, name, createdAt, updatedAt,
+revision, activitySequence, document, comments, history
+```
+
+رکورد v2 فیلد مالک، member یا permission ندارد. `revision` فقط با تغییر document افزایش پیدا می‌کند؛ `activitySequence` با هر Action ذخیره‌شده افزایش پیدا می‌کند.
+
+رکوردهای قدیمی `ah2d.collaboration/project-v1` قابل‌خواندن‌اند. Store آن‌ها را هنگام load به مدل v2 تبدیل می‌کند و در **اولین write عادی همان پروژه** به v2 ذخیره می‌کند؛ صرف read فایل را بازنویسی نمی‌کند. داده‌های فعال membership و ownership در خروجی v2 نگه‌داری نمی‌شوند. Actionهای قدیمی member ممکن است فقط به‌عنوان history تاریخی باقی بمانند و هیچ اثر دسترسی ندارند. فایل‌های `.ah2d-data/collaboration/*.json` را برای migration دستی ویرایش نکنید.
+
+Universal Project نسخهٔ `4` منبع Authoring است. سند پیش‌فرض Studio همچنین `dataModel: { id: "ah2d.ecs", version: 1, componentSchemaVersion: 1 }` دارد؛ این descriptor با نسخهٔ container پروژه و ECS snapshot نسخهٔ `3` سه محور مستقل‌اند. API فقط سند کامل Universal را نگه می‌دارد؛ خروجی lossy مربوط به `Engine.export()` یا `ah2d ecs export` نباید جای document پروژه PUT شود.
+
+Componentهای document با profile `authoring` و در حالت strict اعتبارسنجی می‌شوند. `components.<canonical-or-alias>` بر محل legacy/تخت precedence دارد و اختلاف دو محل conflict است. componentها و فیلدهای ناشناختهٔ JSON را در read/merge/write حفظ کنید.
 
 ## Editor bridge و Autosave
 
-صفحهٔ `/projects/:projectId` Editor موجود را از Route احرازشدهٔ `/api/editor/frame` بارگذاری می‌کند. iframe عمداً `allow-same-origin` ندارد و با `sandbox="allow-scripts allow-downloads allow-modals"` اجرا می‌شود؛ بنابراین document داخل Frame یک origin ایزوله و مبهم (`null`) دارد و به cookie، storage یا DOM صفحهٔ والد دسترسی مستقیم ندارد. form، popup، navigation سطح بالا و اجرای object/plugin نیز مجاز نیستند.
+صفحهٔ `/projects/:projectId` محتوای `/api/editor/frame` را بارگذاری می‌کند. این route و `/api/editor/engine` عمومی‌اند. iframe عمداً `allow-same-origin` ندارد و با `sandbox="allow-scripts allow-downloads allow-modals"` اجرا می‌شود؛ بنابراین document داخل Frame یک origin مبهم (`null`) دارد و به storage یا DOM صفحهٔ والد دسترسی مستقیم ندارد. form، popup، top-level navigation و object/plugin نیز مجاز نیستند.
 
-Frame فقط بعد از session معتبر HTML را تحویل می‌دهد. DataModel و سپس Engine داخل همان پاسخ inline می‌شوند و CSP آن را به `default-src 'none'`، script/style inline، تصویر `data:`/`blob:`، font از `data:` و `connect-src 'none'` محدود می‌کند؛ `object-src`، `base-uri` و `form-action` نیز `none` هستند و `frame-ancestors 'self'` embedding خارجی را رد می‌کند. پاسخ همچنین `Referrer-Policy: no-referrer` و `X-Content-Type-Options: nosniff` دارد. Route مستقیم `/api/editor/engine` نیز Auth می‌خواهد.
+Frame، DataModel و Engine را inline می‌کند. CSP آن به `default-src 'none'`، script/style inline، تصویر `data:`/`blob:`، font از `data:` و `connect-src 'none'` محدود است؛ `object-src`، `base-uri` و `form-action` نیز `none` هستند و `frame-ancestors 'self'` embedding خارجی را رد می‌کند. پاسخ `Referrer-Policy: no-referrer` و `X-Content-Type-Options: nosniff` نیز دارد.
 
-ارتباط فقط از bridge محدود `postMessage` انجام می‌شود. چون target origin Frame مبهم است، ارسال به `*` لازم است. Receiver والد، `event.source === iframe.contentWindow`، origin موردانتظار (`null` برای sandbox و origin صفحه برای fallback) و marker `source: "ah2d-editor"` را باهم بررسی می‌کند. Receiver داخل Frame فقط پیام همان `window.parent` با marker `source: "ah2d-studio"` را می‌پذیرد؛ CSP `frame-ancestors 'self'` والد را به همین Site محدود می‌کند. این کنترل‌ها را هنگام تغییر bridge حذف یا شل نکنید و payload را صرفاً بر اساس marker متنی معتبر فرض نکنید.
+bridge محدود `postMessage` را حفظ کنید. Receiver والد باید `event.source === iframe.contentWindow`، origin موردانتظار و marker `source: "ah2d-editor"` را باهم بررسی کند. Receiver داخل Frame فقط پیام همان `window.parent` با marker `source: "ah2d-studio"` را می‌پذیرد. marker به‌تنهایی کافی نیست.
 
-Workspace سند versioned سرور را با `AH2D_LOAD_PROJECT` داخل Editor می‌فرستد و snapshotهای تغییرکرده را با `AH2D_PROJECT_CHANGED` دریافت می‌کند. وقتی هم نقش حساب (`OWNER/ADMIN/EDITOR`) و هم نقش پروژه (`owner/admin/editor`) نوشتن document را اجازه دهند، تغییرها به‌صورت debounce و با `PUT document` ذخیره می‌شوند؛ در غیر این صورت روی Editor سپر read-only قرار می‌گیرد. کامنت‌گذاری با تقاطع مستقل `project:comment` حساب و `comment:create` پروژه کنترل می‌شود.
+Workspace سند versioned را با `AH2D_LOAD_PROJECT` داخل Editor می‌فرستد و snapshot تغییرکرده را با `AH2D_PROJECT_CHANGED` دریافت می‌کند. Autosave برای همه فعال و optimistic است. اگر client دیگری زودتر ذخیره کند، UI باید conflict را نشان دهد، snapshot جدید را بخواند و از overwrite خاموش خودداری کند. `localStorage` داخل Editor جایگزین Project API نیست.
 
-Autosave نیز optimistic است. اگر همکار دیگری زودتر ذخیره کند، client باید حالت conflict را نشان دهد، snapshot جدید را از سرور بخواند و از overwrite خاموش خودداری کند. merge باید تمام `dataModel`، `components`، storage legacy/provenance و extensionهای ناشناختهٔ هر دو revision را لحاظ کند. `localStorage` داخل Editor جایگزین revisioned storage Studio نیست؛ در Workspace منبع حقیقت همان Project API است.
-
-## راه‌اندازی
+## راه‌اندازی و تنظیمات
 
 حداقل Node.js برابر `20.9` است:
 
@@ -48,65 +94,16 @@ npm install
 npm run dev
 ```
 
-در `http://localhost:3000` وارد شوید. وقتی auth store هنوز هیچ User ندارد، اولین تلاش Login تابع bootstrap را اجرا می‌کند و حساب Owner را از متغیرهای `AH2D_BOOTSTRAP_OWNER_*` می‌سازد.
-
-متغیرهای موجود در `.env.example`:
-
-| متغیر | کاربرد |
-| --- | --- |
-| `AH2D_AUTH_SECRET` | کلید HMAC session؛ حداقل ۳۲ بایت و در Production اجباری |
-| `AH2D_BOOTSTRAP_OWNER_EMAIL` | Email حساب اولیه |
-| `AH2D_BOOTSTRAP_OWNER_PASSWORD` | Password حساب اولیه؛ حداقل ۱۲ کاراکتر |
-| `AH2D_BOOTSTRAP_OWNER_NAME` | نام نمایشی حساب اولیه |
-| `AH2D_AUTH_STORE_PATH` | مسیر JSON مربوط به Userها و sessionها |
-| `AH2D_COLLAB_DATA_DIR` | پوشهٔ فایل‌های JSON پروژه‌ها |
-| `AH2D_AUTH_SECURE_COOKIE` | اجبار cookie امن در Development؛ در Production خودکار فعال است |
-| `AH2D_ALLOWED_ORIGINS` | originهای مجاز POST/PATCH/PUT/DELETE، جداشده با comma؛ نمونهٔ محلی شامل هر دو `http://localhost:3000` و `http://127.0.0.1:3000` است |
-
-تنظیمات اختیاری کد:
+سپس `http://localhost:3000` را باز کنید. Studio مستقیم صفحهٔ Projects را نمایش می‌دهد و setup کاربر ندارد.
 
 | متغیر | پیش‌فرض | کاربرد |
 | --- | ---: | --- |
-| `AH2D_AUTH_SESSION_TTL_SECONDS` | 604800 | عمر session؛ بین ۵ دقیقه و ۳۰ روز clamp می‌شود |
-| `AH2D_AUTH_SECRET_PATH` | کنار auth store | فایل secret خودکار فقط برای Development و زمانی که `AH2D_AUTH_SECRET` تنظیم نشده است |
+| `AH2D_COLLAB_DATA_DIR` | `.ah2d-data/collaboration` | پوشهٔ فایل‌های JSON پروژه‌ها |
+| `AH2D_ALLOWED_ORIGINS` | origin همان request | originهای اضافهٔ مجاز برای mutation مرورگر، جداشده با comma |
 | `AH2D_MAX_PROJECT_BYTES` | 16777216 | حداکثر اندازهٔ JSON document هر پروژه |
-| `AH2D_MAX_API_BODY_BYTES` | 18874368 | حداکثر body JSON که collaboration route پیش از parse می‌پذیرد |
+| `AH2D_MAX_API_BODY_BYTES` | 18874368 | حداکثر body JSON پیش از parse |
 
-Secret یا bootstrap password واقعی را commit نکنید. پس از ساخته‌شدن اولین حساب، تغییر bootstrap env حساب موجود را تغییر نمی‌دهد.
-
-## Authentication
-
-Passwordها با `scrypt` و salt تصادفی hash می‌شوند. پس از Login، سرور یک شناسهٔ تصادفی session را با HMAC-SHA256 امضا می‌کند، cookie را روی `HttpOnly` و `SameSite=Strict` می‌گذارد و فقط SHA-256 شناسهٔ session را در auth store ذخیره می‌کند. cookie در Production همیشه `Secure` است.
-
-POSTهای same-origin بررسی می‌شوند. Login ناموفق بر اساس Email و IP به‌صورت in-process محدود می‌شود: پنج failure در پنجرهٔ ۱۵ دقیقه. این rate limiter برای deployment چند-process کافی نیست؛ بخش Production را ببینید.
-
-### Auth routes
-
-| Method | Route | Body | نتیجه |
-| --- | --- | --- | --- |
-| `POST` | `/api/auth/login` | `{ "email": string, "password": string }` | ایجاد session و تنظیم cookie |
-| `POST` | `/api/auth/logout` | ندارد | revoke session و پاک‌کردن cookie؛ پاسخ `204` |
-| `GET` | `/api/auth/me` | ندارد | User، session expiry و permissionهای سراسری |
-| `GET` | `/api/auth/users` | ندارد | فهرست حساب‌ها؛ نیازمند `members:manage` سراسری |
-| `POST` | `/api/auth/users` | `{ "email", "displayName", "password", "role" }` | ساخت حساب؛ نیازمند `roles:manage` سراسری |
-
-نمونهٔ ساخت حساب:
-
-```js
-const response = await fetch('/api/auth/users', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    email: 'designer@example.com',
-    displayName: 'Level Designer',
-    password: 'use-a-real-password-manager',
-    role: 'EDITOR'
-  })
-});
-const result = await response.json();
-```
-
-این endpoint فقط provisioning محلی است؛ reset password، invite email، MFA، OAuth/OIDC و حذف/غیرفعال‌کردن حساب endpoint عمومی ندارند.
+`AH2D_ALLOWED_ORIGINS` فقط Origin check را گسترش می‌دهد و client را معتبر نمی‌کند. wildcard یا origin عمومی را برای نمونهٔ متصل به شبکه تنظیم نکنید.
 
 ## قالب پاسخ API
 
@@ -134,85 +131,17 @@ const result = await response.json();
 }
 ```
 
-`revision` فقط در routeهایی که به نسخهٔ document مرتبط‌اند تضمین می‌شود. همیشه status HTTP و `ok` را بررسی کنید.
+`revision` فقط در routeهای مرتبط با document تضمین می‌شود. همیشه status HTTP و `ok` را بررسی کنید.
 
-## RBAC سراسری حساب
+## API عمومی پروژه
 
-نقش حساب با حروف بزرگ ذخیره می‌شود. این نقش سقف permissionهای User در تمام Studio، از جمله داخل پروژه، است و دسترسی عضویت پروژه را دور نمی‌زند.
-
-| نقش | قابلیت اصلی |
-| --- | --- |
-| `OWNER` | همهٔ permissionهای سراسری؛ می‌تواند هر نقش حسابی بسازد |
-| `ADMIN` | مدیریت account و role پایین‌تر از ADMIN؛ نمی‌تواند OWNER یا ADMIN بسازد/مدیریت کند |
-| `EDITOR` | read/edit/comment/realtime و `members:manage`؛ می‌تواند directory حساب‌ها را بخواند و در صورت اجازهٔ نقش پروژه membership را مدیریت کند، اما حساب جدید یا role سراسری نمی‌سازد |
-| `COMMENTER` | read/comment/collaboration؛ بدون edit پروژه و مدیریت حساب |
-| `VIEWER` | read سراسری؛ بدون mutation |
-
-`OWNER` و `ADMIN` دارای `roles:manage` هستند؛ Admin فقط حساب‌های `EDITOR`، `COMMENTER` و `VIEWER` را provision می‌کند، در حالی که Owner می‌تواند هر role حساب را بسازد. `GET /api/auth/users` به `members:manage` نیاز دارد و بنابراین برای `OWNER`، `ADMIN` و `EDITOR` مجاز است؛ `POST /api/auth/users` به `roles:manage` نیاز دارد.
-
-permissionهای دقیق در `src/lib/auth/rbac.ts` تعریف شده‌اند. در Route Handler جدید از `requireRequestPermission(request, permission)` استفاده کنید؛ هیچ تصمیم authorization را فقط به پنهان‌کردن یک دکمه در UI نسپارید.
-
-## RBAC عضویت پروژه
-
-عضویت پروژه با حروف کوچک ذخیره می‌شود. حتی `OWNER` سراسری باید عضو پروژه باشد. سازندهٔ پروژه عضو `owner` می‌شود، اما permission مؤثر همیشه تقاطع دو لایه است:
-
-```text
-effective permission = account-role permission ∩ project-role permission
-```
-
-نگاشت دو لایه:
-
-| permission پروژه | permission لازم در حساب |
-| --- | --- |
-| `project:read`, `document:read`, `comment:read` | `project:read` |
-| `project:update`, `document:write` | `project:edit` |
-| `comment:create`, `comment:moderate` | `project:comment` |
-| `history:read` | `history:read` |
-| `member:read`, `member:manage` | `members:read`, `members:manage` |
-| `presence:read`, `presence:write` | `collaboration:read`, `collaboration:write` |
-
-برای مثال `VIEWER` سراسری حتی با membership اشتباهِ `editor` نمی‌تواند document بنویسد؛ از طرف دیگر `OWNER` سراسری با membership `viewer` نیز read-only می‌ماند. `COMMENTER` سراسری با membership `admin` به edit document دسترسی نمی‌گیرد. `EDITOR` سراسری با membership `owner/admin` می‌تواند membership را مدیریت کند چون اکنون `members:manage` سراسری دارد، اما همچنان برای ساخت حساب جدید `roles:manage` ندارد.
-
-جدول زیر فقط permission لایهٔ پروژه را نشان می‌دهد؛ ستون نقش حساب باید همان permission را نیز اجازه دهد:
-
-| قابلیت | owner | admin | editor | commenter | viewer |
-| --- | :---: | :---: | :---: | :---: | :---: |
-| دیدن پروژه/document | ✓ | ✓ | ✓ | ✓ | ✓ |
-| تغییر نام پروژه | ✓ | ✓ | — | — | — |
-| نوشتن document | ✓ | ✓ | ✓ | — | — |
-| ساخت comment | ✓ | ✓ | ✓ | ✓ | — |
-| moderation همهٔ commentها | ✓ | ✓ | — | — | — |
-| دیدن history/member | ✓ | ✓ | ✓ | ✓ | ✓ |
-| مدیریت member | ✓ | ✓ محدود | — | — | — |
-| ارسال presence | ✓ | ✓ | ✓ | ✓ | ✓ |
-
-در لایهٔ حساب، `presence:write` به `collaboration:write` نگاشت می‌شود؛ بنابراین حساب `VIEWER` می‌تواند presence را ببیند ولی update غنی cursor/selection را ارسال نمی‌کند، حتی اگر جدول پروژه اجازه دهد.
-
-Owner پروژه می‌تواند همهٔ memberهای غیرOwner را مدیریت کند، اما انتقال ownership از مسیر member upsert پشتیبانی نمی‌شود و Owner را نمی‌توان حذف کرد. Admin پروژه فقط `editor`، `commenter` و `viewer` را مدیریت می‌کند و نمی‌تواند Owner/Admin را تغییر دهد. این توانایی علاوه بر نقش پروژه، `members:manage` حساب Actor را نیز لازم دارد.
-
-### سقف نقش پروژه برای حساب مقصد
-
-Member API حساب فعال مقصد را از auth store پیدا می‌کند و اجازه نمی‌دهد role پروژه از role حساب او بالاتر برود:
-
-| role حساب مقصد | roleهای قابل‌اعطا در پروژه |
-| --- | --- |
-| `OWNER` | `admin`, `editor`, `commenter`, `viewer` |
-| `ADMIN` | `admin`, `editor`, `commenter`, `viewer` |
-| `EDITOR` | `editor`, `commenter`, `viewer` |
-| `COMMENTER` | `commenter`, `viewer` |
-| `VIEWER` | `viewer` |
-
-`owner` از Member API قابل‌اعطا نیست؛ تنها ساخت پروژه، سازنده را Owner همان پروژه می‌کند و انتقال ownership هنوز API ندارد. تخطی از سقف با `409 ROLE_EXCEEDS_ACCOUNT` و نبودن حساب فعال با `404 ACCOUNT_NOT_FOUND` رد می‌شود. این cap مربوط به حساب **مقصد** است و جای کنترل role/permission Actor را نمی‌گیرد؛ هر دو کنترل اجرا می‌شوند.
-
-## Project API
-
-تمام routeهای پروژه session معتبر و permission مؤثر حاصل از تقاطع حساب/عضویت را لازم دارند. تنها فهرست پروژه‌ها عضویت‌های User را برمی‌گرداند؛ ساخت پروژه به `project:edit` حساب نیاز دارد و بنابراین برای `OWNER`، `ADMIN` و `EDITOR` سراسری ممکن است.
+همهٔ routeهای زیر بدون محدودیت کاربری در دسترس‌اند:
 
 | Method | Route | کاربرد |
 | --- | --- | --- |
-| `GET` | `/api/projects` | پروژه‌هایی که User عضو آن‌هاست |
+| `GET` | `/api/projects` | فهرست همهٔ پروژه‌ها |
 | `POST` | `/api/projects` | ساخت پروژه با `{ name, document? }` |
-| `GET` | `/api/projects/:projectId` | summary و memberهای پروژه |
+| `GET` | `/api/projects/:projectId` | summary پروژه |
 | `PATCH` | `/api/projects/:projectId` | تغییر نام با `{ name, clientMutationId? }` |
 | `GET` | `/api/projects/:projectId/document` | دریافت Universal document و revision |
 | `PUT` | `/api/projects/:projectId/document` | جایگزینی کامل document |
@@ -221,79 +150,64 @@ Member API حساب فعال مقصد را از auth store پیدا می‌کن�
 | `POST` | `/api/projects/:projectId/comments` | ساخت comment یا reply |
 | `PATCH` | `/api/projects/:projectId/comments/:commentId` | تغییر body یا status |
 | `DELETE` | `/api/projects/:projectId/comments/:commentId` | حذف comment |
-| `GET` | `/api/projects/:projectId/history` | action history ترتیبی |
-| `GET` | `/api/projects/:projectId/members` | فهرست memberها |
-| `POST` | `/api/projects/:projectId/members` | add/update با `{ userId, role }`؛ هویت مقصد از auth store خوانده می‌شود |
-| `PATCH` | `/api/projects/:projectId/members/:userId` | تغییر role با `{ role }` |
-| `DELETE` | `/api/projects/:projectId/members/:userId` | حذف member |
+| `GET` | `/api/projects/:projectId/history` | Action History ترتیبی |
 | `GET` | `/api/projects/:projectId/events` | stream رویدادهای SSE و اتصال presence |
 | `POST` | `/api/projects/:projectId/presence` | به‌روزرسانی presence اتصال باز |
 
-### ساخت و خواندن پروژه
+endpoint مربوط به account یا member وجود ندارد و Workspace پنل People/مدیریت همکاران ندارد.
+
+ساخت و خواندن پروژه:
 
 ```js
 const created = await fetch('/api/projects', {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
+  headers: { 'Content-Type': 'application/json', ...actorHeaders },
   body: JSON.stringify({ name: 'Forest Adventure' })
 }).then(response => response.json());
 
 const projectId = created.data.project.id;
 const snapshot = await fetch(`/api/projects/${projectId}/document`, {
+  headers: actorHeaders,
   cache: 'no-store'
 }).then(response => response.json());
 
 const { document, revision } = snapshot.data;
 ```
 
-`GET document` همچنین `ETag: "<revision>"` می‌فرستد. write contract فعلی `expectedRevision` را در JSON body می‌گیرد و از `If-Match` استفاده نمی‌کند.
+`GET document` همچنین `ETag: "<revision>"` می‌فرستد. write contract مقدار `expectedRevision` را در JSON body می‌گیرد و از `If-Match` استفاده نمی‌کند.
+
+## Same-Origin برای mutation مرورگر
+
+`POST`، `PATCH`، `PUT` و `DELETE` وقتی header `Origin` دارند فقط از origin خود request، Host متناظر یا `AH2D_ALLOWED_ORIGINS` پذیرفته می‌شوند. این کنترل برای کاهش mutation ناخواسته از یک صفحهٔ cross-origin است، نه تعیین اینکه چه کسی اجازهٔ تغییر دارد. client غیرمرورگری که به شبکه دسترسی دارد می‌تواند بدون `Origin` mutation بفرستد.
 
 ## Optimistic document revision
 
 هر `PUT` یا `PATCH` document باید `expectedRevision` مثبت داشته باشد:
 
 ```js
-const mutationId = crypto.randomUUID();
 const result = await fetch(`/api/projects/${projectId}/document`, {
   method: 'PATCH',
-  headers: { 'Content-Type': 'application/json' },
+  headers: { 'Content-Type': 'application/json', ...actorHeaders },
   body: JSON.stringify({
     expectedRevision: revision,
-    clientMutationId: mutationId,
+    clientMutationId: crypto.randomUUID(),
     operations: [
-      { op: 'replace', path: '/postProcess/effects/0/enabled', value: true },
-      { op: 'replace', path: '/postProcess/effects/0/intensity', value: 0.5 }
+      { op: 'replace', path: '/postProcess/effects/0/enabled', value: true }
     ]
   })
 }).then(response => response.json());
 ```
 
-JSON Patch از `add`، `remove`، `replace` و `test` پشتیبانی می‌کند. مسیرها JSON Pointer هستند. عملیات `move` و `copy` پیاده نشده‌اند.
+JSON Patch از `add`، `remove`، `replace` و `test` پشتیبانی می‌کند؛ `move` و `copy` پیاده نشده‌اند.
 
 - نبودن revision معتبر: `428 REVISION_REQUIRED`.
 - قدیمی‌بودن revision: `409 REVISION_CONFLICT` همراه `actualRevision`.
-- موفقیت: document به‌صورت atomic ذخیره می‌شود و revision یک واحد بالا می‌رود.
-- `clientMutationId` تا ۱۶۰ کاراکتر، mutation را برای همان Actor idempotent می‌کند. یک کلید را برای نوع دیگری از mutation دوباره استفاده نکنید.
+- موفقیت: document اتمیک ذخیره و revision یک واحد زیاد می‌شود.
+- `clientMutationId` تا ۱۶۰ کاراکتر برای deduplication همان actor label استفاده می‌شود.
 
-در conflict سند جدید را دوباره بگیرید، تغییر محلی و remote را آگاهانه merge کنید و mutation تازه را با revision و `clientMutationId` تازه بفرستید. retry کور روی نسخهٔ قدیمی مجاز نیست.
+در conflict سند جدید را بگیرید، تغییر محلی و remote را آگاهانه merge کنید و mutation تازه بفرستید. `PUT` فقط برای snapshot کامل و تازه‌مبنا مناسب است. حد پیش‌فرض document برابر ۱۶ MiB است و assetهای Base64 نیز در همین اندازه حساب می‌شوند.
 
-`PUT` برای autosave کامل Editor مناسب است، به شرط آنکه snapshot روی همان revision پایه ساخته شده و تمام بخش‌های ناشناختهٔ سند را حفظ کرده باشد:
-
-```js
-await fetch(`/api/projects/${projectId}/document`, {
-  method: 'PUT',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    document: editorProject,
-    expectedRevision: currentRevision,
-    clientMutationId: crypto.randomUUID()
-  })
-});
-```
-
-حد پیش‌فرض document برابر ۱۶ MiB است. assetهای Base64 جزو همین اندازه‌اند.
-
-هر `PUT` و نتیجهٔ هر `PATCH` پیش از commit با قرارداد مشترک CLI در حالت strict اعتبارسنجی و آینهٔ `scene` آن با Scene فعال هماهنگ می‌شود. خطای schema/component یا conflict چند storage با `422 INVALID_AH2D_PROJECT` برمی‌گردد؛ این خطا با `409 REVISION_CONFLICT` که فقط به concurrency مربوط است متفاوت است.
+هر `PUT` و نتیجهٔ هر `PATCH` پیش از commit با قرارداد مشترک CLI در حالت strict اعتبارسنجی و mirror مربوط به `scene` با Scene فعال هماهنگ می‌شود. خطای schema/component با `422 INVALID_AH2D_PROJECT` و تعارض concurrency با `409 REVISION_CONFLICT` برمی‌گردد.
 
 ## Comments
 
@@ -302,7 +216,7 @@ Comment می‌تواند به Scene، Entity، مسیر داده، موقعیت
 ```js
 await fetch(`/api/projects/${projectId}/comments`, {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
+  headers: { 'Content-Type': 'application/json', ...actorHeaders },
   body: JSON.stringify({
     body: 'Hitbox should start two frames earlier.',
     anchor: {
@@ -318,69 +232,33 @@ await fetch(`/api/projects/${projectId}/comments`, {
 });
 ```
 
-برای reply، `parentId` را بفرستید. Filterهای GET عبارت‌اند از `status=open|resolved`، `sceneId` و `entityId`. Author می‌تواند comment خودش را ویرایش/حذف کند؛ Owner/Admin پروژه می‌توانند moderation انجام دهند.
-
-تغییر status:
-
-```js
-await fetch(`/api/projects/${projectId}/comments/${commentId}`, {
-  method: 'PATCH',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ status: 'resolved', clientMutationId: crypto.randomUUID() })
-});
-```
-
-حذف parent، replyهای باقی‌مانده را حذف نمی‌کند و فقط `parentId` آن‌ها را برمی‌دارد.
+برای reply، `parentId` را بفرستید. filterهای GET عبارت‌اند از `status=open|resolved`، `sceneId` و `entityId`. هر client قابل‌دسترسی می‌تواند هر comment را ویرایش، resolve، reopen یا حذف کند؛ label نویسنده فقط attribution نمایشی است. حذف parent، replyهای باقی‌مانده را حذف نمی‌کند و فقط `parentId` آن‌ها را برمی‌دارد.
 
 ## Action History
 
-هر Action شامل `sequence` صعودی، نوع، snapshot کاربر (`id/name/email`)، زمان، `documentRevision`، metadata و `clientMutationId` اختیاری است. نوع‌های فعلی:
+هر Action شامل `sequence` صعودی، `type`، actor label (`id/name`)، زمان، `documentRevision`، metadata و `clientMutationId` اختیاری است. Actionهای جدید:
 
 - `project.created`, `project.updated`
 - `document.replaced`, `document.patched`
 - `comment.created`, `comment.updated`, `comment.deleted`
-- `member.added`, `member.role_changed`, `member.removed`
-
-آخرین Actionها:
 
 ```text
 GET /api/projects/:projectId/history?limit=100
-```
-
-ادامه از sequence مشخص:
-
-```text
 GET /api/projects/:projectId/history?after=250&limit=100
 ```
 
-`limit` بین ۱ و ۵۰۰ clamp می‌شود و store فقط ۲۰۰۰ Action آخر را نگه می‌دارد. این history برای UX و audit سبک است؛ log انطباقیِ immutable محسوب نمی‌شود.
-
-## Members
-
-ابتدا با `/api/auth/users` حساب را provision کنید و `id` آن را بگیرید، سپس همان ID را به پروژه اضافه کنید:
-
-```js
-await fetch(`/api/projects/${projectId}/members`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    userId: user.id,
-    role: 'editor'
-  })
-});
-```
-
-نام و Email از payload client پذیرفته نمی‌شود؛ Route حساب فعال را با `userId` پیدا می‌کند، target-role cap را بررسی می‌کند و snapshot معتبر نام/Email را خودش داخل membership می‌نویسد. authorization همچنان بر اساس `userId` session انجام می‌شود.
+`limit` بین ۱ و ۵۰۰ clamp می‌شود و store فقط ۲۰۰۰ Action آخر را نگه می‌دارد. history برای UX است، actor label آن قابل‌اعتماد نیست و log انطباقی immutable محسوب نمی‌شود. رکورد مهاجرت‌کرده ممکن است Actionهای قدیمی member را فقط به‌عنوان سابقه نگه دارد.
 
 ## SSE و Presence
 
-برای هر tab یک `clientId` پایدار و یکتا بسازید و stream را باز نگه دارید:
+برای هر tab یک `clientId` یکتا بسازید. همان actor label را در query stream و header درخواست presence بفرستید:
 
 ```js
+const actorId = 'local-tab-7f3a';
+const actorName = 'Local User';
 const clientId = crypto.randomUUID();
-const events = new EventSource(
-  `/api/projects/${projectId}/events?clientId=${encodeURIComponent(clientId)}`
-);
+const query = new URLSearchParams({ clientId, actorId, actorName });
+const events = new EventSource(`/api/projects/${projectId}/events?${query}`);
 
 events.addEventListener('connected', event => {
   const message = JSON.parse(event.data);
@@ -389,22 +267,19 @@ events.addEventListener('connected', event => {
 
 events.addEventListener('document.changed', async event => {
   const message = JSON.parse(event.data);
-  if (message.actor?.id !== currentUserId) await reloadAndMerge(message.revision);
+  if (message.actor?.id !== actorId) await reloadAndMerge(message.revision);
 });
 
 events.addEventListener('comment.changed', refreshComments);
-events.addEventListener('member.changed', refreshMembers);
 events.addEventListener('presence.updated', drawRemoteSelection);
-```
 
-EventSource با cookie همان origin احراز هویت می‌شود. eventهای موجود: `connected`، `document.changed`، `project.changed`، `comment.changed`، `member.changed`، `presence.joined`، `presence.updated` و `presence.left`.
-
-بعد از بازشدن stream، presence همان `clientId` را ارسال کنید:
-
-```js
 await fetch(`/api/projects/${projectId}/presence`, {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
+  headers: {
+    'Content-Type': 'application/json',
+    'x-ah2d-actor-id': actorId,
+    'x-ah2d-actor-name': actorName
+  },
   body: JSON.stringify({
     clientId,
     sceneId: 'boss-room',
@@ -415,40 +290,24 @@ await fetch(`/api/projects/${projectId}/presence`, {
 });
 ```
 
-اگر stream قبلاً وصل نشده باشد، presence با `409 PRESENCE_CONNECTION_NOT_FOUND` رد می‌شود. بستن stream باعث `presence.left` می‌شود. برای پاک‌کردن fieldهای اختیاری مقدار `null` بفرستید.
+eventهای جاری عبارت‌اند از `connected`، `document.changed`، `project.changed`، `comment.changed`، `presence.joined`، `presence.updated` و `presence.left`. تطابق actor ID و `clientId` فقط اتصال presence را correlate می‌کند و دسترسی ایجاد نمی‌کند.
 
-سرور هر ۱۵ ثانیه پیش از heartbeat، session، identity، account permission و عضویت پروژه را دوباره بررسی می‌کند و در صورت لغو دسترسی stream را می‌بندد. حذف همان User از memberها نیز stream را هنگام event مربوطه فوراً می‌بندد. سرور `retry: 3000` پیشنهاد می‌دهد. replay با `Last-Event-ID` فقط در همان process و تا وقتی event در buffer حداکثر ۲۵۶ آیتم/۲ MiB موجود است انجام می‌شود. بعد از reconnect همیشه revision/history را نیز reconcile کنید؛ SSE منبع دائمی حقیقت نیست.
+اگر stream قبلاً وصل نشده باشد، presence با `409 PRESENCE_CONNECTION_NOT_FOUND` رد می‌شود. بستن stream باعث `presence.left` می‌شود. سرور heartbeat پانزده‌ثانیه‌ای و `retry: 3000` می‌فرستد. replay با `Last-Event-ID` فقط در همان process و تا وقتی event در buffer حداکثر ۲۵۶ آیتم/۲ MiB موجود است انجام می‌شود. بعد از reconnect همیشه revision/history را reconcile کنید؛ SSE منبع دائمی حقیقت نیست.
 
 ## Post Process در Collaboration
 
-`postProcess` جزئی از Universal document و در نتیجه جزئی از همان optimistic revision است. هر پروژه stack خودش را دارد و تغییر slider/toggle توسط Editor در autosave بعدی داخل document ذخیره می‌شود. پروژه‌های جدید defaultهای Bloom، Vignette، Color Adjust، Chromatic Aberration، Pixelate و CRT را دریافت می‌کنند.
+`postProcess` جزئی از Universal document و همان optimistic revision است. هر پروژه stack خودش را دارد و تغییر slider/toggle در autosave بعدی ذخیره می‌شود. برای تغییر بیرون Editor نیز `PATCH document` روی JSON Pointer مناسب بفرستید و effect را در snapshot همان revision با `id` پیدا کنید.
 
-برای تغییر خارج Editor نیز `PATCH document` روی JSON Pointer مناسب است. ترتیب effectها یک array contract است؛ اگر بر اساس index patch می‌کنید ابتدا سند همان revision را بخوانید. برای code پایدارتر effect موردنظر را با `id` پیدا کنید، index متناظر همان snapshot را patch کنید و conflict را merge کنید.
-
-## محدودیت store محلی
+## محدودیت store محلی و adapter تولیدی
 
 پیاده‌سازی فعلی برای توسعه، demo و اجرای تک-process است:
 
-- حساب‌ها و sessionها در یک فایل JSON و پروژه‌ها هرکدام در یک فایل JSON ذخیره می‌شوند.
-- writeها atomic و lockها فقط داخل همان process هستند.
-- listenerها، SSE replay buffer، presence و login rate limit در RAM همان process‌اند.
-- اجرای چند instance، serverless/edge، autoscaling یا shared network filesystem می‌تواند race، presence ناقص و event گم‌شده ایجاد کند.
-- Action History قابل‌ویرایش روی filesystem است و retention آن محدود است.
+- پروژه‌ها فایل JSON محلی هستند؛ write اتمیک است اما lock فقط داخل همان process است.
+- SSE replay buffer و presence در RAM همان process قرار دارند.
+- اجرای چند instance، serverless/edge، autoscaling یا shared filesystem می‌تواند race، presence ناقص و event گم‌شده ایجاد کند.
+- Action History قابل‌ویرایش روی filesystem و retention آن محدود است.
 - assetهای Base64 باعث بزرگ‌شدن document و write کامل فایل می‌شوند.
 
-تا پیش از اضافه‌شدن adapter پایدار، فقط یک process Node را روی یک volume پایدار اجرا کنید. دستورالعمل کامل در [`DEPLOYMENT.md`](./DEPLOYMENT.md) است.
-
-## قرارداد adapter برای Production
-
-برای Production چندکاربره، رفتار بیرونی routeها را نگه دارید اما زیرساخت را جایگزین کنید:
-
-1. `AuthStore` را با PostgreSQL/SQL یا Identity Provider سازمانی جایگزین کنید؛ session revoke/expiry باید transactional باشد.
-2. `CollaborationProjectStore` را پشت repository interface قرار دهید و compare-and-swap روی `revision` را در یک transaction انجام دهید.
-3. Action و document mutation را در همان transaction بنویسید؛ برای انتشار realtime از transactional outbox استفاده کنید.
-4. Event hub و presence را به Redis/NATS/pub-sub و TTL-backed presence منتقل کنید؛ reconnect باید از durable sequence یا history recover شود.
-5. assetهای بزرگ را در object storage بگذارید و فقط metadata/content hash را در Universal document نگه دارید.
-6. secretها را در secret manager، cookie را پشت HTTPS و origin allowlist را دقیق تنظیم کنید.
-7. rate limit را distributed و مبتنی بر proxy-aware IP/User کنید.
-8. برای audit رسمی، log append-only با retention، integrity control و access policy جدا بسازید.
+تا پیش از adapter پایدار، فقط یک process Node را روی volume پایدار اجرا کنید. برای چند instance، compare-and-swap روی `revision` را در transaction دیتابیس انجام دهید، Action و document را در همان transaction بنویسید، realtime را با transactional outbox و pub/sub پایدار کنید و presence را TTLدار نگه دارید. actor label ورودی را حتی در adapter تولیدی هویت معتبر فرض نکنید؛ اگر محیط به مجوز واقعی نیاز دارد، آن مرز باید بیرون یا جایگزین این حالت local-trusted طراحی شود.
 
 Routeها و typeهای مرجع در `src/app/api` و `src/lib/collaboration/types.ts` هستند. تغییر schema یا event contract باید با test، migration و به‌روزرسانی این سند همراه باشد.

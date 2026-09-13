@@ -1,8 +1,15 @@
-import { AuthError, assertSameOrigin, authErrorResponse, requireApiUser } from "@/lib/auth";
 import { CollaborationError } from "./errors";
 import type { CollaborationActor } from "./types";
 
 const MAX_API_BODY_BYTES = Number(process.env.AH2D_MAX_API_BODY_BYTES) || 18 * 1024 * 1024;
+const ACTOR_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
+const MAX_ACTOR_NAME_LENGTH = 160;
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
+
+export const LOCAL_ACTOR: Readonly<CollaborationActor> = {
+  id: "local",
+  name: "Local User",
+};
 
 interface ApiSuccessOptions {
   status?: number;
@@ -24,14 +31,6 @@ export function apiSuccess(data: unknown, options: ApiSuccessOptions = {}): Resp
 }
 
 export function apiError(error: unknown): Response {
-  if (error instanceof AuthError) return authErrorResponse(error);
-  if (error instanceof Response) {
-    if (error.headers.get("content-type")?.includes("application/json")) return error;
-    return Response.json(
-      { ok: false, error: { code: "AUTHENTICATION_REQUIRED", message: error.statusText || "Authentication failed." } },
-      { status: error.status || 401, headers: error.headers },
-    );
-  }
   if (error instanceof CollaborationError) {
     return Response.json(
       {
@@ -59,7 +58,63 @@ export function apiError(error: unknown): Response {
   );
 }
 
-export async function authenticatedApi(
+export function assertSameOrigin(request: Request): void {
+  const origin = request.headers.get("origin");
+  if (!origin) return;
+
+  const requestUrl = new URL(request.url);
+  const allowed = new Set(
+    (process.env.AH2D_ALLOWED_ORIGINS || "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  allowed.add(requestUrl.origin);
+  const host = request.headers.get("host")?.trim();
+  if (host) allowed.add(`${requestUrl.protocol}//${host}`);
+  if (!allowed.has(origin)) {
+    throw new CollaborationError(
+      "INVALID_ORIGIN",
+      "Cross-origin collaboration request rejected.",
+      403,
+    );
+  }
+}
+
+function optionalActorValue(value: string | null): string | undefined {
+  const normalized = value?.trim();
+  return normalized || undefined;
+}
+
+export function actorFromRequest(request: Request): CollaborationActor {
+  const url = new URL(request.url);
+  const id = optionalActorValue(request.headers.get("x-ah2d-actor-id"))
+    ?? optionalActorValue(url.searchParams.get("actorId"));
+  const name = optionalActorValue(request.headers.get("x-ah2d-actor-name"))
+    ?? optionalActorValue(url.searchParams.get("actorName"));
+
+  if (id && !ACTOR_ID_PATTERN.test(id)) {
+    throw new CollaborationError(
+      "INVALID_ACTOR",
+      "Actor ID must contain 1 to 160 safe identifier characters.",
+      400,
+    );
+  }
+  if (name && (name.length > MAX_ACTOR_NAME_LENGTH || CONTROL_CHARACTER_PATTERN.test(name))) {
+    throw new CollaborationError(
+      "INVALID_ACTOR",
+      "Actor name must contain at most 160 characters and no control characters.",
+      400,
+    );
+  }
+
+  return {
+    id: id ?? LOCAL_ACTOR.id,
+    name: name ?? LOCAL_ACTOR.name,
+  };
+}
+
+export async function collaborationApi(
   request: Request,
   handler: (actor: CollaborationActor) => Promise<Response>,
 ): Promise<Response> {
@@ -67,14 +122,7 @@ export async function authenticatedApi(
     if (!["GET", "HEAD", "OPTIONS"].includes(request.method.toUpperCase())) {
       assertSameOrigin(request);
     }
-    const user = await requireApiUser(request);
-    const actor: CollaborationActor = {
-      id: user.id,
-      name: user.name || user.email || "User",
-      email: user.email ?? null,
-      accountRole: user.role,
-    };
-    return await handler(actor);
+    return await handler(actorFromRequest(request));
   } catch (error) {
     return apiError(error);
   }
@@ -128,8 +176,4 @@ export type ProjectRouteContext = {
 
 export type CommentRouteContext = {
   params: Promise<{ projectId: string; commentId: string }>;
-};
-
-export type MemberRouteContext = {
-  params: Promise<{ projectId: string; userId: string }>;
 };

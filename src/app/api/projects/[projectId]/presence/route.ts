@@ -1,6 +1,6 @@
 import {
   apiSuccess,
-  authenticatedApi,
+  collaborationApi,
   jsonBody,
   type ProjectRouteContext,
 } from "@/lib/collaboration/api";
@@ -18,11 +18,11 @@ function finiteCoordinate(value: unknown, label: string): number {
 }
 
 export function POST(request: Request, context: ProjectRouteContext): Promise<Response> {
-  return authenticatedApi(request, async (actor) => {
+  return collaborationApi(request, async (actor) => {
     const { projectId } = await context.params;
     const body = await jsonBody(request);
     const service = getCollaborationService();
-    const project = await service.authorize(actor, projectId, "presence:write");
+    const project = await service.readProject(projectId);
     if (typeof body.clientId !== "string" || !body.clientId.trim() || body.clientId.length > 160) {
       throw new CollaborationError("INVALID_PRESENCE", "A valid clientId is required.");
     }

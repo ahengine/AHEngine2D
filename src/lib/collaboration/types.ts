@@ -1,45 +1,14 @@
-import type { Role as AccountRole } from "@/types/auth";
-
-export const COLLABORATION_SCHEMA = "ah2d.collaboration/project-v1" as const;
-
-export type ProjectRole = "owner" | "admin" | "editor" | "commenter" | "viewer";
-
-export type CollaborationPermission =
-  | "project:read"
-  | "project:update"
-  | "document:read"
-  | "document:write"
-  | "comment:read"
-  | "comment:create"
-  | "comment:moderate"
-  | "history:read"
-  | "member:read"
-  | "member:manage"
-  | "presence:read"
-  | "presence:write";
+export const COLLABORATION_SCHEMA = "ah2d.collaboration/project-v2" as const;
+export const LEGACY_COLLABORATION_SCHEMA = "ah2d.collaboration/project-v1" as const;
 
 export interface CollaborationActor {
   id: string;
   name: string;
-  email?: string | null;
-  /** Platform role caps project-scoped privileges for authenticated actors. */
-  accountRole?: AccountRole;
 }
 
 export interface ActorSnapshot {
   id: string;
   name: string;
-  email?: string | null;
-}
-
-export interface ProjectMember {
-  userId: string;
-  role: ProjectRole;
-  name: string;
-  email?: string | null;
-  joinedAt: string;
-  updatedAt: string;
-  invitedBy?: string;
 }
 
 export interface CommentAnchor {
@@ -73,6 +42,7 @@ export type ProjectActionType =
   | "comment.created"
   | "comment.updated"
   | "comment.deleted"
+  // Retained so v1 action history can be read without losing prior activity.
   | "member.added"
   | "member.role_changed"
   | "member.removed";
@@ -93,7 +63,6 @@ export interface StoredCollaborationProject {
   schema: typeof COLLABORATION_SCHEMA;
   id: string;
   name: string;
-  ownerId: string;
   createdAt: string;
   updatedAt: string;
   /** Optimistic concurrency token for the authored AH2D document. */
@@ -101,7 +70,6 @@ export interface StoredCollaborationProject {
   /** Monotonic sequence covering every persisted project action. */
   activitySequence: number;
   document: unknown;
-  members: Record<string, ProjectMember>;
   comments: ProjectComment[];
   history: ProjectAction[];
 }
@@ -109,13 +77,10 @@ export interface StoredCollaborationProject {
 export interface ProjectSummary {
   id: string;
   name: string;
-  ownerId: string;
-  role: ProjectRole;
   revision: number;
   activitySequence: number;
   createdAt: string;
   updatedAt: string;
-  memberCount: number;
   openCommentCount: number;
 }
 
@@ -136,7 +101,6 @@ export type CollaborationEventType =
   | "document.changed"
   | "project.changed"
   | "comment.changed"
-  | "member.changed"
   | "presence.joined"
   | "presence.updated"
   | "presence.left";

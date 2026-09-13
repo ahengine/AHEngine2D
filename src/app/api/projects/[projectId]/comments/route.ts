@@ -1,6 +1,6 @@
 import {
   apiSuccess,
-  authenticatedApi,
+  collaborationApi,
   jsonBody,
   type ProjectRouteContext,
 } from "@/lib/collaboration/api";
@@ -9,7 +9,7 @@ import { getCollaborationService } from "@/lib/collaboration/service";
 export const runtime = "nodejs";
 
 export function GET(request: Request, context: ProjectRouteContext): Promise<Response> {
-  return authenticatedApi(request, async (actor) => {
+  return collaborationApi(request, async (actor) => {
     const { projectId } = await context.params;
     const url = new URL(request.url);
     const result = await getCollaborationService().listComments(actor, projectId, {
@@ -22,7 +22,7 @@ export function GET(request: Request, context: ProjectRouteContext): Promise<Res
 }
 
 export function POST(request: Request, context: ProjectRouteContext): Promise<Response> {
-  return authenticatedApi(request, async (actor) => {
+  return collaborationApi(request, async (actor) => {
     const { projectId } = await context.params;
     const body = await jsonBody(request);
     const result = await getCollaborationService().createComment(actor, projectId, {

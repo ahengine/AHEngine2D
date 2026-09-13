@@ -8,12 +8,10 @@ AH2D یک محیط Authoring دوبعدی، یک Studio مشارکتی مبتن�
 
 ```text
 AH2D Studio (Next.js)
-├── Signed HttpOnly Authentication
-├── Effective global ∩ per-project RBAC
-├── Collaborative Project API
+├── Open local-trusted Project API
 ├── Comments + Action History
 ├── SSE Events + Presence
-└── Auth-gated sandboxed Spatial Editor
+└── Public sandboxed Spatial Editor
     └── AH2D Engine
         ├── Scene Graph + ECS
         ├── Transform / Camera / Lighting / Shadow
@@ -26,14 +24,13 @@ AH2D Studio (Next.js)
 فایل‌های اصلی:
 
 - `AH2DEdtior.html`: خود Editor و Preview.
-- `src/app`: پوستهٔ Next.js، صفحه‌های Login/Projects/Workspace و Route Handlerها.
-- `src/lib/auth`: session، password hashing و RBAC سراسری.
-- `src/lib/collaboration`: ذخیرهٔ پروژه، RBAC پروژه، comment، history، presence و event stream.
+- `src/app`: پوستهٔ Next.js، صفحه‌های Projects/Workspace و Route Handlerها.
+- `src/lib/collaboration`: ذخیرهٔ پروژه، actor label نمایشی، comment، history، presence و event stream.
 - `engine/AH2DEngine.js`: هستهٔ Runtime، ECS، Scene Graph و Physics.
 - `engine/AH2DDataModel.js`: قرارداد واحد Entity/Component، رجیستری schema، validation، migration و codec سازگار با داده‌های قدیمی.
 - `engine/cli/ah2d.js`: CLI بدون dependency برای Agent و CI.
 - `engine/CLI.md`: مرجع کامل فرمان‌های CLI.
-- `docs/COLLABORATION.md`: قرارداد کامل Auth، RBAC و API مشارکت.
+- `docs/COLLABORATION.md`: قرارداد API عمومی، revision، attribution و realtime.
 - `docs/DEPLOYMENT.md`: اجرای Production و محدودیت storage محلی.
 - `Agent.md`: راهنمای توسعهٔ بازی توسط Agent.
 - `AGENTS.md`: دستورالعمل کوتاه و استاندارد Agentهای کدنویسی.
@@ -44,12 +41,11 @@ AH2D Studio (Next.js)
 
 ```powershell
 Copy-Item .env.example .env.local
-# مقادیر AH2D_AUTH_SECRET و حساب Owner را در .env.local تغییر دهید.
 npm install
 npm run dev
 ```
 
-سپس `http://localhost:3000` را باز کنید. اگر auth store خالی باشد، حساب Owner هنگام نخستین Login از `AH2D_BOOTSTRAP_OWNER_*` ساخته می‌شود. رمز باید حداقل ۱۲ کاراکتر و `AH2D_AUTH_SECRET` حداقل ۳۲ بایت باشد.
+سپس `http://localhost:3000` را باز کنید؛ Studio مستقیماً صفحهٔ Projects را نمایش می‌دهد. این سرویس در حالت no-auth/open local-trusted است: هر client شبکه‌ای که به آن برسد می‌تواند همهٔ پروژه‌ها و mutationها را اجرا کند. آن را فقط روی دستگاه یا شبکهٔ مورداعتماد در دسترس بگذارید.
 
 Build و اجرای Production:
 
@@ -60,29 +56,26 @@ npm run start
 
 ### Docker
 
-فایل `Dockerfile` یک image چندمرحله‌ای مبتنی بر خروجی standalone می‌سازد و سرویس را با User غیر root اجرا می‌کند. داده‌های Auth و Collaboration باید روی volume پایدار `/var/lib/ah2d` قرار بگیرند:
+فایل `Dockerfile` یک image چندمرحله‌ای مبتنی بر خروجی standalone می‌سازد و سرویس را با user غیر-root اجرا می‌کند. داده‌های Collaboration باید روی volume پایدار `/var/lib/ah2d` قرار بگیرند:
 
 ```bash
 docker build -t ah2d-studio:latest .
 docker volume create ah2d-data
 docker run -d --name ah2d-studio --restart unless-stopped \
-  -p 3000:3000 \
+  -p 127.0.0.1:3000:3000 \
   --env-file .env.production \
   -v ah2d-data:/var/lib/ah2d \
   ah2d-studio:latest
 ```
 
-حداقل `.env.production` باید `AH2D_AUTH_SECRET` تصادفی با حداقل ۳۲ بایت، مشخصات Owner اولیه و origin دقیق HTTPS را داشته باشد:
+تنظیمات نمونهٔ `.env.production`:
 
 ```dotenv
-AH2D_AUTH_SECRET=<at-least-32-random-bytes>
-AH2D_BOOTSTRAP_OWNER_EMAIL=owner@example.com
-AH2D_BOOTSTRAP_OWNER_PASSWORD=<long-unique-password>
-AH2D_BOOTSTRAP_OWNER_NAME=Studio Owner
-AH2D_ALLOWED_ORIGINS=https://studio.example.com
+AH2D_COLLAB_DATA_DIR=/var/lib/ah2d/collaboration
+AH2D_ALLOWED_ORIGINS=https://studio.internal.example
 ```
 
-فایل env را commit نکنید و container را پشت reverse proxy دارای HTTPS اجرا کنید. مسیرهای storage داخل image به‌صورت پیش‌فرض روی `/var/lib/ah2d` تنظیم شده‌اند. deployment فعلی فقط یک container و یک Node process را پشتیبانی می‌کند؛ جزئیات backup، SSE و محدودیت scale در [راهنمای Deployment](./docs/DEPLOYMENT.md) آمده است.
+فایل env را commit نکنید. bind کردن port به loopback مانع exposure مستقیم می‌شود؛ برای دسترسی تیمی از VPN، شبکهٔ خصوصی یا reverse proxy محدودشده استفاده کنید. مسیر storage داخل image به‌صورت پیش‌فرض روی `/var/lib/ah2d` تنظیم شده است. deployment فعلی فقط یک container و یک Node process را پشتیبانی می‌کند؛ جزئیات backup، SSE و محدودیت scale در [راهنمای Deployment](./docs/DEPLOYMENT.md) آمده است.
 
 Validation و تست کل Studio، Engine و CLI:
 
@@ -93,7 +86,7 @@ npm run check
 npm test
 ```
 
-برای استفادهٔ standalone و بدون Login/Collaboration هنوز می‌توانید `AH2DEdtior.html` را با یک static HTTP server باز کنید:
+برای استفادهٔ standalone و بدون سرویس Collaboration می‌توانید `AH2DEdtior.html` را با یک static HTTP server باز کنید:
 
 ```powershell
 python -m http.server 4173
@@ -101,22 +94,15 @@ python -m http.server 4173
 
 سپس آدرس `http://127.0.0.1:4173/AH2DEdtior.html` را باز کنید.
 
-## Studio مشارکتی، Auth و RBAC
+## Studio مشارکتی و مدل اعتماد
 
-Studio از session امضاشده در cookie با نام `ah2d_session` استفاده می‌کند. cookie از نوع `HttpOnly` و `SameSite=Strict` است و در Production فقط روی HTTPS ارسال می‌شود. Passwordها با `scrypt` و salt تصادفی hash می‌شوند؛ خود token در storage ذخیره نمی‌شود و فقط SHA-256 آن نگه‌داری می‌شود.
+Studio برای استفادهٔ محلی و قابل‌اعتماد طراحی شده و هیچ مرحلهٔ ورود، حساب، نقش یا عضویت پروژه‌ای ندارد. همهٔ routeهای پروژه و Editor عمومی‌اند. endpoint مدیریت member و پنل People نیز وجود ندارد. هر client شبکه‌ای که به سرور دسترسی دارد می‌تواند تمام پروژه‌ها را بخواند و تغییر دهد، commentها را مدیریت کند و به SSE/presence متصل شود؛ بنابراین `AH2D_ALLOWED_ORIGINS` جایگزین ایزوله‌سازی شبکه نیست.
 
-این Auth مربوط به کاربران و پروژه‌های hosted Studio است و به‌صورت خودکار وارد Runtime بازی exportشده نمی‌شود؛ بازی نهایی می‌تواند Identity Provider و backend متناسب با محصول خودش را انتخاب کند.
+برای attribution اختیاری، requestها headerهای `x-ah2d-actor-id` و `x-ah2d-actor-name` و stream SSE queryهای `actorId` و `actorName` را می‌پذیرند. fallback برابر `Local User` است. این labelها قابل‌جعل‌اند و هرگز مجوز یا هویت معتبر محسوب نمی‌شوند.
 
-دو سطح نقش جداگانه وجود دارد:
+رکورد جاری Collaboration برابر `ah2d.collaboration/project-v2` و بدون ownership/membership است. رکوردهای v1 خوانده می‌شوند و در اولین write عادی همان پروژه، بدون دادهٔ membership به v2 تبدیل می‌شوند. optimistic revision، comment، Action History، SSE و presence همچنان برقرارند.
 
-- نقش سراسری حساب: `OWNER`، `ADMIN`، `EDITOR`، `COMMENTER` و `VIEWER`؛ برای provisioning حساب‌ها و مجوزهای سراسری.
-- نقش عضویت پروژه: `owner`، `admin`، `editor`، `commenter` و `viewer`؛ برای document، comment، history، member و presence همان پروژه.
-
-مجوز مؤثر، تقاطع permission نقش حساب و permission عضویت پروژه است؛ قوی‌بودن یکی، محدودیت دیگری را دور نمی‌زند. نقش سراسری به‌تنهایی دسترسی به همهٔ پروژه‌ها نمی‌دهد و کاربر باید عضو پروژه نیز باشد. سازندهٔ پروژه به‌طور خودکار `owner` آن پروژه می‌شود، ولی توان عملی او همچنان با نقش حساب محدود است.
-
-نقش پروژه‌ای که به یک User داده می‌شود نیز نمی‌تواند از سقف نقش حساب آن User بالاتر باشد؛ برای نمونه حساب `COMMENTER` فقط می‌تواند `commenter` یا `viewer` پروژه باشد. ownership از Member API قابل‌اعطا نیست. جزئیات permission matrix، target-role cap، تمام Routeها، قرارداد optimistic revision، SSE و مثال‌های request در [`docs/COLLABORATION.md`](./docs/COLLABORATION.md) آمده است. تنظیم Production و جایگزینی file store محلی در [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) توضیح داده شده است.
-
-Editor تعبیه‌شده فقط پس از Login تحویل داده می‌شود و در iframe با origin ایزوله (`opaque`)، sandbox محدود، CSP سخت‌گیرانه و bridge کنترل‌شده اجرا می‌شود. جزئیات این مرز امنیتی در سند Collaboration آمده است.
+Editor تعبیه‌شده عمومی است، اما در iframe با origin ایزوله (`opaque`)، sandbox محدود، CSP سخت‌گیرانه و bridge کنترل‌شده اجرا می‌شود. این مرز Frame را از پوسته جدا می‌کند و کنترل دسترسی شبکه نیست. قرارداد کامل در [`docs/COLLABORATION.md`](./docs/COLLABORATION.md) و راهنمای exposure امن در [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) آمده است.
 
 ## خروجی‌های Editor
 

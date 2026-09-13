@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import { link, mkdir, open, readdir, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { CollaborationError } from "./errors";
-import { COLLABORATION_SCHEMA, type StoredCollaborationProject } from "./types";
+import {
+  COLLABORATION_SCHEMA,
+  LEGACY_COLLABORATION_SCHEMA,
+  type ActorSnapshot,
+  type StoredCollaborationProject,
+} from "./types";
 
 const PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
@@ -18,24 +23,65 @@ function projectPath(projectId: string): string {
   return path.join(dataDirectory(), `${projectId}.json`);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function corrupt(message: string): never {
+  throw new CollaborationError("CORRUPT_PROJECT", message, 500);
+}
+
+function cleanActorSnapshot(value: unknown, label: string): ActorSnapshot {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.name !== "string") {
+    return corrupt(`${label} is not a valid actor snapshot.`);
+  }
+  return { id: value.id, name: value.name };
+}
+
+/**
+ * Reads both store versions, returning only the v2 in-memory contract. The
+ * caller decides whether a normal mutation should persist that migrated copy.
+ */
 function validateStoredProject(value: unknown, expectedId?: string): StoredCollaborationProject {
-  if (!value || typeof value !== "object") {
+  if (!isRecord(value)) {
     throw new CollaborationError("CORRUPT_PROJECT", "Stored project is not a JSON object.", 500);
   }
-  const project = value as StoredCollaborationProject;
+  const schema = value.schema;
   if (
-    project.schema !== COLLABORATION_SCHEMA ||
-    typeof project.id !== "string" ||
-    (expectedId && project.id !== expectedId) ||
-    !Number.isSafeInteger(project.revision) ||
-    !Number.isSafeInteger(project.activitySequence) ||
-    !project.members || typeof project.members !== "object" ||
-    !Array.isArray(project.comments) ||
-    !Array.isArray(project.history)
+    (schema !== COLLABORATION_SCHEMA && schema !== LEGACY_COLLABORATION_SCHEMA) ||
+    typeof value.id !== "string" ||
+    (expectedId && value.id !== expectedId) ||
+    typeof value.name !== "string" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string" ||
+    !Number.isSafeInteger(value.revision) ||
+    !Number.isSafeInteger(value.activitySequence) ||
+    !Array.isArray(value.comments) ||
+    !Array.isArray(value.history)
   ) {
     throw new CollaborationError("CORRUPT_PROJECT", "Stored collaboration project has an invalid shape.", 500);
   }
-  return project;
+
+  const project = structuredClone(value);
+  project.schema = COLLABORATION_SCHEMA;
+  delete project.ownerId;
+  delete project.members;
+  project.comments = (project.comments as unknown[]).map((entry, index) => {
+    if (!isRecord(entry)) return corrupt(`comments[${index}] is not an object.`);
+    const comment = structuredClone(entry);
+    comment.author = cleanActorSnapshot(comment.author, `comments[${index}].author`);
+    if (comment.resolvedBy !== undefined) {
+      comment.resolvedBy = cleanActorSnapshot(comment.resolvedBy, `comments[${index}].resolvedBy`);
+    }
+    return comment;
+  });
+  project.history = (project.history as unknown[]).map((entry, index) => {
+    if (!isRecord(entry)) return corrupt(`history[${index}] is not an object.`);
+    const action = structuredClone(entry);
+    action.actor = cleanActorSnapshot(action.actor, `history[${index}].actor`);
+    return action;
+  });
+  return project as unknown as StoredCollaborationProject;
 }
 
 class KeyedLock {
@@ -96,14 +142,14 @@ export class CollaborationProjectStore {
   }
 
   async create(project: StoredCollaborationProject): Promise<void> {
-    return this.lock.run(project.id, async () => {
-      validateStoredProject(project, project.id);
+    const normalized = validateStoredProject(project, project.id);
+    return this.lock.run(normalized.id, async () => {
       await mkdir(dataDirectory(), { recursive: true });
-      const target = projectPath(project.id);
+      const target = projectPath(normalized.id);
       const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
       const handle = await open(temporary, "wx", 0o600);
       try {
-        await handle.writeFile(`${JSON.stringify(project, null, 2)}\n`, "utf8");
+        await handle.writeFile(`${JSON.stringify(normalized, null, 2)}\n`, "utf8");
         await handle.sync();
         await handle.close();
         await link(temporary, target);
@@ -132,13 +178,13 @@ export class CollaborationProjectStore {
   }
 
   private async writeAtomic(project: StoredCollaborationProject): Promise<void> {
-    validateStoredProject(project, project.id);
+    const normalized = validateStoredProject(project, project.id);
     await mkdir(dataDirectory(), { recursive: true });
-    const target = projectPath(project.id);
+    const target = projectPath(normalized.id);
     const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
     const handle = await open(temporary, "wx", 0o600);
     try {
-      await handle.writeFile(`${JSON.stringify(project, null, 2)}\n`, "utf8");
+      await handle.writeFile(`${JSON.stringify(normalized, null, 2)}\n`, "utf8");
       await handle.sync();
     } finally {
       await handle.close();

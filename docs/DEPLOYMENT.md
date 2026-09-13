@@ -1,13 +1,16 @@
 # Deploying AH2D Studio
 
-این راهنما برای پوستهٔ Next.js، Auth و Collaboration است. `AH2DEdtior.html` به‌تنهایی همچنان یک Editor محلی است، اما Login، پروژه‌های server-managed، comment، history و presence فقط از طریق Studio اجرا می‌شوند.
+این راهنما برای پوستهٔ Next.js و سرویس Collaboration است. Studio در حالت **no-auth/open local-trusted** اجرا می‌شود: هر client شبکه‌ای که به آن برسد می‌تواند همهٔ پروژه‌ها و mutationها را اجرا کند. آن را اینترنتی یا روی شبکهٔ غیرقابل‌اعتماد منتشر نکنید مگر اینکه محدودسازی شبکه یا reverse proxy مستقل جلوی آن قرار گرفته باشد.
 
 ## نیازمندی‌ها
 
 - Node.js `20.9` یا جدیدتر
-- npm و dependencyهای قفل‌شده در `package-lock.json`
-- HTTPS برای Production، چون session cookie در Production همیشه `Secure` است
+- dependencyهای lockشده با npm
 - یک volume محلی پایدار و قابل‌نوشتن برای deployment تک-process فعلی
+- محدودسازی دسترسی شبکه به hostهای مورداعتماد
+- HTTPS در صورت عبور traffic از شبکه
+
+HTTPS محتوا را در مسیر محافظت می‌کند، اما عمومی‌بودن API را تغییر نمی‌دهد.
 
 ## Development
 
@@ -17,37 +20,25 @@ npm install
 npm run dev
 ```
 
-پیش از Login مقدارهای زیر را در `.env.local` عوض کنید:
+تنظیمات محلی نمونه:
 
 ```dotenv
-AH2D_AUTH_SECRET=a-random-secret-with-at-least-32-bytes
-AH2D_BOOTSTRAP_OWNER_EMAIL=owner@example.com
-AH2D_BOOTSTRAP_OWNER_PASSWORD=replace-with-a-long-unique-password
-AH2D_BOOTSTRAP_OWNER_NAME=Studio Owner
-AH2D_AUTH_STORE_PATH=.ah2d-data/auth-store.json
 AH2D_COLLAB_DATA_DIR=.ah2d-data/collaboration
-AH2D_AUTH_SECURE_COOKIE=false
 AH2D_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 ```
 
-یک secret تصادفی مناسب را می‌توان با Node ساخت:
-
-```powershell
-node -e "console.log(require('node:crypto').randomBytes(48).toString('base64url'))"
-```
-
-خروجی را فقط در secret store یا `.env.local` قرار دهید و commit نکنید.
-
-فایل `.env.example` دقیقاً هشت متغیر نمونهٔ بالا را دارد. تنظیمات اختیاری که فقط در صورت نیاز اضافه می‌شوند:
+تنظیمات اختیاری:
 
 | متغیر | پیش‌فرض | کاربرد |
 | --- | ---: | --- |
-| `AH2D_AUTH_SESSION_TTL_SECONDS` | 604800 | عمر session، clampشده بین ۵ دقیقه و ۳۰ روز |
-| `AH2D_AUTH_SECRET_PATH` | کنار auth store | محل fallback secret فقط در Development |
 | `AH2D_MAX_PROJECT_BYTES` | 16777216 | سقف Universal document ذخیره‌شده |
-| `AH2D_MAX_API_BODY_BYTES` | 18874368 | سقف body ورودی collaboration API پیش از parse |
+| `AH2D_MAX_API_BODY_BYTES` | 18874368 | سقف body ورودی پیش از parse |
 
-## Build و اجرای Production
+`AH2D_ALLOWED_ORIGINS` فقط originهای اضافهٔ مجاز برای mutation مرورگر را مشخص می‌کند. این allowlist هویت client را ثابت نمی‌کند و request مستقیم بدون `Origin` را مسدود نمی‌کند.
+
+Studio را در `http://localhost:3000` باز کنید؛ صفحهٔ Projects مستقیماً نمایش داده می‌شود.
+
+## Build و اجرای production
 
 ```powershell
 npm ci
@@ -57,32 +48,40 @@ npm run build
 npm run start
 ```
 
-`npm run start` به‌صورت پیش‌فرض روی port 3000 گوش می‌دهد. متغیرهای محیطی production را از platform/secret manager تزریق کنید، نه از فایل commit‌شده.
-
-حداقل تنظیم Production:
+حداقل تنظیم برای container تک-process:
 
 ```dotenv
 NODE_ENV=production
-AH2D_AUTH_SECRET=<at-least-32-random-bytes>
-AH2D_AUTH_STORE_PATH=/var/lib/ah2d/auth-store.json
-AH2D_COLLAB_DATA_DIR=/var/lib/ah2d/projects
-AH2D_ALLOWED_ORIGINS=https://studio.example.com
+AH2D_COLLAB_DATA_DIR=/var/lib/ah2d/collaboration
+AH2D_ALLOWED_ORIGINS=https://studio.internal.example
 ```
 
-در Production `AH2D_AUTH_SECRET` اجباری است. fallback secret فایل فقط در Development ساخته می‌شود. `AH2D_AUTH_SECURE_COOKIE` لازم نیست، چون `NODE_ENV=production` آن را خودکار امن می‌کند.
+متغیرهای environment را خارج repository نگه دارید. فایل `Dockerfile` سرویس را با user غیر-root و volume برابر `/var/lib/ah2d` اجرا می‌کند.
+
+نمونهٔ اجرا:
+
+```bash
+docker build -t ah2d-studio:latest .
+docker volume create ah2d-data
+docker run -d --name ah2d-studio --restart unless-stopped \
+  -p 127.0.0.1:3000:3000 \
+  --env-file .env.production \
+  -v ah2d-data:/var/lib/ah2d \
+  ah2d-studio:latest
+```
+
+bind کردن port به `127.0.0.1` مانع exposure مستقیم روی interfaceهای دیگر می‌شود. برای دسترسی تیمی، ورودی را از یک reverse proxy محدودشده، VPN یا شبکهٔ خصوصی عبور دهید. صرف تنظیم `AH2D_ALLOWED_ORIGINS` برای حفاظت از API کافی نیست.
 
 ## Reverse proxy و SSE
 
-Proxy باید HTTPS را terminate کند، requestهای طولانی `/api/projects/*/events` را باز نگه دارد و buffering را برای `text/event-stream` غیرفعال کند. Route پاسخ `X-Accel-Buffering: no` می‌دهد، اما تنظیم proxy نیز باید با آن سازگار باشد.
-
-موارد لازم:
+Proxy باید requestهای طولانی `/api/projects/*/events` را باز نگه دارد و buffering را برای `text/event-stream` غیرفعال کند. Route پاسخ `X-Accel-Buffering: no` می‌دهد، اما تنظیم proxy نیز باید سازگار باشد.
 
 - idle timeout بیشتر از heartbeat پانزده‌ثانیه‌ای؛ پیشنهاد حداقل ۶۰ ثانیه
-- عدم cache و عدم compression/buffering اجباری روی SSE
-- عبور cookie و `Last-Event-ID`
-- تنظیم صحیح `X-Forwarded-For` یا `X-Real-IP` برای rate limit
+- عدم cache و buffering اجباری روی SSE
+- عبور `Last-Event-ID` و query string کامل
+- محدودسازی source network یا کنترل دسترسی مستقل در لبه
 - origin عمومی دقیق داخل `AH2D_ALLOWED_ORIGINS`
-- redirect دائمی HTTP به HTTPS
+- HTTPS و redirect دائمی HTTP به HTTPS در صورت استفاده از شبکه
 
 نمونهٔ مفهومی Nginx:
 
@@ -92,59 +91,58 @@ location /api/projects/ {
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_buffering off;
     proxy_read_timeout 1h;
 }
 ```
 
-این فقط fragment مفهومی است؛ TLS، headerهای امنیتی، upload limits و policyهای سازمان خود را جداگانه تنظیم کنید.
+این fragment هیچ access policy تعریف نمی‌کند؛ ACL شبکه یا policy لبه را جداگانه اضافه کنید.
 
-## Data و backup در حالت فعلی
+## Actor label و ریسک exposure
 
-مسیرهای پیش‌فرض:
+headerهای `x-ah2d-actor-id` و `x-ah2d-actor-name` و queryهای `actorId`/`actorName` در SSE فقط label نمایشی هستند. fallback برابر `Local User` است. این مقادیر قابل‌جعل‌اند و نباید برای مجوز، audit معتبر یا تفکیک tenant استفاده شوند.
+
+در نتیجه client قابل‌دسترسی می‌تواند:
+
+- همهٔ پروژه‌ها را فهرست و محتوای کامل آن‌ها را دریافت کند؛
+- پروژه بسازد یا نام و document هر پروژه را تغییر دهد؛
+- هر comment را ایجاد، ویرایش، resolve یا حذف کند؛
+- history، SSE و presence را بخواند یا attribution دلخواه بفرستد.
+
+Same-Origin check فقط mutation مرورگر دارای `Origin` نامعتبر را رد می‌کند. ابزار CLI، script یا client شبکه‌ای می‌تواند request بدون `Origin` بفرستد.
+
+## Data، schema و backup
+
+مسیر پیش‌فرض:
 
 ```text
 .ah2d-data/
-├── auth-store.json
-├── auth-secret                 development fallback only
 └── collaboration/
     └── project-<uuid>.json
 ```
 
-فایل‌ها شامل Email، hash Password، session hash، membership، comment، action history و کل Universal Project هستند. دسترسی filesystem را فقط به process سرویس محدود کنید.
+رکورد جاری `ah2d.collaboration/project-v2` شامل metadata پروژه، Universal document، commentها و Action History است و دادهٔ membership ندارد. فایل‌های v1 هنگام read پذیرفته و در اولین write عادی همان پروژه به v2 بدون membership فعال ذخیره می‌شوند؛ read تنها migration را روی disk commit نمی‌کند.
 
 برای backup سازگار:
 
 1. write traffic را متوقف کنید یا snapshot اتمیک volume بگیرید.
-2. هر دو auth store و پوشهٔ collaboration را باهم backup کنید.
-3. secret امضای session را در secret manager جداگانه نگه دارید.
-4. restore را در محیط ایزوله آزمایش کنید.
-5. پس از افشای احتمالی secret، secret را rotate و sessionهای موجود را revoke کنید.
+2. کل پوشهٔ collaboration را backup کنید.
+3. restore را در محیط ایزوله آزمایش کنید.
+4. سطح دسترسی filesystem و backup را فقط به operatorهای لازم محدود کنید.
 
-فایل‌های پروژه با temporary file و rename اتمیک نوشته می‌شوند، اما کپی معمولی هم‌زمان با write تضمین snapshot چندفایلی نمی‌دهد.
+فایل پروژه با temporary file و rename اتمیک نوشته می‌شود، اما copy معمولی هم‌زمان با write تضمین snapshot چندفایلی نمی‌دهد. `.ah2d-data/collaboration/*.json` را دستی تغییر ندهید.
 
 ## محدودیت مهم: فقط یک process
 
-storage و realtime فعلی adapter تولیدی چند-instance نیست:
+storage و realtime فعلی adapter چند-instance نیست:
 
 - lock مربوط به mutation فقط in-process است.
-- Auth در یک فایل مشترک با queue داخل process نوشته می‌شود.
 - Projectها فایل JSON هستند و compare-and-swap دیتابیسی ندارند.
 - SSE listener، replay buffer و presence در RAM قرار دارند.
-- Login failure counters در RAM قرار دارند.
 
-بنابراین اجرای چند worker، چند container، cluster Node، serverless function یا autoscaling امن نیست. حتی با volume مشترک، lock و event hub میان processها مشترک نمی‌شود. تا زمان جایگزینی adapterها یک instance و یک process اجرا کنید.
+بنابراین چند worker، چند container، cluster Node، serverless function یا autoscaling امن نیست. حتی با volume مشترک، lock و event hub میان processها مشترک نمی‌شود. تا زمان جایگزینی adapterها یک instance و یک process اجرا کنید.
 
-## مسیر Production چند-instance
-
-### Auth
-
-- User/session را به PostgreSQL یا provider مبتنی بر OIDC/OAuth منتقل کنید.
-- password policy، reset، Email verification، MFA و disable/revoke مدیریت‌شده اضافه کنید.
-- session hash را index و expiry/revocation را transactionally enforce کنید.
-- rate limit را در Redis یا gateway اجرا کنید.
-- HMAC secret را در KMS/secret manager نگه دارید و rotation versioned بسازید.
+## مسیر چند-instance
 
 ### Project document و optimistic concurrency
 
@@ -152,50 +150,34 @@ storage و realtime فعلی adapter تولیدی چند-instance نیست:
 - write را با شرط `WHERE revision = expectedRevision` انجام دهید.
 - document، revision و Action را در یک transaction بنویسید.
 - در صورت update count صفر، `409 REVISION_CONFLICT` با revision واقعی برگردانید.
-- `clientMutationId + actorId` را unique/index کنید تا idempotency به retention تاریخچه وابسته نباشد.
+- `clientMutationId + actorLabel` را فقط برای deduplication در نظر بگیرید؛ actor label هویت معتبر نیست.
 
 ### Realtime و presence
 
 - Action منتشرشده را از transactional outbox به Redis Streams، NATS، Kafka یا سرویس realtime بفرستید.
-- Presence را ephemeral و TTLدار ذخیره کنید؛ disconnect ناگهانی نباید User را برای همیشه online نگه دارد.
+- Presence را ephemeral و TTLدار ذخیره کنید.
 - resume cursor را durable کنید یا client را ملزم به reconciliation با document revision و activity sequence نگه دارید.
-- event authorization را در زمان اتصال و در صورت تغییر membership دوباره بررسی کنید.
 
 ### Asset storage
 
-Universal JSON فعلی می‌تواند Data URL داشته باشد. در مقیاس واقعی:
+Universal JSON می‌تواند Data URL داشته باشد. در مقیاس واقعی binary را در object storage قرار دهید و داخل document فقط asset ID، content hash، MIME type، dimensions و URL منطقی نگه دارید. upload size، MIME sniffing، image decoding و malware policy را enforce کنید.
 
-- binary را در object storage با signed upload/download بگذارید.
-- داخل document فقط asset ID، content hash، MIME type، dimensions و URL منطقی نگه دارید.
-- upload size، MIME sniffing، image decoding و malware policy را enforce کنید.
-- referential cleanup را asynchronous و recoverable طراحی کنید.
+### Audit
 
-### Audit و compliance
+Action History داخلی فقط ۲۰۰۰ Action آخر را نگه می‌دارد و actor label آن قابل‌جعل است. برای audit رسمی از store append-only جدا، timestamp معتبر، correlation ID، tamper evidence، retention policy و هویت تأییدشده در یک لایهٔ مستقل استفاده کنید.
 
-Action History داخلی برای UX است و فقط ۲۰۰۰ Action آخر را نگه می‌دارد. برای audit رسمی:
+## چک‌لیست ایمنی
 
-- append-only store جدا با retention policy
-- timestamp معتبر، request/correlation ID و source IP policy
-- tamper evidence یا immutable storage
-- redaction و access control برای metadata شخصی
-- export/retention مطابق مقررات محیط استقرار
-
-## Security checklist
-
-- `AH2D_AUTH_SECRET` حداقل ۳۲ بایت تصادفی و خارج repository است.
-- bootstrap Password منحصر‌به‌فرد است و پس از provisioning در deployment config رها نمی‌شود.
-- HTTPS اجباری و cookie `Secure`, `HttpOnly`, `SameSite=Strict` است.
-- `AH2D_ALLOWED_ORIGINS` wildcard ندارد و فقط originهای واقعی را شامل می‌شود.
-- Routeهای mutation هم server-side auth و هم permission پروژه را بررسی می‌کنند.
-- دسترسی مؤثر از تقاطع role حساب و role پروژه محاسبه می‌شود و Member role از سقف حساب مقصد بالاتر نمی‌رود.
-- `/api/editor/frame` و `/api/editor/engine` Auth می‌خواهند؛ iframe بدون `allow-same-origin` sandbox شده و CSP محدود آن حفظ شده است.
-- handler پیام‌های Frame علاوه بر marker، `event.source` و origin مبهم موردانتظار را کنترل می‌کند.
-- reverse proxy headerهای IP را فقط از proxy مورداعتماد می‌پذیرد.
-- `.ah2d-data` public/static serve نمی‌شود.
-- backupها رمزگذاری و restore آن‌ها تست شده است.
-- logs شامل cookie، Password، project document کامل یا secret نیستند.
+- Studio فقط روی loopback یا شبکهٔ خصوصی مورداعتماد reachable است.
+- exposure تیمی پشت VPN، ACL یا reverse proxy دارای access policy مستقل قرار دارد.
+- `AH2D_ALLOWED_ORIGINS` wildcard ندارد و فقط originهای لازم را شامل می‌شود.
+- actor header/query فقط attribution نمایشی تلقی می‌شود.
+- mutationها optimistic revision و Same-Origin check مرورگر را حفظ می‌کنند.
+- `/api/editor/frame` عمومی است، اما iframe بدون `allow-same-origin`، CSP محدود و validation کامل `postMessage` را حفظ می‌کند.
+- `.ah2d-data` از public/static serve نمی‌شود و backupها محافظت می‌شوند.
+- logها شامل project document کامل یا metadata حساس عملیاتی نیستند.
 - dependency، test، typecheck و build در CI اجرا می‌شوند.
-- برای deployment چند-instance ابتدا adapterهای file/in-memory جایگزین شده‌اند.
+- برای چند instance ابتدا adapterهای file/in-memory جایگزین شده‌اند.
 
 ## Health verification
 
@@ -206,15 +188,15 @@ npm run check
 npm test
 ```
 
-سپس از طریق browser این مسیر را تست کنید:
+سپس این مسیر را آزمایش کنید:
 
-1. Login با Owner bootstrap.
+1. بازشدن مستقیم `/projects` بدون setup کاربر.
 2. ساخت Project و بازشدن Workspace.
 3. بازکردن همان Project در tab دوم و مشاهدهٔ presence.
 4. تغییر سند و افزایش revision در هر دو tab.
-5. ایجاد و resolve یک comment.
-6. دیدن Actor و Action در History.
-7. اضافه‌کردن یک `viewer` و تأیید read-only بودن document.
-8. reconnect کردن SSE و reconciliation با آخرین revision.
+5. ایجاد، resolve و حذف comment.
+6. دیدن actor label و Action در History با این آگاهی که label قابل‌اعتماد نیست.
+7. reconnect کردن SSE و reconciliation با آخرین revision.
+8. ردشدن mutation مرورگر با `Origin` غیرمجاز.
 
 قرارداد routeها و نمونه‌های client در [`COLLABORATION.md`](./COLLABORATION.md) قرار دارد.

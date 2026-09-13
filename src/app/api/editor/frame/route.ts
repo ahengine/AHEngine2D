@@ -1,6 +1,5 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { authErrorResponse, requireRequestAuth } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -195,38 +194,33 @@ const WORKSPACE_BRIDGE = String.raw`
 })();
 </script>`;
 
-export async function GET(request: Request) {
-  try {
-    await requireRequestAuth(request);
-    const [editorSource, pixiSource, dataModelSource, engineSource] = await Promise.all([
-      readFile(path.join(process.cwd(), "AH2DEdtior.html"), "utf8"),
-      readFile(path.join(process.cwd(), "node_modules", "pixi.js", "dist", "pixi.min.js"), "utf8"),
-      readFile(path.join(process.cwd(), "engine", "AH2DDataModel.js"), "utf8"),
-      readFile(path.join(process.cwd(), "engine", "AH2DEngine.js"), "utf8"),
-    ]);
-    let html = editorSource
-      .replace(
-        '<script src="./node_modules/pixi.js/dist/pixi.min.js"></script>',
-        () => `<script>${pixiSource.replace(/<\/script/gi, "<\\/script")}</script>`,
-      )
-      .replace('<script src="./engine/AH2DDataModel.js"></script>', "")
-      .replace(
-        '<script src="./engine/AH2DEngine.js"></script>',
-        () => `<script>${dataModelSource.replace(/<\/script/gi, "<\\/script")}</script>\n` +
-          `<script>${engineSource.replace(/<\/script/gi, "<\\/script")}</script>`,
-      );
-    html = html.replace("</body>", `${WORKSPACE_BRIDGE}\n</body>`);
+export async function GET() {
+  const [editorSource, pixiSource, dataModelSource, engineSource] = await Promise.all([
+    readFile(path.join(process.cwd(), "AH2DEdtior.html"), "utf8"),
+    readFile(path.join(process.cwd(), "node_modules", "pixi.js", "dist", "pixi.min.js"), "utf8"),
+    readFile(path.join(process.cwd(), "engine", "AH2DDataModel.js"), "utf8"),
+    readFile(path.join(process.cwd(), "engine", "AH2DEngine.js"), "utf8"),
+  ]);
+  let html = editorSource
+    .replace(
+      '<script src="./node_modules/pixi.js/dist/pixi.min.js"></script>',
+      () => `<script>${pixiSource.replace(/<\/script/gi, "<\\/script")}</script>`,
+    )
+    .replace('<script src="./engine/AH2DDataModel.js"></script>', "")
+    .replace(
+      '<script src="./engine/AH2DEngine.js"></script>',
+      () => `<script>${dataModelSource.replace(/<\/script/gi, "<\\/script")}</script>\n` +
+        `<script>${engineSource.replace(/<\/script/gi, "<\\/script")}</script>`,
+    );
+  html = html.replace("</body>", `${WORKSPACE_BRIDGE}\n</body>`);
 
-    return new Response(html, {
-      headers: {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store",
-        "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
-        "Referrer-Policy": "no-referrer",
-        "X-Content-Type-Options": "nosniff",
-      },
-    });
-  } catch (error) {
-    return authErrorResponse(error);
-  }
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
 }

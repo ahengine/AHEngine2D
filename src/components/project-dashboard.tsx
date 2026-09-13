@@ -3,8 +3,8 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { FormEvent, useEffect, useState } from "react";
+import { withLocalActorHeaders } from "@/lib/collaboration/local-actor";
 import type { ProjectSummary } from "@/lib/collaboration/types";
-import type { CurrentUser } from "@/lib/auth/server";
 
 type ApiEnvelope<T> = {
   ok: boolean;
@@ -13,7 +13,11 @@ type ApiEnvelope<T> = {
 };
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, { cache: "no-store", ...init });
+  const response = await fetch(url, {
+    cache: "no-store",
+    ...init,
+    headers: withLocalActorHeaders(init?.headers),
+  });
   const payload = await response.json().catch(() => null) as ApiEnvelope<T> | null;
   if (!response.ok || !payload?.ok || payload.data === undefined) {
     throw new Error(payload?.error?.message || `Request failed (${response.status}).`);
@@ -41,14 +45,13 @@ function ProjectGlyph() {
   );
 }
 
-export function ProjectDashboard({ user }: Readonly<{ user: CurrentUser }>) {
+export function ProjectDashboard() {
   const router = useRouter();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [error, setError] = useState("");
-  const canCreateProject = user.role === "OWNER" || user.role === "ADMIN" || user.role === "EDITOR";
 
   useEffect(() => {
     let active = true;
@@ -79,12 +82,6 @@ export function ProjectDashboard({ user }: Readonly<{ user: CurrentUser }>) {
     }
   }
 
-  async function logout() {
-    await fetch("/api/auth/logout", { method: "POST" }).catch(() => null);
-    router.replace("/login");
-    router.refresh();
-  }
-
   return (
     <main className="projects-page">
       <div className="dashboard-glow dashboard-glow-a" />
@@ -95,12 +92,7 @@ export function ProjectDashboard({ user }: Readonly<{ user: CurrentUser }>) {
           <strong>AH2D</strong>
           <span>Studio</span>
         </Link>
-        <div className="account-cluster">
-          <span className="global-role">{user.role}</span>
-          <span className="avatar" aria-hidden="true">{user.displayName.slice(0, 1).toUpperCase()}</span>
-          <span className="account-copy"><strong>{user.displayName}</strong><small>{user.email}</small></span>
-          <button className="ghost-button compact-button" type="button" onClick={logout}>Sign out</button>
-        </div>
+        <span className="local-mode-badge">Local Studio</span>
       </header>
 
       <section className="dashboard-content">
@@ -110,7 +102,7 @@ export function ProjectDashboard({ user }: Readonly<{ user: CurrentUser }>) {
             <h1>Projects</h1>
             <p>Build, review and collaborate on every AH2D world from one place.</p>
           </div>
-          <button className="primary-button create-project-button" type="button" disabled={!canCreateProject} onClick={() => setCreateOpen(true)} title={canCreateProject ? "Create project" : "Your account role cannot create projects"}>
+          <button className="primary-button create-project-button" type="button" onClick={() => setCreateOpen(true)} title="Create project">
             <span aria-hidden="true">＋</span> New project
           </button>
         </div>
@@ -127,14 +119,13 @@ export function ProjectDashboard({ user }: Readonly<{ user: CurrentUser }>) {
               <Link className="project-card" href={`/projects/${encodeURIComponent(project.id)}`} key={project.id}>
                 <div className="project-card-top">
                   <ProjectGlyph />
-                  <span className={`role-badge role-${project.role}`}>{project.role}</span>
+                  <span className="local-project-label">Local project</span>
                 </div>
                 <div className="project-card-copy">
                   <h2>{project.name}</h2>
                   <p>Updated {relativeDate(project.updatedAt)}</p>
                 </div>
                 <div className="project-card-meta">
-                  <span title="Project members">◉ {project.memberCount}</span>
                   <span title="Open comments">◌ {project.openCommentCount}</span>
                   <span>r{project.revision}</span>
                   <span className="open-project-arrow" aria-hidden="true">↗</span>
@@ -142,18 +133,12 @@ export function ProjectDashboard({ user }: Readonly<{ user: CurrentUser }>) {
               </Link>
             ))}
           </div>
-        ) : canCreateProject ? (
+        ) : (
           <button className="empty-projects glass-panel" type="button" onClick={() => setCreateOpen(true)}>
             <ProjectGlyph />
             <strong>Create your first world</strong>
             <span>Start with an empty Scene and the default editable post-process stack.</span>
           </button>
-        ) : (
-          <div className="empty-projects glass-panel">
-            <ProjectGlyph />
-            <strong>No shared projects yet</strong>
-            <span>Ask an Owner or Admin to add this account to a project.</span>
-          </div>
         )}
       </section>
 

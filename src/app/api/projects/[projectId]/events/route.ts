@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { authenticatedApi, type ProjectRouteContext } from "@/lib/collaboration/api";
+import { collaborationApi, type ProjectRouteContext } from "@/lib/collaboration/api";
 import { getCollaborationService } from "@/lib/collaboration/service";
 import type { CollaborationEvent } from "@/lib/collaboration/types";
-import { requireApiUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,10 +11,10 @@ function encodeEvent(event: CollaborationEvent): string {
 }
 
 export function GET(request: Request, context: ProjectRouteContext): Promise<Response> {
-  return authenticatedApi(request, async (actor) => {
+  return collaborationApi(request, async (actor) => {
     const { projectId } = await context.params;
     const service = getCollaborationService();
-    const project = await service.authorize(actor, projectId, "presence:read");
+    const project = await service.readProject(projectId);
     const requestedClientId = new URL(request.url).searchParams.get("clientId")?.trim();
     const clientId = requestedClientId && requestedClientId.length <= 160
       ? requestedClientId
@@ -48,33 +47,11 @@ export function GET(request: Request, context: ProjectRouteContext): Promise<Res
         };
         enqueue(`retry: 3000\n${encodeEvent(connected)}`);
         const unsubscribe = service.events.subscribe(projectId, (event) => {
-          const change = event.type === "member.changed" && event.data && typeof event.data === "object"
-            ? event.data as { mode?: string; userId?: string }
-            : null;
-          if (change?.mode === "remove" && change.userId === actor.id) {
-            cleanup();
-            return;
-          }
           enqueue(encodeEvent(event));
         }, lastEventId);
-        let checkingAccess = false;
-        const heartbeat = setInterval(async () => {
-          if (checkingAccess || !active) return;
-          checkingAccess = true;
-          try {
-            const current = await requireApiUser(request);
-            if (current.id !== actor.id) throw new Error("Session identity changed.");
-            await service.authorize(
-              { id: current.id, name: current.name, email: current.email, accountRole: current.role },
-              projectId,
-              "presence:read",
-            );
-            enqueue(`: heartbeat ${Date.now()}\n\n`);
-          } catch {
-            cleanup();
-          } finally {
-            checkingAccess = false;
-          }
+        const heartbeat = setInterval(() => {
+          if (!active) return;
+          enqueue(`: heartbeat ${Date.now()}\n\n`);
         }, 15_000);
         cleanup = () => {
           if (!active) return;

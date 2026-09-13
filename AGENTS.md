@@ -2,7 +2,7 @@
 
 Read [`Agent.md`](./Agent.md) before implementing game code, changing the serialized project contract, or extending a runtime adapter. It contains the full layer boundaries, gameplay patterns, physics rules, validation loop, and completion checklist.
 
-For Next.js Auth, project RBAC, document revisions, comments, history, SSE, or presence, also read [`docs/COLLABORATION.md`](./docs/COLLABORATION.md). Read [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) before changing storage, sessions, realtime transport, or deployment topology.
+For Next.js project APIs, document revisions, comments, history, SSE, presence, or the local-trusted actor labels, also read [`docs/COLLABORATION.md`](./docs/COLLABORATION.md). Read [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) before changing storage, realtime transport, network exposure, or deployment topology.
 
 Use the AH2D CLI for project JSON changes instead of rewriting project files by hand. It preserves unknown fields, validates Scene Graph invariants, synchronizes the active Scene mirror, and performs atomic writes.
 
@@ -37,11 +37,11 @@ Component values must be JSON-safe objects or arrays with safe PascalCase names.
 
 Do not edit `.ah2d-data/collaboration/*.json` directly. A Studio-managed project must be changed through `/api/projects/:projectId/document` with the latest numeric `expectedRevision` and an idempotent `clientMutationId`. The Studio revision is not the CLI SHA-256 precondition. On `REVISION_CONFLICT`, fetch, merge, and retry as a new mutation.
 
-Never expose the `ah2d_session` cookie, password/session hashes, or auth secret. Effective access is the intersection of the uppercase global account role and lowercase per-project membership role; a global Owner does not bypass project membership. Global EDITOR has `members:manage` but still needs project `owner/admin` and has no account `roles:manage`.
+Studio is deliberately no-auth/open local-trusted: every network client that can reach it can read and mutate every project. Treat `x-ah2d-actor-id`/`x-ah2d-actor-name` and SSE `actorId`/`actorName` only as untrusted attribution labels with `Local User` fallback; never use them for permission, ownership, moderation, or security audit. There are no member endpoints or People-management workflow.
 
-Resolve Member targets from the active auth store and enforce their account-role cap before assigning a project role. Never accept client-supplied name/Email as canonical membership identity, and never assign project `owner` through the Member API.
+Collaboration records use `ah2d.collaboration/project-v2` without membership data. Read legacy v1 records and persist the v2 form on the next normal write; do not edit the store manually. Preserve Same-Origin checks for browser mutations, but do not mistake them for network access control. Keep Studio on loopback or a trusted private network, or place an independent access policy in front of it.
 
-Keep the Editor frame Auth-gated and sandboxed without `allow-same-origin`. Preserve the restrictive CSP. For its opaque-origin `postMessage` bridge, validate the exact `event.source`, expected origin, and protocol marker; marker text by itself is not authentication.
+Keep the public Editor frame sandboxed without `allow-same-origin` and preserve the restrictive CSP. For its opaque-origin `postMessage` bridge, validate the exact `event.source`, expected origin, and protocol marker; marker text by itself is not trust.
 
 Top-level `postProcess` is project data. Preserve effect IDs, ordering, unknown effects, and custom parameters. The Engine exposes configuration through `engine.postProcess`; renderer hosts remain responsible for mapping active effects to their own filters or shaders.
 

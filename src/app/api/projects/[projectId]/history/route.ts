@@ -1,10 +1,10 @@
-import { apiSuccess, authenticatedApi, type ProjectRouteContext } from "@/lib/collaboration/api";
+import { apiSuccess, collaborationApi, type ProjectRouteContext } from "@/lib/collaboration/api";
 import { getCollaborationService } from "@/lib/collaboration/service";
 
 export const runtime = "nodejs";
 
 export function GET(request: Request, context: ProjectRouteContext): Promise<Response> {
-  return authenticatedApi(request, async (actor) => {
+  return collaborationApi(request, async (actor) => {
     const { projectId } = await context.params;
     const url = new URL(request.url);
     const after = Number(url.searchParams.get("after") ?? 0);

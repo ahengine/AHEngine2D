@@ -9,11 +9,11 @@ An Agent may work in four distinct layers:
 1. **Authoring data** — Universal AH2D Project JSON, scenes, entities, components, assets, prefabs, animations, and particles.
 2. **Reusable engine code** — framework-neutral behavior in `engine/AH2DEngine.js`.
 3. **Game code** — controllers, rules, UI, renderer mappings, content loading, and tests in the game project.
-4. **Studio services** — Next.js authentication, project membership, collaboration APIs, comments, history, presence, and the Editor bridge under `src/`.
+4. **Studio services** — the open local-trusted Next.js project APIs, comments, history, presence, and the Editor bridge under `src/`.
 
 Keep game-specific logic outside `AH2DEdtior.html`. Modify the Editor only when the requested feature is an authoring workflow. Modify the Engine only when the behavior is reusable across games and runtimes.
 
-Keep Studio identity and collaboration concerns outside the framework-neutral Engine. Authentication protects the hosted authoring service; a shipped game chooses its own identity provider and server architecture.
+Keep Studio attribution and collaboration concerns outside the framework-neutral Engine. The Studio does not protect a hosted authoring service: every network client that can reach it can mutate every project. A shipped game chooses its own identity and server architecture.
 
 ## Source-of-truth rules
 
@@ -111,27 +111,32 @@ All `apply` operations are evaluated on an in-memory clone and written only if t
 
 ## Collaborative Studio workflow
 
-Projects under `.ah2d-data/collaboration` are server-managed records, not ordinary game files. Do not edit those JSON files directly and do not run the CLI against them while the Studio is running. Use the authenticated project API so membership checks, optimistic revision, Action History, SSE events, and atomic persistence all remain consistent.
+Projects under `.ah2d-data/collaboration` are server-managed records, not ordinary game files. Do not edit those JSON files directly and do not run the CLI against them while the Studio is running. Use the Project API so optimistic revision, Action History, SSE events, schema migration, and atomic persistence all remain consistent.
 
 The minimum safe document mutation loop is:
 
-1. Fetch `GET /api/projects/:projectId/document` with the signed session cookie.
+1. Fetch `GET /api/projects/:projectId/document`; add optional actor-label headers if attribution is useful.
 2. Record `data.revision` and preserve the entire Universal document, including unknown fields.
 3. Compute a narrow JSON Patch or a complete replacement document.
 4. Send `expectedRevision` and a new stable `clientMutationId`.
 5. On `409 REVISION_CONFLICT`, fetch the latest document, merge deliberately, and submit a new mutation. Never blind-retry the stale payload.
 6. Reconcile from `document.changed` SSE events, but treat the persisted document and revision as the source of truth.
 
-Example JSON Patch request from a same-origin browser session:
+Example JSON Patch request from a same-origin browser client:
 
 ```js
+const actorHeaders = {
+  'x-ah2d-actor-id': 'local-agent',
+  'x-ah2d-actor-name': 'Local User'
+};
 const snapshot = await fetch(`/api/projects/${projectId}/document`, {
+  headers: actorHeaders,
   cache: 'no-store'
 }).then(response => response.json());
 
 const result = await fetch(`/api/projects/${projectId}/document`, {
   method: 'PATCH',
-  headers: { 'Content-Type': 'application/json' },
+  headers: { 'Content-Type': 'application/json', ...actorHeaders },
   body: JSON.stringify({
     expectedRevision: snapshot.data.revision,
     clientMutationId: crypto.randomUUID(),
@@ -148,25 +153,22 @@ if (!result.ok && result.error?.code === 'REVISION_CONFLICT') {
 
 Use `PUT document` only when the Editor owns a complete, freshly based snapshot. Use `PATCH document` for targeted agent changes. JSON Patch supports `add`, `remove`, `replace`, and `test`; it does not support `move` or `copy`.
 
-`clientMutationId` is idempotent per actor while its history entry is retained. Reuse the same ID only when retrying the exact same logical mutation after an uncertain network response.
+`clientMutationId` is idempotent per untrusted actor label while its history entry is retained. Reuse the same ID only when retrying the exact same logical mutation after an uncertain network response.
 
-### Authentication and authorization rules
+### Open local-trusted Studio rules
 
-- Never log, return, copy into prompts, or persist the `ah2d_session` cookie. It is an HttpOnly browser session, not an Agent API token.
-- Route handlers must authenticate server-side. Use the existing helpers from `src/lib/auth`; do not trust identity, role, or permission fields sent by a client.
-- Global account roles (`OWNER`, `ADMIN`, `EDITOR`, `COMMENTER`, `VIEWER`) and project roles (`owner`, `admin`, `editor`, `commenter`, `viewer`) are separate inputs to one effective check: a request needs permission from both layers.
-- A global Owner is not automatically a member of every project. Enforce project membership on every project resource.
-- Global `EDITOR` has `members:manage`; it may manage project membership only when its project role is `owner` or `admin`, and it still lacks global `roles:manage` for account provisioning.
-- Never rely on disabled UI controls for authorization. Service methods must call the project permission layer.
-- Mutating requests must retain same-origin enforcement. Add a documented CSRF design before allowing cross-origin clients.
-- Provision an account through `POST /api/auth/users`, then add its real User ID through the project members API. Member routes must resolve the active account server-side and ignore client-supplied identity snapshots.
-- Enforce the target account cap: OWNER/ADMIN accounts may receive `admin|editor|commenter|viewer`, EDITOR may receive `editor|commenter|viewer`, COMMENTER may receive `commenter|viewer`, and VIEWER may receive only `viewer`. Project `owner` is never assigned through the Member API.
-- Do not expose password hashes, session hashes, secrets, full project documents, or unnecessary personal data in Action metadata.
-- Keep `/api/editor/frame` and `/api/editor/engine` authentication-gated. The embedded Editor intentionally runs without `allow-same-origin` in an opaque-origin sandbox. Preserve its restrictive CSP and validate `postMessage` by `event.source`, allowed origin, and message marker; never trust marker text alone.
+- Studio has no user setup, role or project membership. All projects, comments, history, realtime routes and mutations are available to every network client that can reach the server.
+- Treat `x-ah2d-actor-id` and `x-ah2d-actor-name` as untrusted display labels only. For SSE, `actorId` and `actorName` query parameters serve the same purpose. Missing labels fall back to `Local User`.
+- Never use actor labels for permission, ownership, moderation or security audit. Any client can spoof another label. `clientMutationId` scoped by actor label is only a deduplication aid.
+- There are no account/member endpoints and no People-management workflow. Collaboration record v2 has no ownership or membership fields.
+- Preserve support for reading `ah2d.collaboration/project-v1`; the next normal write must persist v2 without active membership data. Do not rewrite the store manually just to migrate it.
+- Mutating browser requests must retain Same-Origin enforcement. This check does not protect the service from a direct client without an `Origin` header.
+- Keep the Studio bound to loopback or a trusted private network. If it must be exposed, require network isolation, VPN or a reverse proxy with an independent access policy.
+- `/api/editor/frame` and `/api/editor/engine` are public. The embedded Editor must still run without `allow-same-origin` in an opaque-origin sandbox. Preserve its restrictive CSP and validate `postMessage` by exact `event.source`, expected origin and message marker; never trust marker text alone.
 
 ### Realtime, comments, and history
 
-Open `/api/projects/:projectId/events?clientId=<unique-tab-id>` before sending presence. A presence POST must use the same `clientId`. SSE delivery and presence are ephemeral; after reconnect, compare `revision` and `activitySequence` and fetch durable state.
+Open `/api/projects/:projectId/events?clientId=<unique-tab-id>&actorId=<label>&actorName=<label>` before sending presence. A presence POST must use the same `clientId` and matching actor-label headers for correlation. That match is not a permission check. SSE delivery and presence are ephemeral; after reconnect, compare `revision` and `activitySequence` and fetch durable state.
 
 Anchor comments with stable IDs where possible:
 
@@ -185,7 +187,7 @@ Anchor comments with stable IDs where possible:
 
 Do not rewrite or delete Action History to conceal a mutation. The current history is a bounded product feature, not a compliance audit log. If a task requires immutable audit, implement a separate append-only production adapter and retention policy.
 
-The development collaboration store, event hub, presence, and login limiter are single-process implementations. Do not deploy multiple workers or serverless instances and claim realtime correctness. Follow `docs/DEPLOYMENT.md` before scaling.
+The development collaboration store, event hub, and presence are single-process implementations. Do not deploy multiple workers or serverless instances and claim realtime correctness. Follow `docs/DEPLOYMENT.md` before scaling or exposing the Studio beyond a trusted network.
 
 ## Post Process workflow
 
@@ -511,7 +513,7 @@ A game-development task is complete only when all applicable items are true:
 - Dry-run was reviewed before material project writes.
 - Final writes used `--expect-sha256` when working concurrently.
 - Studio document writes used the latest `expectedRevision` and an idempotent `clientMutationId`.
-- Authentication and both RBAC layers are enforced on the server, not only in the UI.
+- Studio exposure matches the open local-trusted model, and actor labels are never treated as access control.
 - Durable document/history reconciliation is performed after SSE reconnect; presence is treated as ephemeral.
 - `npm run check` passes.
 - `npm test` passes.
@@ -524,6 +526,6 @@ A game-development task is complete only when all applicable items are true:
 - `README.md` — project output and game-programming guide.
 - `engine/README.md` — Engine architecture and physics summary.
 - `engine/CLI.md` — complete CLI reference.
-- `docs/COLLABORATION.md` — Auth, global/project RBAC, project APIs, SSE, comments, history, and presence.
-- `docs/DEPLOYMENT.md` — secure deployment, the single-process boundary, and production adapter guidance.
+- `docs/COLLABORATION.md` — public project APIs, actor attribution, schema migration, SSE, comments, history, and presence.
+- `docs/DEPLOYMENT.md` — network isolation, the single-process boundary, and production adapter guidance.
 - `AGENTS.md` — compact repository-level Agent instructions.

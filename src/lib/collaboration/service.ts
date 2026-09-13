@@ -1,17 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { hasPermission as hasAccountPermission } from "@/lib/auth";
-import type { Permission as AccountPermission } from "@/types/auth";
 import { CollaborationError, assertCollaboration } from "./errors";
 import { getCollaborationEventHub, type CollaborationEventHub } from "./event-hub";
 import { applyJsonPatch } from "./json-patch";
-import {
-  canManageMember,
-  hasPermission,
-  isProjectRole,
-  requirePermission,
-} from "./permissions";
 import {
   getCollaborationProjectStore,
   type CollaborationProjectStore,
@@ -20,15 +12,12 @@ import {
   COLLABORATION_SCHEMA,
   type ActorSnapshot,
   type CollaborationActor,
-  type CollaborationPermission,
   type CommentAnchor,
   type JsonPatchOperation,
   type MutationOptions,
   type ProjectAction,
   type ProjectActionType,
   type ProjectComment,
-  type ProjectMember,
-  type ProjectRole,
   type ProjectSummary,
   type StoredCollaborationProject,
 } from "./types";
@@ -51,45 +40,8 @@ const projectContract = createRequire(path.join(process.cwd(), "package.json"))(
   }>;
 };
 
-const ACCOUNT_PERMISSION_FOR_COLLABORATION: Record<CollaborationPermission, AccountPermission> = {
-  "project:read": "project:read",
-  "project:update": "project:edit",
-  "document:read": "project:read",
-  "document:write": "project:edit",
-  "comment:read": "project:read",
-  "comment:create": "project:comment",
-  "comment:moderate": "project:comment",
-  "history:read": "history:read",
-  "member:read": "members:read",
-  "member:manage": "members:manage",
-  "presence:read": "collaboration:read",
-  "presence:write": "collaboration:write",
-};
-
-function requireAccountPermission(actor: CollaborationActor, permission: AccountPermission): void {
-  // Direct Engine/CLI adapters may omit an account role. Every HTTP actor has
-  // one, and it is a hard upper bound over its project membership role.
-  if (actor.accountRole && !hasAccountPermission(actor.accountRole, permission)) {
-    throw new CollaborationError(
-      "ACCOUNT_PERMISSION_DENIED",
-      `Account role '${actor.accountRole}' does not grant '${permission}'.`,
-      403,
-      { accountRole: actor.accountRole, permission },
-    );
-  }
-}
-
-function requireEffectivePermission(
-  project: StoredCollaborationProject,
-  actor: CollaborationActor,
-  permission: CollaborationPermission,
-): ProjectMember {
-  requireAccountPermission(actor, ACCOUNT_PERMISSION_FOR_COLLABORATION[permission]);
-  return requirePermission(project, actor.id, permission);
-}
-
 function actorSnapshot(actor: CollaborationActor): ActorSnapshot {
-  return { id: actor.id, name: actor.name, email: actor.email ?? null };
+  return { id: actor.id, name: actor.name };
 }
 
 function requiredText(value: unknown, label: string, maximum: number): string {
@@ -249,27 +201,20 @@ function findMutationReplay(
   return prior;
 }
 
-function summary(project: StoredCollaborationProject, userId: string): ProjectSummary {
-  const member = project.members[userId];
+function summary(project: StoredCollaborationProject): ProjectSummary {
   return {
     id: project.id,
     name: project.name,
-    ownerId: project.ownerId,
-    role: member.role,
     revision: project.revision,
     activitySequence: project.activitySequence,
     createdAt: project.createdAt,
     updatedAt: project.updatedAt,
-    memberCount: Object.keys(project.members).length,
     openCommentCount: project.comments.filter((comment) => comment.status === "open").length,
   };
 }
 
-function publicProject(project: StoredCollaborationProject, userId: string) {
-  return {
-    ...summary(project, userId),
-    members: Object.values(project.members),
-  };
+function publicProject(project: StoredCollaborationProject) {
+  return summary(project);
 }
 
 function validateAnchor(value: unknown): CommentAnchor | undefined {
@@ -299,49 +244,36 @@ export class CollaborationService {
     actor: CollaborationActor,
     input: { name: unknown; document?: unknown },
   ): Promise<{ project: ReturnType<typeof publicProject>; action: ProjectAction }> {
-    requireAccountPermission(actor, "project:edit");
     const name = requiredText(input.name, "name", 120);
     const now = new Date().toISOString();
     const id = this.store.createId();
-    const owner: ProjectMember = {
-      userId: actor.id,
-      role: "owner",
-      name: actor.name,
-      email: actor.email ?? null,
-      joinedAt: now,
-      updatedAt: now,
-    };
     const project: StoredCollaborationProject = {
       schema: COLLABORATION_SCHEMA,
       id,
       name,
-      ownerId: actor.id,
       createdAt: now,
       updatedAt: now,
       revision: 1,
       activitySequence: 0,
       document: validateDocument(input.document ?? defaultDocument(name)),
-      members: { [actor.id]: owner },
       comments: [],
       history: [],
     };
     const action = appendAction(project, "project.created", actor, { name });
     await this.store.create(project);
     this.events.publish(project.id, "project.changed", { action }, { actor: action.actor, revision: project.revision });
-    return { project: publicProject(project, actor.id), action };
+    return { project: publicProject(project), action };
   }
 
-  async listProjects(actor: CollaborationActor): Promise<ProjectSummary[]> {
+  async listProjects(_actor?: CollaborationActor): Promise<ProjectSummary[]> {
     const projects = await this.store.list();
     return projects
-      .filter((project) => Boolean(project.members[actor.id]))
-      .map((project) => summary(project, actor.id))
+      .map((project) => summary(project))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  async getProject(actor: CollaborationActor, projectId: string) {
-    const project = await this.authorize(actor, projectId, "project:read");
-    return publicProject(project, actor.id);
+  async getProject(_actor: CollaborationActor, projectId: string) {
+    return publicProject(await this.store.read(projectId));
   }
 
   async updateProject(
@@ -352,7 +284,6 @@ export class CollaborationService {
     const name = requiredText(input.name, "name", 120);
     const clientMutationId = optionalMutationId(input.clientMutationId);
     const { project, result } = await this.store.mutate(projectId, (value) => {
-      requireEffectivePermission(value, actor, "project:update");
       const replay = findMutationReplay(value, actor, clientMutationId, "project.updated");
       if (replay) return { action: replay, replayed: true };
       const previousName = value.name;
@@ -368,11 +299,11 @@ export class CollaborationService {
         revision: project.revision,
       });
     }
-    return { project: publicProject(project, actor.id), ...result };
+    return { project: publicProject(project), ...result };
   }
 
-  async getDocument(actor: CollaborationActor, projectId: string) {
-    const project = await this.authorize(actor, projectId, "document:read");
+  async getDocument(_actor: CollaborationActor, projectId: string) {
+    const project = await this.store.read(projectId);
     return { document: structuredClone(project.document), revision: project.revision, updatedAt: project.updatedAt };
   }
 
@@ -384,7 +315,6 @@ export class CollaborationService {
     const document = validateDocument(input.document);
     const clientMutationId = optionalMutationId(input.clientMutationId);
     const { project, result } = await this.store.mutate(projectId, (value) => {
-      requireEffectivePermission(value, actor, "document:write");
       const replay = findMutationReplay(value, actor, clientMutationId, "document.replaced");
       if (replay) return { action: replay, replayed: true };
       assertRevision(input.expectedRevision, value.revision);
@@ -413,7 +343,6 @@ export class CollaborationService {
   ) {
     const clientMutationId = optionalMutationId(input.clientMutationId);
     const { project, result } = await this.store.mutate(projectId, (value) => {
-      requireEffectivePermission(value, actor, "document:write");
       const replay = findMutationReplay(value, actor, clientMutationId, "document.patched");
       if (replay) return { action: replay, replayed: true };
       assertRevision(input.expectedRevision, value.revision);
@@ -445,11 +374,11 @@ export class CollaborationService {
   }
 
   async listComments(
-    actor: CollaborationActor,
+    _actor: CollaborationActor,
     projectId: string,
     filters: { status?: string | null; sceneId?: string | null; entityId?: string | null } = {},
   ) {
-    const project = await this.authorize(actor, projectId, "comment:read");
+    const project = await this.store.read(projectId);
     return {
       comments: project.comments.filter((comment) =>
         (!filters.status || comment.status === filters.status) &&
@@ -470,7 +399,6 @@ export class CollaborationService {
     const parentId = input.parentId == null ? undefined : requiredText(input.parentId, "parentId", 160);
     const clientMutationId = optionalMutationId(input.clientMutationId);
     const { project, result } = await this.store.mutate(projectId, (value) => {
-      requireEffectivePermission(value, actor, "comment:create");
       const replay = findMutationReplay(value, actor, clientMutationId, "comment.created");
       if (replay) {
         const comment = value.comments.find((candidate) => candidate.id === replay.metadata?.commentId);
@@ -518,7 +446,6 @@ export class CollaborationService {
   ) {
     const clientMutationId = optionalMutationId(input.clientMutationId);
     const { project, result } = await this.store.mutate(projectId, (value) => {
-      const member = requireEffectivePermission(value, actor, "comment:create");
       const replay = findMutationReplay(value, actor, clientMutationId, "comment.updated");
       if (replay) {
         if (replay.metadata?.commentId !== commentId) {
@@ -536,8 +463,6 @@ export class CollaborationService {
       }
       const comment = value.comments.find((candidate) => candidate.id === commentId);
       if (!comment) throw new CollaborationError("COMMENT_NOT_FOUND", "Comment was not found.", 404);
-      const mayEdit = comment.author.id === actor.id || hasPermission(member.role, "comment:moderate");
-      if (!mayEdit) throw new CollaborationError("COMMENT_PERMISSION_DENIED", "You cannot edit this comment.", 403);
       if (input.body !== undefined) comment.body = requiredText(input.body, "body", 10_000);
       if (input.status !== undefined) {
         assertCollaboration(input.status === "open" || input.status === "resolved", "INVALID_COMMENT_STATUS", "Comment status must be 'open' or 'resolved'.");
@@ -571,12 +496,9 @@ export class CollaborationService {
 
   async deleteComment(actor: CollaborationActor, projectId: string, commentId: string) {
     const { project, result: action } = await this.store.mutate(projectId, (value) => {
-      const member = requireEffectivePermission(value, actor, "comment:create");
       const index = value.comments.findIndex((candidate) => candidate.id === commentId);
       if (index < 0) throw new CollaborationError("COMMENT_NOT_FOUND", "Comment was not found.", 404);
       const comment = value.comments[index];
-      const mayDelete = comment.author.id === actor.id || hasPermission(member.role, "comment:moderate");
-      if (!mayDelete) throw new CollaborationError("COMMENT_PERMISSION_DENIED", "You cannot delete this comment.", 403);
       value.comments.splice(index, 1);
       // Replies remain as historical discussion, but are detached from the removed parent.
       for (const reply of value.comments) if (reply.parentId === commentId) delete reply.parentId;
@@ -592,8 +514,8 @@ export class CollaborationService {
     return { commentId, action };
   }
 
-  async listHistory(actor: CollaborationActor, projectId: string, after = 0, limit = 100) {
-    const project = await this.authorize(actor, projectId, "history:read");
+  async listHistory(_actor: CollaborationActor, projectId: string, after = 0, limit = 100) {
+    const project = await this.store.read(projectId);
     const safeLimit = Math.min(Math.max(Math.trunc(limit) || 100, 1), 500);
     const actions = after > 0
       ? project.history.filter((action) => action.sequence > after).slice(0, safeLimit)
@@ -601,93 +523,8 @@ export class CollaborationService {
     return { actions, activitySequence: project.activitySequence, revision: project.revision };
   }
 
-  async listMembers(actor: CollaborationActor, projectId: string) {
-    const project = await this.authorize(actor, projectId, "member:read");
-    return { members: Object.values(project.members), revision: project.revision };
-  }
-
-  async upsertMember(
-    actor: CollaborationActor,
-    projectId: string,
-    input: { userId: unknown; name: unknown; email?: unknown; role: unknown },
-  ) {
-    const userId = requiredText(input.userId, "userId", 160);
-    const name = requiredText(input.name, "name", 160);
-    const email = input.email == null ? null : requiredText(input.email, "email", 320);
-    assertCollaboration(isProjectRole(input.role), "INVALID_PROJECT_ROLE", "Invalid project role.");
-    assertCollaboration(input.role !== "owner", "OWNER_TRANSFER_REQUIRED", "Ownership cannot be assigned through member upsert.", 409);
-    const role = input.role;
-    const { project, result } = await this.store.mutate(projectId, (value) => {
-      const managingMember = requireEffectivePermission(value, actor, "member:manage");
-      const existing = value.members[userId];
-      if (existing?.role === "owner" || userId === value.ownerId) {
-        throw new CollaborationError(
-          "OWNER_ROLE_IMMUTABLE",
-          "The project owner cannot be demoted through member management.",
-          409,
-        );
-      }
-      if (!canManageMember(managingMember, existing, role)) {
-        throw new CollaborationError("MEMBER_MANAGEMENT_DENIED", "You cannot manage this member or role.", 403);
-      }
-      const now = new Date().toISOString();
-      const member: ProjectMember = existing
-        ? { ...existing, name, email, role, updatedAt: now }
-        : { userId, name, email, role, joinedAt: now, updatedAt: now, invitedBy: actor.id };
-      value.members[userId] = member;
-      const action = appendAction(value, existing ? "member.role_changed" : "member.added", actor, {
-        userId,
-        previousRole: existing?.role,
-        role,
-      });
-      return { member, action };
-    });
-    this.events.publish(projectId, "member.changed", { mode: "upsert", ...result }, {
-      actor: result.action.actor,
-      revision: project.revision,
-    });
-    return result;
-  }
-
-  async updateMemberRole(
-    actor: CollaborationActor,
-    projectId: string,
-    userId: string,
-    role: unknown,
-  ) {
-    const existingProject = await this.authorize(actor, projectId, "member:read");
-    const target = existingProject.members[userId];
-    if (!target) throw new CollaborationError("MEMBER_NOT_FOUND", "Project member was not found.", 404);
-    return this.upsertMember(actor, projectId, { ...target, role });
-  }
-
-  async removeMember(actor: CollaborationActor, projectId: string, userId: string) {
-    const { project, result: action } = await this.store.mutate(projectId, (value) => {
-      const managingMember = requireEffectivePermission(value, actor, "member:manage");
-      const target = value.members[userId];
-      if (!target) throw new CollaborationError("MEMBER_NOT_FOUND", "Project member was not found.", 404);
-      if (target.role === "owner") throw new CollaborationError("OWNER_REMOVAL_DENIED", "The project owner cannot be removed.", 409);
-      if (!canManageMember(managingMember, target)) {
-        throw new CollaborationError("MEMBER_MANAGEMENT_DENIED", "You cannot remove this member.", 403);
-      }
-      delete value.members[userId];
-      return appendAction(value, "member.removed", actor, { userId, role: target.role });
-    });
-    this.events.publish(projectId, "member.changed", { mode: "remove", userId, action }, {
-      actor: action.actor,
-      revision: project.revision,
-    });
-    return { userId, action };
-  }
-
-  async authorize(
-    actor: CollaborationActor,
-    projectId: string,
-    permission: CollaborationPermission,
-  ): Promise<StoredCollaborationProject> {
-    const project = await this.store.read(projectId);
-    requireEffectivePermission(project, actor, permission);
-    return project;
+  async readProject(projectId: string): Promise<StoredCollaborationProject> {
+    return this.store.read(projectId);
   }
 }
 

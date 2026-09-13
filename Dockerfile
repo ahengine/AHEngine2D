@@ -20,7 +20,6 @@ ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     HOSTNAME=0.0.0.0 \
     PORT=3000 \
-    AH2D_AUTH_STORE_PATH=/var/lib/ah2d/auth-store.json \
     AH2D_COLLAB_DATA_DIR=/var/lib/ah2d/collaboration
 
 RUN addgroup --system --gid 1001 nodejs \
@@ -31,8 +30,8 @@ RUN addgroup --system --gid 1001 nodejs \
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
-# These files are read dynamically by authenticated route handlers and by the
-# Universal Project validator, so they must remain beside standalone server.js.
+# These files are read dynamically by the Editor routes and Universal Project
+# validator, so they must remain beside standalone server.js.
 COPY --from=builder --chown=nextjs:nodejs /app/AH2DEdtior.html ./AH2DEdtior.html
 COPY --from=builder --chown=nextjs:nodejs /app/engine ./engine
 
@@ -42,6 +41,6 @@ VOLUME ["/var/lib/ah2d"]
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/login || exit 1
+  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/projects || exit 1
 
 CMD ["node", "server.js"]
