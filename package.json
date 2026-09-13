@@ -1,0 +1,37 @@
+{
+  "name": "ah2d-engine",
+  "version": "0.3.0",
+  "private": true,
+  "description": "AH2D universal 2D engine, editor and agent-friendly CLI",
+  "bin": {
+    "ah2d": "engine/cli/ah2d.js"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "ah2d": "node engine/cli/ah2d.js",
+    "test": "node engine/AH2DEngine.test.js && node engine/cli/AH2DCLI.test.js && tsx --test src/lib/auth/auth.test.ts src/lib/collaboration/collaboration.test.ts",
+    "test:engine": "node engine/AH2DEngine.test.js",
+    "test:cli": "node engine/cli/AH2DCLI.test.js",
+    "test:server": "tsx --test src/lib/auth/auth.test.ts src/lib/collaboration/collaboration.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "node --check engine/AH2DEngine.js && node --check engine/cli/AH2DProject.js && node --check engine/cli/ah2d.js && tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "16.3.5",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "tsx": "4.23.13",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=20.9"
+  },
+  "license": "MIT"
+}
