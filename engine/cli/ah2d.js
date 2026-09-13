@@ -17,7 +17,8 @@ const BOOLEAN_OPTIONS = new Set([
   'help', 'version', 'json', 'pretty', 'write', 'dry-run', 'print-document', 'force',
   'activate', 'keep-ids', 'deep', 'cascade', 'reparent', 'strict', 'warnings-as-errors',
   'allow-invalid', 'fix', 'check', 'commit', 'tree', 'engine', 'backup', 'mkdir',
-  'string', 'quiet', 'include-document', 'allow-future', 'include-stack', 'root'
+  'string', 'quiet', 'include-document', 'allow-future', 'include-stack', 'root',
+  'world', 'preserve-world', 'preserve-local'
 ]);
 const SHORT_OPTIONS = { f: 'file', o: 'out', j: 'json', h: 'help', w: 'write', n: 'dry-run' };
 
@@ -262,9 +263,17 @@ function capabilities() {
       precedence: 'components',
       types: componentSchemaTypes()
     },
+    sceneGraph: {
+      hierarchyStorage: 'parentId',
+      authoringTransformSpace: 'local',
+      derivedWorldMatrix: '[a,b,c,d,e,f]',
+      reparentDefault: 'preserve-local',
+      reparentModes: { preserveLocal: '--preserve-local', preserveWorld: '--preserve-world' },
+      treeOutput: { command: 'entity list --tree', includeWorld: '--world' }
+    },
     commands: {
       project: ['init', 'show', 'patch'], scene: ['list', 'get', 'create', 'clone', 'rename', 'select', 'delete', 'export', 'import'],
-      entity: ['list', 'get', 'create', 'clone', 'rename', 'set', 'patch', 'reparent', 'delete'],
+      entity: ['list', 'tree', 'get', 'create', 'clone', 'rename', 'set', 'patch', 'reparent', 'delete'],
       component: ['list', 'get', 'put', 'set', 'patch', 'delete'], resource: ['list', 'get', 'put', 'delete'],
       runtime: ['get', 'set'], physics: ['get', 'set'], schema: ['list', 'show'],
       topLevel: ['init', 'inspect', 'validate', 'format', 'migrate', 'query', 'patch', 'apply', 'simulate', 'ecs export', 'doctor', 'version', 'capabilities']
@@ -273,7 +282,8 @@ function capabilities() {
     selectors: {
       scene: { byId: ['--scene ID', '--scene-id ID'], byName: '--scene-name NAME' },
       entity: { byId: ['--entity ID', '--entity-id ID', 'positional ID'], byName: '--entity-name NAME' },
-      unparent: '--root'
+      unparent: '--root',
+      reparentTransform: { default: 'preserve-local', preserveLocal: '--preserve-local', preserveWorld: '--preserve-world' }
     },
     mutationSafety: { explicitWrite: ['--write', '--out', '--print-document', '--dry-run'], optimisticConcurrency: '--expect-sha256', atomicReplace: true, batchRollback: true, unknownFieldsPreserved: true },
     input: { project: ['--file PATH', '--file -'], jsonValue: ['JSON', '@file.json', '-'] },
@@ -286,7 +296,7 @@ function componentSchemaTypes() {
 }
 
 const schemas = {
-  project: { $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'AH2D Project', type: 'object', required: ['format', 'version', 'currentSceneId', 'scenes'], properties: { format: { const: 'AH2D' }, version: { type: 'integer', maximum: PROJECT_VERSION }, dataModel: { type: 'object', required: ['id', 'version', 'componentSchemaVersion'], properties: { id: { const: DATA_MODEL_DESCRIPTOR.id }, version: { const: DATA_MODEL_DESCRIPTOR.version }, componentSchemaVersion: { const: DATA_MODEL_DESCRIPTOR.componentSchemaVersion } }, additionalProperties: true }, currentSceneId: { type: 'string' }, scenes: { type: 'array', minItems: 1, items: { $ref: '#/$defs/scene' } } }, $defs: { scene: { type: 'object', required: ['id', 'name', 'objects'], properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string' }, objects: { type: 'array', items: { type: 'object', required: ['id'] } } } } } },
+  project: { $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'AH2D Project', type: 'object', required: ['format', 'version', 'currentSceneId', 'scenes'], properties: { format: { const: 'AH2D' }, version: { type: 'integer', maximum: PROJECT_VERSION }, dataModel: { type: 'object', required: ['id', 'version', 'componentSchemaVersion'], properties: { id: { const: DATA_MODEL_DESCRIPTOR.id }, version: { const: DATA_MODEL_DESCRIPTOR.version }, componentSchemaVersion: { const: DATA_MODEL_DESCRIPTOR.componentSchemaVersion } }, additionalProperties: true }, currentSceneId: { type: 'string' }, scenes: { type: 'array', minItems: 1, items: { $ref: '#/$defs/scene' } } }, $defs: { scene: { type: 'object', required: ['id', 'name', 'objects'], properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string' }, objects: { type: 'array', items: { $ref: '#/$defs/entity' } } }, additionalProperties: true }, entity: { type: 'object', required: ['id'], properties: { id: { type: 'string', minLength: 1 }, parentId: { type: ['string', 'null'], minLength: 1, description: 'Stable ID of the parent Entity in the same Scene; Transform is local to this parent.' }, x: { type: 'number', description: 'Local X position.' }, y: { type: 'number', description: 'Local Y position.' }, rot: { type: 'number', description: 'Local rotation in degrees.' }, rotation: { type: 'number', description: 'Local rotation in degrees.' }, sx: { type: 'number', description: 'Local X scale.' }, sy: { type: 'number', description: 'Local Y scale.' }, scaleX: { type: 'number', description: 'Local X scale.' }, scaleY: { type: 'number', description: 'Local Y scale.' }, components: { type: 'object' } }, additionalProperties: true } } },
   operation: { type: 'object', required: ['op'], properties: { op: { type: 'string', pattern: '^(scene|entity|component|resource|runtime|physics|project)\\.' } }, additionalProperties: true },
   batch: { type: 'array', minItems: 1, items: { $ref: '#/$defs/operation' }, $defs: { operation: { type: 'object', required: ['op'], properties: { op: { type: 'string' } } } } }
 };
@@ -324,7 +334,7 @@ Core:
 
 Domain commands:
   ah2d scene list|create|clone|rename|select|delete
-  ah2d entity list|get|create|clone|rename|set|patch|reparent|delete
+  ah2d entity list|tree|get|create|clone|rename|set|patch|reparent|delete
   ah2d component list|get|put|set|patch|delete
   ah2d resource list|get|put|delete
   ah2d runtime get|set
@@ -335,6 +345,9 @@ Domain commands:
 Mutations are safe by default and require --write, --out, --print-document, or --dry-run.
 Selectors use IDs. Use --scene-name or --entity-name for explicit name lookup.
 Use entity reparent <entity> --root to remove its parent.
+Reparent preserves local Transform by default; choose --preserve-world to keep the world matrix.
+Delete --reparent accepts the same preserve mode; transform flags otherwise require reparenting.
+Use entity list --tree --world for nested paths and derived local/world matrices.
 Default output is ${PROTOCOL} JSON; use --format text for human-readable output.`;
 
 function dispatch(parsed) {
@@ -402,7 +415,7 @@ function sceneCommand(context, positionals, options) {
 
 function entityCommand(context, positionals, options) {
   const action = (positionals.shift() || 'list').toLowerCase(), migrated = migrateDocument(context.document), document = migrated.document, selector = sceneSelector(options), scene = resolveScene(document, selector.sceneId || selector.scene, { allowName: Boolean(selector.sceneName) });
-  if (action === 'list') return { command: 'entity.list', data: { file: context.file, sceneId: scene.id, entities: listEntities(scene, { tree: options.tree, kind: options.kind, component: options.component }) } };
+  if (action === 'list' || action === 'tree') return { command: 'entity.list', data: { file: context.file, sceneId: scene.id, entities: listEntities(scene, { tree: action === 'tree' || options.tree, world: options.world, kind: options.kind, component: options.component }) } };
   if (action === 'create') {
     const data = options.data ? readValue(options.data, options) : {};
     const operation = { op: 'entity.create', ...selector, entity: isObjectValue(data), id: options.id, name: options.name || positionals.shift(), kind: options.kind, parentId: options.parent, x: options.x, y: options.y, width: options.width, height: options.height, rotation: options.rotation, scaleX: options['scale-x'], scaleY: options['scale-y'], layer: options.layer, color: options.color };
@@ -418,8 +431,24 @@ function entityCommand(context, positionals, options) {
     const source = requiredValue(options.patch ?? positionals.shift(), 'entity patch requires a JSON merge patch');
     operation = { op: 'entity.patch', ...selector, ...entitySelect, patch: readValue(source, options) };
   }
-  else if (action === 'reparent' || action === 'parent') operation = { op: 'entity.reparent', ...selector, ...entitySelect, parentId: options.root ? null : (options.parent ?? options['parent-id'] ?? positionals.shift()) };
-  else if (action === 'delete' || action === 'remove') operation = { op: 'entity.delete', ...selector, ...entitySelect, cascade: options.cascade, reparent: options.reparent };
+  else if (action === 'reparent' || action === 'parent') {
+    if (options['preserve-world'] && options['preserve-local']) {
+      throw new DomainError('E_REPARENT_TRANSFORM_MODE', 'Choose only one of --preserve-world or --preserve-local', { exitCode: EXIT.USAGE });
+    }
+    operation = { op: 'entity.reparent', ...selector, ...entitySelect, parentId: options.root ? null : (options.parent ?? options['parent-id'] ?? positionals.shift()), preserveWorld: options['preserve-world'] === true, preserveLocal: options['preserve-local'] === true };
+  }
+  else if (action === 'delete' || action === 'remove') {
+    if (options.cascade && options.reparent) {
+      throw new DomainError('E_DELETE_MODE', 'Choose only one of --cascade or --reparent when deleting an Entity', { exitCode: EXIT.USAGE });
+    }
+    if (options['preserve-world'] && options['preserve-local']) {
+      throw new DomainError('E_REPARENT_TRANSFORM_MODE', 'Choose only one of --preserve-world or --preserve-local', { exitCode: EXIT.USAGE });
+    }
+    if ((options['preserve-world'] || options['preserve-local']) && !options.reparent) {
+      throw new DomainError('E_DELETE_TRANSFORM_MODE', '--preserve-world and --preserve-local require --reparent when deleting an Entity', { exitCode: EXIT.USAGE });
+    }
+    operation = { op: 'entity.delete', ...selector, ...entitySelect, cascade: options.cascade, reparent: options.reparent, preserveWorld: options['preserve-world'] === true, preserveLocal: options['preserve-local'] === true };
+  }
   else throw new DomainError('E_COMMAND', `Unknown entity command: ${action}`, { exitCode: EXIT.USAGE });
   return operationResult(context, [operation], options, `entity.${action}`);
 }
@@ -486,7 +515,10 @@ function renderSuccess(result, options, io) {
   if (options.format === 'text') {
     if (result.command === 'help') io.stdout.write(`${result.data.help}\n`);
     else if (result.command === 'scene.list') for (const scene of result.data.scenes) io.stdout.write(`${scene.active ? '*' : ' '} ${scene.id}\t${scene.name}\t${scene.objectCount} objects\n`);
-    else if (result.command === 'entity.list') for (const entity of result.data.entities) io.stdout.write(`${'  '.repeat(entity.depth || 0)}${entity.id}\t${entity.name}\n`);
+    else if (result.command === 'entity.list') for (const entity of result.data.entities) {
+      const world = Array.isArray(entity.worldMatrix) ? `\tworld=[${entity.worldMatrix.join(', ')}]` : '';
+      io.stdout.write(`${'  '.repeat(entity.depth || 0)}${entity.id}\t${entity.name}${world}\n`);
+    }
     else io.stdout.write(`${JSON.stringify(result.data, null, 2)}\n`);
   } else io.stdout.write(`${JSON.stringify(envelope, null, options.pretty ? 2 : 0)}\n`);
   return EXIT.OK;

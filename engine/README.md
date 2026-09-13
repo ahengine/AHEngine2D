@@ -67,6 +67,43 @@ engine.registerComponent({
 
 Missing `runtime` or `snapshot` schemas fall back to the authoring schema. A definition may also provide aliases, per-profile schemas, `runtimeOnlyFields`, a normalizer, ordered `migrations`, and storage metadata. Registration rejects unsafe names and name/alias collisions. Pass a prepared `ComponentSchemaRegistry` as `new AH2D.Engine({ componentSchemas: registry })` when registry policy, such as `openWorld: false`, must be shared explicitly.
 
+## Scene Graph and transform spaces
+
+Each runtime Entity is a Scene Graph node. Universal authoring data stores its optional `parentId` and a local `Transform` (`x`, `y`, `rotation`, `scaleX`, and `scaleY`). Roots use world space as their local space. `Transform.world` is a derived Canvas-style matrix `[a,b,c,d,e,f]`; the Transform system updates a dirty Entity and its descendants in root-to-leaf order.
+
+```js
+engine.createEntity({ id: 'body', x: 100, y: 80 });
+engine.createEntity({ id: 'hand', parentId: 'body', x: 24, y: 0 });
+engine.createEntity({ id: 'sword', parentId: 'hand', x: 12, y: 0 });
+
+engine.graph.traverse('body', (id, context) => {
+  console.log(id, context.depth, context.path);
+});
+
+engine.reparent('sword', 'body', { preserveWorld: true });
+engine.graph.detach('sword', { preserveWorld: true });
+
+engine.transform.setLocal('sword', { rotation: 25 });
+engine.transform.setWorld('sword', { x: 400, y: 220 });
+const matrix = engine.transform.getWorldMatrix('sword');
+const screenPoint = engine.transform.localToWorld('sword', { x: 10, y: 0 });
+```
+
+`graph.attach`, `graph.reparent`, and `graph.detach` preserve the local Transform by default. Pass `{ preserveWorld: true }` to derive a new local TRS from the previous world matrix. The operation validates before mutation: cycles, missing nodes, singular parent matrices (`E_NON_INVERTIBLE_TRANSFORM`), and local shear that cannot be represented by TRS (`E_TRANSFORM_SHEAR`) are rejected atomically.
+
+Hierarchy queries are `roots`, `getParent`, `getChildren`, `ancestors`/`getAncestors`, `descendants`/`getDescendants`, `isAncestor`, `isDescendant`, and iterative `traverse` with pre/post order. Use `engine.destroyEntity(id, options)`, not low-level `ecs.destroy`, when hierarchy cleanup is required. Its `childPolicy` is one of:
+
+- `reject` (default): fail if direct children exist.
+- `cascade`: delete the complete subtree in post-order.
+- `reparent`: move direct children to the removed node's parent.
+- `detach`/`root`: make direct children roots.
+
+`reparent`, `detach`, and `root` deletion policies also accept `preserveWorld: true`.
+
+The Transform API exposes `getLocal`, `getLocalMatrix`, `getWorldTransform`, `getWorldMatrix`, `setLocal`, `setWorld`, `localToWorld`, and `worldToLocal`. `AH2D.Matrix2D` exposes the pure compose/multiply/invert/decompose/transformPoint helpers. A world matrix can contain shear after nested rotated non-uniform scales, so renderers should treat `getWorldMatrix`/`Transform.world` as authoritative.
+Physics translation for a dynamic child under a non-uniformly scaled or reflected parent remains matrix-safe. Angular motion is rejected with `E_TRANSFORM_SHEAR` when converting the new world pose back to local TRS would require shear; the Engine never stores an approximation. Prefer an unscaled/unreflected parent or a root node for freely rotating physics-driven bodies.
+
+
 ## Multi-Scene projects
 
 Universal project JSON stores every Scene independently and keeps a legacy `scene` copy of the active Scene for older runtimes:
@@ -158,4 +195,4 @@ The universal AH2D JSON remains the source of truth, so scenes and physics compo
 node engine/AH2DEngine.test.js
 ```
 
-The suite covers transform/scene graph sync, runtime selection, gravity and damping, circle/rotated-box contacts, wide-ground box stability, triggers, collision filters, automatic mass, impulses, kinematic bodies, sleeping, pause/resume/stop restoration, native Box2D unit conversion, and the editor integration contract.
+The suite covers deep nested local/world transforms, dirty propagation, traversal, cycle protection, preserve-world reparent/detach, atomic singular/shear rejection, graph-aware deletion, runtime selection, gravity and damping, contacts, triggers, collision filters, automatic mass, impulses, kinematic bodies, sleeping, lifecycle restoration, native Box2D conversion, and the Editor contract.

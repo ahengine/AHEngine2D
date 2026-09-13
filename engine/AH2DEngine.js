@@ -21,13 +21,33 @@
       this.schemas = schemas;
       this.entities = new Set();
       this.components = new Map();
+      this.destroyGuard = null;
     }
+    bindDestroyGuard(guard) { this.destroyGuard = typeof guard === 'function' ? guard : null; return this; }
     create(id = uid()) {
       if (typeof id !== 'string' || !id.trim()) throw new DataModel.ComponentSchemaError('E_ENTITY_ID', 'Entity id must be a non-empty string');
       if (this.entities.has(id)) throw new DataModel.ComponentSchemaError('E_ENTITY_EXISTS', `Entity already exists: ${id}`);
-      this.entities.add(id); this.events.emit('entity:create', id); return id;
+      this.entities.add(id);
+      try {
+        this.events.emit('entity:create', id);
+      } catch (error) {
+        this.entities.delete(id);
+        try { this.events.emit('entity:createRollback', id); } catch (_) { /* Preserve the original listener error. */ }
+        throw error;
+      }
+      return id;
     }
-    destroy(id) { this.entities.delete(id); this.components.forEach(store => store.delete(id)); this.events.emit('entity:destroy', id); }
+    destroy(id, options = {}) {
+      if (!this.entities.has(id)) return false;
+      if (options[GRAPH_INTERNAL] !== true) {
+        this.destroyGuard?.(id);
+        this.events.emit('entity:beforeDestroy', id);
+      }
+      this.entities.delete(id);
+      this.components.forEach(store => store.delete(id));
+      if (options.emit !== false) this.events.emit('entity:destroy', id);
+      return true;
+    }
     add(id, type, value = {}) {
       const canonical = this.schemas.resolve(type);
       if (!canonical) throw new DataModel.ComponentSchemaError('E_COMPONENT_NAME', `Invalid or unknown Component name: ${type || '(empty)'}`);
@@ -43,27 +63,253 @@
     clear() { this.entities.clear(); this.components.clear(); }
   }
 
+  const graphError = (code, message, details) => new DataModel.ComponentSchemaError(code, message, { details });
+  const GRAPH_INTERNAL = Symbol('AH2D.SceneGraph.internal');
+  const assertGraphId = (id, label = 'Entity') => {
+    if (typeof id !== 'string' || !id.trim()) throw graphError('E_GRAPH_ENTITY_ID', label + ' id must be a non-empty string', { id });
+    return id;
+  };
+
   class SceneGraph {
-    constructor(events) { this.events = events; this.parent = new Map(); this.children = new Map(); }
-    ensure(id) { if (!this.children.has(id)) this.children.set(id, new Set()); }
-    attach(child, parent = null) {
-      this.ensure(child);
-      const old = this.parent.get(child);
-      if (old) this.children.get(old)?.delete(child);
-      if (parent) {
-        if (child === parent || this.isDescendant(parent, child)) throw new Error('SceneGraph cycle detected');
-        this.ensure(parent); this.parent.set(child, parent); this.children.get(parent).add(child);
-      } else this.parent.delete(child);
-      this.events.emit('graph:attach', { child, parent });
+    constructor(events) {
+      this.events = events;
+      this.nodes = new Set();
+      this.parent = new Map();
+      this.children = new Map();
+      this.transforms = null;
+      this.entityExists = null;
     }
-    detach(child) { this.attach(child, null); }
+    bindTransformSystem(transforms) { this.transforms = transforms || null; return this; }
+    bindEntityStore(entityExists) { this.entityExists = typeof entityExists === 'function' ? entityExists : null; return this; }
+    add(id) {
+      assertGraphId(id);
+      if (this.entityExists && !this.entityExists(id)) {
+        throw graphError('E_GRAPH_ENTITY_MISSING', 'Cannot register a Scene Graph node without an ECS Entity: ' + id, { id });
+      }
+      if (!this.nodes.has(id)) {
+        this.nodes.add(id);
+        this.children.set(id, new Set());
+        this.events?.emit('graph:add', { id });
+      }
+      return id;
+    }
+    ensure(id) { return this.add(id); }
+    has(id) { return this.nodes.has(id); }
+    _assertNode(id, label = 'Entity') {
+      assertGraphId(id, label);
+      if (!this.nodes.has(id)) throw graphError('E_GRAPH_ENTITY_MISSING', label + ' does not exist in the Scene Graph: ' + id, { id, label });
+      return id;
+    }
+    _assertAttach(child, parent) {
+      this._assertNode(child, 'Child');
+      if (parent == null) return null;
+      assertGraphId(parent, 'Parent');
+      if (!this.nodes.has(parent)) {
+        throw graphError('E_DANGLING_PARENT', 'Parent does not exist in the Scene Graph: ' + parent, { child, parent });
+      }
+      if (child === parent || this.isDescendant(parent, child)) {
+        throw graphError('E_GRAPH_CYCLE', 'SceneGraph cycle detected while parenting ' + child + ' to ' + parent, { child, parent });
+      }
+      return parent;
+    }
+    _setParent(child, parent) {
+      const oldParent = this.parent.get(child) || null;
+      if (oldParent === parent) return oldParent;
+      if (oldParent != null) this.children.get(oldParent)?.delete(child);
+      if (parent == null) this.parent.delete(child);
+      else {
+        this.parent.set(child, parent);
+        this.children.get(parent).add(child);
+      }
+      return oldParent;
+    }
+    attach(child, parent = null, options = {}) {
+      if (typeof options === 'boolean') options = { preserveWorld: options };
+      parent = parent === undefined ? null : parent;
+      this._assertAttach(child, parent);
+      const oldParent = this.getParent(child);
+      if (oldParent === parent) return child;
+      const preserveWorld = options.preserveWorld === true;
+      const preservedLocal = preserveWorld ? this._requireTransforms().computeLocalForParent(child, parent) : null;
+      this._setParent(child, parent);
+      if (preservedLocal) this.transforms._applyLocal(child, preservedLocal);
+      else this.transforms?.markDirty(child);
+      this.transforms?.update();
+      this.events?.emit('graph:attach', { child, parent, oldParent, preserveWorld });
+      return child;
+    }
+    reparent(child, parent = null, options = {}) { return this.attach(child, parent, options); }
+    detach(child, options = {}) { return this.attach(child, null, options); }
     getParent(id) { return this.parent.get(id) || null; }
     getChildren(id) { return [...(this.children.get(id) || [])]; }
-    roots(ids) { return [...ids].filter(id => !this.parent.has(id)); }
-    isDescendant(id, possibleAncestor) { let p = this.parent.get(id); while (p) { if (p === possibleAncestor) return true; p = this.parent.get(p); } return false; }
-    clear() { this.parent.clear(); this.children.clear(); }
+    roots(ids = this.nodes) { return [...ids].filter(id => this.nodes.has(id) && !this.parent.has(id)); }
+    ancestors(id, options = {}) {
+      this._assertNode(id);
+      const output = options.includeSelf ? [id] : [];
+      const seen = new Set(output);
+      let current = this.getParent(id);
+      while (current != null) {
+        if (seen.has(current)) throw graphError('E_GRAPH_CYCLE', 'SceneGraph cycle detected at ' + current, { id, current });
+        output.push(current);
+        seen.add(current);
+        current = this.getParent(current);
+      }
+      return output;
+    }
+    getAncestors(id, options = {}) { return this.ancestors(id, options); }
+    path(id) { return this.ancestors(id, { includeSelf: true }).reverse(); }
+    isDescendant(id, possibleAncestor) {
+      if (!this.nodes.has(id) || !this.nodes.has(possibleAncestor) || id === possibleAncestor) return false;
+      let current = this.getParent(id);
+      const seen = new Set();
+      while (current != null) {
+        if (current === possibleAncestor) return true;
+        if (seen.has(current)) throw graphError('E_GRAPH_CYCLE', 'SceneGraph cycle detected at ' + current, { id, possibleAncestor });
+        seen.add(current);
+        current = this.getParent(current);
+      }
+      return false;
+    }
+    isAncestor(id, possibleDescendant) { return this.isDescendant(possibleDescendant, id); }
+    traverse(root = null, visitor = null, options = {}) {
+      if (typeof root === 'function') { options = visitor || {}; visitor = root; root = null; }
+      else if (root && typeof root === 'object' && !Array.isArray(root)) { options = root; visitor = null; root = null; }
+      else if (visitor && typeof visitor === 'object') { options = visitor; visitor = null; }
+      const starts = root == null ? this.roots() : [this._assertNode(root)];
+      const order = options.order === 'post' ? 'post' : 'pre';
+      const output = [];
+      const seen = new Set();
+      const stack = starts.slice().reverse().map(id => ({ id, depth: 0, expanded: false }));
+      while (stack.length) {
+        const entry = stack.pop();
+        if (order === 'post' && !entry.expanded) {
+          if (seen.has(entry.id)) throw graphError('E_GRAPH_CYCLE', 'SceneGraph cycle detected at ' + entry.id, { id: entry.id });
+          seen.add(entry.id);
+          stack.push({ ...entry, expanded: true });
+          const children = this.getChildren(entry.id);
+          for (let index = children.length - 1; index >= 0; index -= 1) {
+            const child = children[index];
+            stack.push({ id: child, depth: entry.depth + 1, expanded: false });
+          }
+          continue;
+        }
+        if (order === 'pre') {
+          if (seen.has(entry.id)) throw graphError('E_GRAPH_CYCLE', 'SceneGraph cycle detected at ' + entry.id, { id: entry.id });
+          seen.add(entry.id);
+        }
+        output.push(entry.id);
+        let descend = true;
+        if (typeof visitor === 'function') {
+          const context = { depth: entry.depth, parentId: this.getParent(entry.id) };
+          const cachePath = value => {
+            Object.defineProperty(context, 'path', {
+              value, enumerable: true, configurable: true, writable: true
+            });
+            return value;
+          };
+          Object.defineProperty(context, 'path', {
+            enumerable: true,
+            configurable: true,
+            get: () => cachePath(this.path(entry.id)),
+            set: value => { cachePath(value); }
+          });
+          descend = visitor(entry.id, context) !== false;
+        }
+        if (order === 'pre' && descend) {
+          const children = this.getChildren(entry.id);
+          for (let index = children.length - 1; index >= 0; index -= 1) {
+            const child = children[index];
+            stack.push({ id: child, depth: entry.depth + 1, expanded: false });
+          }
+        }
+      }
+      return output;
+    }
+    descendants(id, options = {}) {
+      const values = this.traverse(id, null, options);
+      if (options.includeSelf) return values;
+      return options.order === 'post' ? values.slice(0, -1) : values.slice(1);
+    }
+    getDescendants(id, options = {}) { return this.descendants(id, options); }
+    remove(id, options = {}) {
+      this._assertNode(id);
+      if (typeof options === 'string') options = { childPolicy: options };
+      if (this.entityExists?.(id) && options[GRAPH_INTERNAL] !== true) {
+        throw graphError('E_GRAPH_LIFECYCLE', 'Use Engine.destroyEntity() to remove an ECS-backed Scene Graph node', { id });
+      }
+
+      const childPolicy = options.childPolicy || options.children || options.mode || 'reject';
+      if (!['reject', 'cascade', 'reparent', 'detach', 'root'].includes(childPolicy)) {
+        throw graphError('E_GRAPH_CHILD_POLICY', 'Unknown Scene Graph child policy: ' + childPolicy, { id, childPolicy });
+      }
+      const directChildren = this.getChildren(id);
+      if (directChildren.length && childPolicy === 'reject') {
+        throw graphError('E_GRAPH_HAS_CHILDREN', 'Cannot remove ' + id + ' while it has children', { id, children: directChildren });
+      }
+      const emitGraph = (type, payload) => {
+        if (Array.isArray(options.eventQueue)) options.eventQueue.push([type, payload]);
+        else this.events?.emit(type, payload);
+      };
+
+      if (childPolicy === 'cascade') {
+        const removed = this.descendants(id, { includeSelf: true, order: 'post' });
+        if (typeof options.beforeCommit === 'function') options.beforeCommit(removed.slice());
+        for (const target of removed) {
+          const parent = this.getParent(target);
+          if (parent != null) this.children.get(parent)?.delete(target);
+          this.parent.delete(target);
+          this.children.delete(target);
+          this.nodes.delete(target);
+          this.transforms?.forget(target);
+        }
+        emitGraph('graph:remove', { id, childPolicy, removed: removed.slice() });
+        return removed;
+      }
+      const targetParent = childPolicy === 'reparent' ? this.getParent(id) : null;
+      const preserveWorld = options.preserveWorld === true;
+      const prepared = preserveWorld
+        ? directChildren.map(child => [child, this._requireTransforms().computeLocalForParent(child, targetParent)])
+        : [];
+      if (typeof options.beforeCommit === 'function') options.beforeCommit([id]);
+      for (const child of directChildren) {
+        const oldParent = this._setParent(child, targetParent);
+        emitGraph('graph:attach', { child, parent: targetParent, oldParent, preserveWorld });
+      }
+      for (const [child, local] of prepared) this.transforms._applyLocal(child, local);
+      if (!preserveWorld) directChildren.forEach(child => this.transforms?.markDirty(child));
+      const parent = this.getParent(id);
+      if (parent != null) this.children.get(parent)?.delete(id);
+      this.parent.delete(id);
+      this.children.delete(id);
+      this.nodes.delete(id);
+      this.transforms?.forget(id);
+      emitGraph('graph:remove', { id, childPolicy, removed: [id] });
+      return [id];
+    }
+    _requireTransforms() {
+      if (!this.transforms) throw graphError('E_TRANSFORM_SYSTEM_REQUIRED', 'A bound TransformSystem is required to preserve world transforms');
+      return this.transforms;
+    }
+    clear(options = {}) {
+      if (options[GRAPH_INTERNAL] !== true && this.entityExists && [...this.nodes].some(id => this.entityExists(id))) {
+        throw graphError('E_GRAPH_LIFECYCLE', 'SceneGraph.clear() cannot remove live ECS Entities', { entities: [...this.nodes] });
+      }
+      this.nodes.clear();
+      this.parent.clear();
+      this.children.clear();
+      this.transforms?.clear();
+    }
   }
 
+
+  const MATRIX_EPSILON = 1e-10;
+  const IDENTITY_MATRIX = Object.freeze([1, 0, 0, 1, 0, 0]);
+  const assertMatrix = (value, label = 'Transform matrix') => {
+    if (!Array.isArray(value) || value.length !== 6 || value.some(item => typeof item !== 'number' || !Number.isFinite(item))) {
+      throw graphError('E_TRANSFORM_MATRIX', label + ' must contain six finite numbers', { value });
+    }
+    return value;
+  };
   const matrix = (x = 0, y = 0, rotation = 0, sx = 1, sy = 1) => {
     const r = rotation * Math.PI / 180, c = Math.cos(r), s = Math.sin(r);
     return [c * sx, s * sx, -s * sy, c * sy, x, y];
@@ -73,17 +319,310 @@
     a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3],
     a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]
   ];
+  const determinant = value => value[0] * value[3] - value[1] * value[2];
+  const invert = value => {
+    assertMatrix(value);
+    const det = determinant(value);
+    if (Math.abs(det) <= MATRIX_EPSILON) {
+      throw graphError('E_NON_INVERTIBLE_TRANSFORM', 'Transform matrix is singular and cannot be inverted', { matrix: value.slice() });
+    }
+    return [
+      value[3] / det, -value[1] / det, -value[2] / det, value[0] / det,
+      (value[2] * value[5] - value[3] * value[4]) / det,
+      (value[1] * value[4] - value[0] * value[5]) / det
+    ];
+  };
+  const transformPoint = (value, point) => {
+    assertMatrix(value);
+    const x = Number(point?.x ?? point?.[0]), y = Number(point?.y ?? point?.[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      throw graphError('E_TRANSFORM_POINT', 'Point must contain finite x and y values', { point });
+    }
+    return { x: value[0] * x + value[2] * y + value[4], y: value[1] * x + value[3] * y + value[5] };
+  };
+  const decompose = (value, options = {}) => {
+    assertMatrix(value);
+    const [a, b, c, d, x, y] = value;
+    let rotation = Number.isFinite(options.rotationHint) ? options.rotationHint * Math.PI / 180 : 0;
+    let scaleX = Math.hypot(a, b), scaleY = 0, shear = 0;
+    if (scaleX > MATRIX_EPSILON) {
+      rotation = Math.atan2(b, a);
+      const axisX = a / scaleX, axisY = b / scaleX;
+      shear = axisX * c + axisY * d;
+      const perpendicularX = c - axisX * shear, perpendicularY = d - axisY * shear;
+      scaleY = Math.hypot(perpendicularX, perpendicularY);
+      if (determinant(value) < 0) scaleY = -scaleY;
+    } else {
+      const columnY = Math.hypot(c, d);
+      if (columnY > MATRIX_EPSILON) {
+        rotation = Math.atan2(-c, d);
+        scaleX = 0;
+        scaleY = columnY;
+      } else {
+        scaleX = 0;
+        scaleY = 0;
+      }
+    }
+    if (Number.isFinite(options.rotationHint) && (Math.abs(scaleX) > MATRIX_EPSILON || Math.abs(scaleY) > MATRIX_EPSILON)) {
+      const hint = options.rotationHint;
+      const canonical = rotation * 180 / Math.PI;
+      const nearest = angle => angle + 360 * Math.round((hint - angle) / 360);
+      const primary = nearest(canonical);
+      const reflected = nearest(canonical + 180);
+      if (Math.abs(reflected - hint) + MATRIX_EPSILON < Math.abs(primary - hint)) {
+        rotation = reflected * Math.PI / 180;
+        scaleX = -scaleX;
+        scaleY = -scaleY;
+      } else {
+        rotation = primary * Math.PI / 180;
+      }
+    }
+    const result = { x, y, rotation: rotation * 180 / Math.PI, scaleX, scaleY };
+    const reconstructed = matrix(result.x, result.y, result.rotation, result.scaleX, result.scaleY);
+    const linearMaximum = Math.max(1, Math.abs(a), Math.abs(b), Math.abs(c), Math.abs(d));
+    const residual = Math.max(
+      ...value.slice(0, 4).map((item, index) => Math.abs(item - reconstructed[index]))) / linearMaximum;
+    result.skew = Math.atan2(shear, Math.max(MATRIX_EPSILON, Math.abs(scaleY))) * 180 / Math.PI;
+    result.isTRS = residual <= (options.tolerance || 1e-8);
+    if (options.strict && !result.isTRS) {
+      throw graphError('E_TRANSFORM_SHEAR', 'Transform contains shear that cannot be represented by x/y/rotation/scale', {
+        matrix: value.slice(), residual, tolerance: options.tolerance || 1e-8
+      });
+    }
+    return result;
+  };
+  const matricesEqual = (a, b, epsilon = 1e-9) => Array.isArray(a) && Array.isArray(b)
+    && a.length === 6 && b.length === 6 && a.every((value, index) => Math.abs(value - b[index]) <= epsilon);
+
+  const Matrix2D = Object.freeze({
+    identity: () => IDENTITY_MATRIX.slice(),
+    compose: matrix,
+    multiply,
+    determinant,
+    invert,
+    decompose,
+    transformPoint
+  });
 
   class TransformSystem {
-    constructor(engine) { this.engine = engine; }
-    update() {
-      const { ecs, graph } = this.engine;
-      const visit = (id, parentWorld = [1, 0, 0, 1, 0, 0]) => {
-        const t = ecs.get(id, 'Transform');
-        if (t) t.world = multiply(parentWorld, matrix(t.x, t.y, t.rotation, t.scaleX, t.scaleY));
-        graph.getChildren(id).forEach(child => visit(child, t?.world || parentWorld));
+    constructor(engine) {
+      this.engine = engine;
+      this.dirty = new Set();
+      this.localState = new Map();
+      this.worldState = new Map();
+    }
+    _transform(id) {
+      if (!this.engine.ecs.entities.has(id)) throw graphError('E_GRAPH_ENTITY_MISSING', 'Entity does not exist: ' + id, { id });
+      const transform = this.engine.ecs.get(id, 'Transform');
+      if (!transform) throw graphError('E_TRANSFORM_MISSING', 'Entity has no Transform component: ' + id, { id });
+      return transform;
+    }
+    _localValues(transform) {
+      const values = {
+        x: transform.x ?? 0,
+        y: transform.y ?? 0,
+        rotation: transform.rotation ?? transform.rot ?? 0,
+        scaleX: transform.scaleX ?? transform.sx ?? 1,
+        scaleY: transform.scaleY ?? transform.sy ?? 1
       };
-      graph.roots(ecs.entities).forEach(id => visit(id));
+      for (const [field, value] of Object.entries(values)) {
+        if (typeof value !== 'number' || !Number.isFinite(value)) {
+          throw graphError('E_TRANSFORM_VALUE', 'Transform.' + field + ' must be a finite number', { field, value });
+        }
+      }
+      return values;
+    }
+    _signature(transform) {
+      const value = this._localValues(transform);
+      return [value.x, value.y, value.rotation, value.scaleX, value.scaleY];
+    }
+    _detectChanges() {
+      const active = new Set(this.engine.ecs.query('Transform'));
+      for (const id of active) {
+        const transform = this.engine.ecs.get(id, 'Transform');
+        const signature = this._signature(transform);
+        const previous = this.localState.get(id);
+        const previousWorld = this.worldState.get(id);
+        if (!previous || signature.some((value, index) => value !== previous[index]) || !matricesEqual(transform.world, previousWorld)) {
+          this.dirty.add(id);
+        }
+      }
+      for (const id of [...this.localState.keys()]) if (!active.has(id)) {
+        if (this.engine.graph.has(id)) this.markDirty(id);
+        this.forget(id);
+      }
+    }
+    markDirty(id, options = {}) {
+      this.dirty.add(id);
+      if (options.descendants !== false && this.engine.graph.has(id)) {
+        this.engine.graph.descendants(id).forEach(child => this.dirty.add(child));
+      }
+      return this;
+    }
+    invalidateAll() {
+      this.engine.ecs.query('Transform').forEach(id => this.dirty.add(id));
+      return this;
+    }
+    forget(id) {
+      this.dirty.delete(id);
+      this.localState.delete(id);
+      this.worldState.delete(id);
+      return this;
+    }
+    clear() {
+      this.dirty.clear();
+      this.localState.clear();
+      this.worldState.clear();
+      return this;
+    }
+    update(force = false, options = {}) {
+      const { ecs, graph } = this.engine;
+      this._detectChanges();
+      if (force) this.invalidateAll();
+      const changed = [];
+      const visited = new Set();
+      const stack = graph.roots(ecs.entities).slice().reverse().map(id => ({
+        id, parentWorld: IDENTITY_MATRIX, parentDirty: false
+      }));
+      while (stack.length) {
+        const { id, parentWorld, parentDirty } = stack.pop();
+        if (visited.has(id)) throw graphError('E_GRAPH_CYCLE', 'SceneGraph cycle detected at ' + id, { id });
+        visited.add(id);
+        const transform = ecs.get(id, 'Transform');
+        const isDirty = parentDirty || this.dirty.has(id) || (transform && !Array.isArray(transform.world));
+        let world = parentWorld;
+        if (transform) {
+          const local = this._localValues(transform);
+          if (isDirty) {
+            world = multiply(parentWorld, matrix(local.x, local.y, local.rotation, local.scaleX, local.scaleY));
+            transform.world = world;
+            this.worldState.set(id, world.slice());
+            this.localState.set(id, [local.x, local.y, local.rotation, local.scaleX, local.scaleY]);
+            this.dirty.delete(id);
+            changed.push(id);
+          } else {
+            world = transform.world;
+          }
+        }
+        if (!transform) this.dirty.delete(id);
+        const children = graph.getChildren(id);
+        for (let index = children.length - 1; index >= 0; index -= 1) {
+          stack.push({ id: children[index], parentWorld: world, parentDirty: isDirty });
+        }
+      }
+      if (visited.size !== ecs.entities.size) {
+        const missing = [...ecs.entities].filter(id => !visited.has(id));
+        throw graphError('E_GRAPH_DISCONNECTED', 'Scene Graph contains Entities that cannot be reached from a root', { entities: missing });
+      }
+      if (changed.length && options.emit !== false) this.engine.events.emit('transform:update', { entities: changed.slice(), engine: this.engine });
+      return changed;
+    }
+    getLocalMatrix(id) {
+      const local = this._localValues(this._transform(id));
+      return matrix(local.x, local.y, local.rotation, local.scaleX, local.scaleY);
+    }
+    getWorldMatrix(id) {
+      if (!this.engine.ecs.entities.has(id) || !this.engine.graph.has(id)) {
+        throw graphError('E_GRAPH_ENTITY_MISSING', 'Entity does not exist: ' + id, { id });
+      }
+      this.update();
+      let current = id;
+      while (current != null) {
+        const transform = this.engine.ecs.get(current, 'Transform');
+        if (transform) return transform.world.slice();
+        current = this.engine.graph.getParent(current);
+      }
+      return IDENTITY_MATRIX.slice();
+    }
+    getLocal(id) {
+      const local = this._localValues(this._transform(id));
+      return { ...local, matrix: matrix(local.x, local.y, local.rotation, local.scaleX, local.scaleY) };
+    }
+    getLocalTransform(id) { return this.getLocal(id); }
+    _worldRotationHint(id) {
+      const path = this.engine.graph.has(id) ? this.engine.graph.path(id) : [id];
+      return path.reduce((rotation, entityId) => {
+        const transform = this.engine.ecs.get(entityId, 'Transform');
+        return rotation + (transform ? this._localValues(transform).rotation : 0);
+      }, 0);
+    }
+    getWorld(id) {
+      const world = this.getWorldMatrix(id);
+      return { ...decompose(world, { rotationHint: this._worldRotationHint(id) }), matrix: world };
+    }
+    getWorldTransform(id) { return this.getWorld(id); }
+    localToWorld(id, point) { return transformPoint(this.getWorldMatrix(id), point); }
+    worldToLocal(id, point) { return transformPoint(invert(this.getWorldMatrix(id)), point); }
+    _applyLocal(id, values) {
+      const transform = this._transform(id);
+      const local = this._localValues(values);
+      transform.x = local.x;
+      transform.y = local.y;
+      transform.rotation = local.rotation;
+      transform.scaleX = local.scaleX;
+      transform.scaleY = local.scaleY;
+      if (Object.prototype.hasOwnProperty.call(transform, 'rot')) transform.rot = local.rotation;
+      if (Object.prototype.hasOwnProperty.call(transform, 'sx')) transform.sx = local.scaleX;
+      if (Object.prototype.hasOwnProperty.call(transform, 'sy')) transform.sy = local.scaleY;
+      this.markDirty(id);
+      return this.getLocal(id);
+    }
+    setLocal(id, value = {}) {
+      const current = this.getLocal(id);
+      let next;
+      if (Array.isArray(value)) {
+        next = decompose(value, { strict: true, rotationHint: current.rotation });
+      } else {
+        if (!value || typeof value !== 'object') throw graphError('E_TRANSFORM_VALUE', 'Local Transform must be an object or matrix', { value });
+        const source = Array.isArray(value.matrix)
+          ? decompose(value.matrix, { strict: true, rotationHint: current.rotation })
+          : value;
+        next = {
+          x: source.x ?? current.x,
+          y: source.y ?? current.y,
+          rotation: source.rotation ?? source.rot ?? current.rotation,
+          scaleX: source.scaleX ?? source.sx ?? current.scaleX,
+          scaleY: source.scaleY ?? source.sy ?? current.scaleY
+        };
+      }
+      const result = this._applyLocal(id, next);
+      this.update();
+      return result;
+    }
+    computeLocalForParent(id, parentId = null, worldMatrix = null) {
+      const current = this.getLocal(id);
+      const world = worldMatrix ? assertMatrix(worldMatrix).slice() : this.getWorldMatrix(id);
+      const localMatrix = parentId == null ? world : multiply(invert(this.getWorldMatrix(parentId)), world);
+      return decompose(localMatrix, { strict: true, rotationHint: current.rotation });
+    }
+    setWorld(id, value) {
+      const currentWorld = this.getWorldMatrix(id);
+      let desired;
+      if (Array.isArray(value)) {
+        desired = assertMatrix(value).slice();
+      } else if (value && Array.isArray(value.matrix || value.world)) {
+        desired = assertMatrix(value.matrix || value.world).slice();
+      } else {
+        if (!value || typeof value !== 'object') throw graphError('E_TRANSFORM_VALUE', 'World Transform must be an object or matrix', { value });
+        const requestedRotation = value.rotation ?? value.rot;
+        const requestedScaleX = value.scaleX ?? value.sx;
+        const requestedScaleY = value.scaleY ?? value.sy;
+        const needsCurrentLinear = requestedRotation == null || requestedScaleX == null || requestedScaleY == null;
+        const current = needsCurrentLinear
+          ? decompose(currentWorld, { strict: true, rotationHint: this._worldRotationHint(id) })
+          : null;
+        desired = matrix(
+          value.x ?? currentWorld[4],
+          value.y ?? currentWorld[5],
+          requestedRotation ?? current.rotation,
+          requestedScaleX ?? current.scaleX,
+          requestedScaleY ?? current.scaleY
+        );
+      }
+      const local = this.computeLocalForParent(id, this.engine.graph.getParent(id), desired);
+      this._applyLocal(id, local);
+      this.update();
+      return this.getWorld(id);
     }
   }
 
@@ -133,7 +672,7 @@
       this.effects = [];
       this.load();
     }
-    load(source) {
+    load(source, options = {}) {
       const config = source && typeof source === 'object' ? source : createDefaultPostProcess();
       this.enabled = config.enabled !== false;
       const effects = Array.isArray(config.effects) ? config.effects : DEFAULT_POST_PROCESS_EFFECTS;
@@ -144,7 +683,7 @@
         name: String(effect.name || effect.type || effect.id || `Effect ${index + 1}`),
         enabled: effect.enabled !== false
       }));
-      this.engine?.events.emit('postprocess:change', { postProcess: this, engine: this.engine });
+      if (options.emit !== false) this.engine?.events.emit('postprocess:change', { postProcess: this, engine: this.engine });
       return this;
     }
     get(idOrType) { return this.effects.find(effect => effect.id === idOrType || effect.type === idOrType) || null; }
@@ -333,6 +872,8 @@
         managedByECS: Boolean(descriptor.managedByECS),
         userData: descriptor.userData ?? rigidbody.userData ?? null,
         _lastTransformWritten: null,
+        _lastWorldWritten: null,
+        _lastPhysicsPose: null,
         _lastVelocityWritten: null,
         _lastAngularVelocityWritten: undefined,
         _lastSleepingWritten: undefined
@@ -342,15 +883,30 @@
       return body;
     }
     getBody(entityId) { return this.bodies.get(entityId) || null; }
-    destroyBody(entityId) {
+    destroyBody(entityId, options = {}) {
       if (!this.bodies.has(entityId)) return false;
-      this._removeBodyContacts(entityId);
+      const endedContacts = this._removeBodyContacts(entityId);
       this.bodies.delete(entityId);
+      let eventError = null;
+      for (const contact of endedContacts) {
+        try {
+          this._emitContactEvent(this.engine?.events, contact, 'end', options.eventQueue);
+        } catch (error) {
+          if (!eventError) eventError = error;
+        }
+      }
+      if (eventError) throw eventError;
       return true;
     }
-    clear() {
-      [...this.bodies.keys()].forEach(id => this.destroyBody(id));
+    clear(options = {}) {
+      let eventError = null;
+      for (const id of [...this.bodies.keys()]) {
+        try { this.destroyBody(id, { eventQueue: options.eventQueue }); }
+        catch (error) { if (!eventError) eventError = error; }
+      }
       this.contacts.clear();
+      if (eventError) throw eventError;
+      return this;
     }
     wake(entityId) {
       const body = typeof entityId === 'object' ? entityId : this.bodies.get(entityId);
@@ -458,7 +1014,10 @@
       if (!engine) return;
       this.engine = engine;
       if (phase !== 'after') this._syncFromECS(engine);
-      if (phase !== 'before') this._syncToECS(engine);
+      let inheritedBodyChanged = false;
+      if (phase !== 'before') inheritedBodyChanged = this._syncToECS(engine);
+      if (inheritedBodyChanged) this._emitContactChanges(this._detectContacts(), engine);
+      return inheritedBodyChanged;
     }
     _syncFromECS(engine) {
       const eligible = new Set();
@@ -471,7 +1030,8 @@
         const circle = engine.ecs.get(entityId, 'CircleCollider');
         if (!rigidbody && !generic && !box2D && !box && !circle2D && !circle) return;
         eligible.add(entityId);
-        const transform = engine.ecs.get(entityId, 'Transform') || {};
+        const transform = engine.ecs.get(entityId, 'Transform');
+        const localTransform = transform || {};
         const renderable = engine.ecs.get(entityId, 'Renderable') || {};
         const colliderSources = [];
         const append = (source, forcedShape) => {
@@ -488,20 +1048,26 @@
         append(circle, 'circle');
         let body = this.bodies.get(entityId);
         const isNew = !body;
-        if (!body) body = this.createBody(entityId, { transform, rigidbody: rigidbody || { type: 'static' }, collider: colliderSources, renderable, managedByECS: true });
+        if (!body) body = this.createBody(entityId, { transform: localTransform, rigidbody: rigidbody || { type: 'static' }, collider: colliderSources, renderable, managedByECS: true });
         body.managedByECS = true;
         const local = {
-          x: finite(transform.x, 0), y: finite(transform.y, 0), rotation: finite(transform.rotation, 0),
-          scaleX: finite(transform.scaleX, 1), scaleY: finite(transform.scaleY, 1)
+          x: finite(localTransform.x, 0), y: finite(localTransform.y, 0), rotation: finite(localTransform.rotation, 0),
+          scaleX: finite(localTransform.scaleX, 1), scaleY: finite(localTransform.scaleY, 1)
         };
-        if (isNew || !body._lastTransformWritten || Object.keys(local).some(key => Math.abs(local[key] - body._lastTransformWritten[key]) > 1e-7)) {
-          const world = transform.world;
-          body.position.x = Array.isArray(world) ? finite(world[4], local.x) : local.x;
-          body.position.y = Array.isArray(world) ? finite(world[5], local.y) : local.y;
-          body.rotation = Array.isArray(world) ? Math.atan2(world[1], world[0]) * RAD_TO_DEG : local.rotation;
-          body.scaleX = Array.isArray(world) ? Math.hypot(world[0], world[1]) : local.scaleX;
-          body.scaleY = Array.isArray(world) ? Math.hypot(world[2], world[3]) : local.scaleY;
+        const world = transform && Array.isArray(transform.world)
+          ? transform.world
+          : (engine.graph.has(entityId)
+              ? engine.transform.getWorldMatrix(entityId)
+              : matrix(local.x, local.y, local.rotation, local.scaleX, local.scaleY));
+        if (isNew || !matricesEqual(world, body._lastWorldWritten, 1e-7)) {
+          body.position.x = finite(world[4], local.x);
+          body.position.y = finite(world[5], local.y);
+          body.rotation = Math.atan2(world[1], world[0]) * RAD_TO_DEG;
+          body.scaleX = Math.hypot(world[0], world[1]);
+          body.scaleY = Math.hypot(world[2], world[3]);
           body._lastTransformWritten = local;
+          body._lastWorldWritten = world.slice();
+          body._lastPhysicsPose = { x: body.position.x, y: body.position.y, rotation: body.rotation };
           this.wake(body);
         }
         const source = rigidbody || { type: 'static' };
@@ -531,25 +1097,80 @@
       });
       [...this.bodies].forEach(([id, body]) => { if (body.managedByECS && !eligible.has(id)) this.destroyBody(id); });
     }
+    _bodyWorldMatrix(body) {
+      const value = Array.isArray(body._lastWorldWritten)
+        ? body._lastWorldWritten.slice()
+        : matrix(body.position.x, body.position.y, body.rotation, body.scaleX, body.scaleY);
+      value[4] = body.position.x;
+      value[5] = body.position.y;
+      const previousPose = body._lastPhysicsPose;
+      if (previousPose && Math.abs(body.rotation - previousPose.rotation) > 1e-7) {
+        const delta = (body.rotation - previousPose.rotation) * DEG_TO_RAD;
+        const cosine = Math.cos(delta), sine = Math.sin(delta);
+        const [a, b, c, d] = value;
+        value[0] = cosine * a - sine * b;
+        value[1] = sine * a + cosine * b;
+        value[2] = cosine * c - sine * d;
+        value[3] = sine * c + cosine * d;
+      }
+      return value;
+    }
     _syncToECS(engine) {
+      const entries = new Map();
       this.bodies.forEach((body, entityId) => {
         if (!body.managedByECS || !engine.ecs.entities.has(entityId)) return;
         const transform = engine.ecs.get(entityId, 'Transform');
-        if (transform && body.type !== BODY_TYPES.STATIC) {
-          const parentId = engine.graph.getParent(entityId);
-          const parentWorld = parentId ? engine.ecs.get(parentId, 'Transform')?.world : null;
-          if (parentWorld) {
-            const determinant = parentWorld[0] * parentWorld[3] - parentWorld[1] * parentWorld[2];
-            if (Math.abs(determinant) > PHYSICS_EPSILON) {
-              const dx = body.position.x - parentWorld[4], dy = body.position.y - parentWorld[5];
-              transform.x = (parentWorld[3] * dx - parentWorld[2] * dy) / determinant;
-              transform.y = (-parentWorld[1] * dx + parentWorld[0] * dy) / determinant;
-            } else { transform.x = body.position.x; transform.y = body.position.y; }
-            transform.rotation = body.rotation - Math.atan2(parentWorld[1], parentWorld[0]) * RAD_TO_DEG;
-          } else {
-            transform.x = body.position.x; transform.y = body.position.y; transform.rotation = body.rotation;
-          }
+        entries.set(entityId, {
+          body,
+          transform,
+          desiredWorld: transform && body.type !== BODY_TYPES.STATIC
+            ? this._bodyWorldMatrix(body)
+            : null
+        });
+      });
+
+      const resolvedWorld = new Map();
+      const staged = [], stagedInheritedBodies = [];
+      for (const entityId of engine.graph.traverse()) {
+        const parentId = engine.graph.getParent(entityId);
+        const parentWorld = parentId == null ? IDENTITY_MATRIX : resolvedWorld.get(parentId);
+        const transform = engine.ecs.get(entityId, 'Transform');
+        const entry = entries.get(entityId);
+        let world = parentWorld;
+        if (entry?.desiredWorld && transform) {
+          const localMatrix = parentId == null
+            ? entry.desiredWorld
+            : multiply(invert(parentWorld), entry.desiredWorld);
+          const rotationHint = engine.transform.getLocal(entityId).rotation;
+          const local = decompose(localMatrix, { strict: true, rotationHint });
+          staged.push({ entry, entityId, local });
+          world = entry.desiredWorld;
+        } else if (transform) {
+          world = multiply(parentWorld, engine.transform.getLocalMatrix(entityId));
         }
+        resolvedWorld.set(entityId, world);
+        if (entry && entry.body.type === BODY_TYPES.STATIC && !matricesEqual(world, entry.body._lastWorldWritten, 1e-7)) {
+          stagedInheritedBodies.push({ body: entry.body, world: world.slice() });
+        }
+      }
+
+      for (const { entry, entityId, local } of staged) {
+        engine.transform._applyLocal(entityId, local);
+        entry.body._lastWorldWritten = entry.desiredWorld.slice();
+      }
+
+      for (const { body, world } of stagedInheritedBodies) {
+        body.position.x = world[4];
+        body.position.y = world[5];
+        body.rotation = Math.atan2(world[1], world[0]) * RAD_TO_DEG;
+        body.scaleX = Math.hypot(world[0], world[1]);
+        body.scaleY = Math.hypot(world[2], world[3]);
+        body._lastWorldWritten = world;
+        body._lastPhysicsPose = { x: body.position.x, y: body.position.y, rotation: body.rotation };
+      }
+
+      entries.forEach(({ body, transform }, entityId) => {
+        body._lastPhysicsPose = { x: body.position.x, y: body.position.y, rotation: body.rotation };
         if (transform) body._lastTransformWritten = {
           x: finite(transform.x, 0), y: finite(transform.y, 0), rotation: finite(transform.rotation, 0),
           scaleX: finite(transform.scaleX, 1), scaleY: finite(transform.scaleY, 1)
@@ -575,6 +1196,7 @@
           body._lastSleepingWritten = body.sleeping;
         }
       });
+      return stagedInheritedBodies.length > 0;
     }
     _updateMass(body) {
       if (body.useAutoMass) {
@@ -621,18 +1243,37 @@
       });
     }
     _worldShape(body, collider) {
-      const angle = body.rotation * DEG_TO_RAD;
-      const offset = rotate({ x: collider.offsetX * body.scaleX, y: collider.offsetY * body.scaleY }, angle);
-      const center = { x: body.position.x + offset.x, y: body.position.y + offset.y };
-      if (collider.shape === COLLIDER_SHAPES.CIRCLE) return {
-        type: 'circle', center, radius: collider.radius * Math.max(Math.abs(body.scaleX), Math.abs(body.scaleY))
+      const world = this._bodyWorldMatrix(body);
+      const center = {
+        x: world[4] + world[0] * collider.offsetX + world[2] * collider.offsetY,
+        y: world[5] + world[1] * collider.offsetX + world[3] * collider.offsetY
       };
-      const boxAngle = angle + collider.rotation * DEG_TO_RAD;
+      const columnX = Math.hypot(world[0], world[1]);
+      const columnY = Math.hypot(world[2], world[3]);
+      if (collider.shape === COLLIDER_SHAPES.CIRCLE) return {
+        type: 'circle', center, radius: collider.radius * Math.max(columnX, columnY)
+      };
+      const colliderAngle = collider.rotation * DEG_TO_RAD;
+      const localAxisX = { x: Math.cos(colliderAngle), y: Math.sin(colliderAngle) };
+      const localAxisY = { x: -localAxisX.y, y: localAxisX.x };
+      const transformedX = {
+        x: world[0] * localAxisX.x + world[2] * localAxisX.y,
+        y: world[1] * localAxisX.x + world[3] * localAxisX.y
+      };
+      const transformedY = {
+        x: world[0] * localAxisY.x + world[2] * localAxisY.y,
+        y: world[1] * localAxisY.x + world[3] * localAxisY.y
+      };
+      const axisX = normalize(transformedX);
+      const handedness = cross(transformedX, transformedY) < 0 ? -1 : 1;
+      const axisY = handedness < 0
+        ? { x: axisX.y, y: -axisX.x }
+        : { x: -axisX.y, y: axisX.x };
       return {
-        type: 'box', center, halfX: collider.width * Math.abs(body.scaleX) * 0.5,
-        halfY: collider.height * Math.abs(body.scaleY) * 0.5, angle: boxAngle,
-        axisX: { x: Math.cos(boxAngle), y: Math.sin(boxAngle) },
-        axisY: { x: -Math.sin(boxAngle), y: Math.cos(boxAngle) }
+        type: 'box', center,
+        halfX: collider.width * Math.hypot(transformedX.x, transformedX.y) * 0.5,
+        halfY: collider.height * Math.hypot(transformedY.x, transformedY.y) * 0.5,
+        angle: Math.atan2(axisX.y, axisX.x), axisX, axisY
       };
     }
     _canCollide(a, b) {
@@ -828,21 +1469,27 @@
       this.contacts.forEach((contact, key) => { if (!next.has(key)) this._emitContactEvent(events, contact, 'end'); });
       this.contacts = next;
     }
-    _emitContactEvent(events, contact, phase) {
-      if (!events) return;
+    _emitContactEvent(events, contact, phase, eventQueue = null) {
+      if (!events && !Array.isArray(eventQueue)) return;
       const triggerPhase = phase === 'start' ? 'enter' : phase === 'end' ? 'exit' : 'stay';
       const name = contact.trigger ? `physics:trigger${triggerPhase}` : `physics:collision${phase}`;
       const payload = this._eventPayload(contact, contact.trigger ? triggerPhase : phase);
+      if (Array.isArray(eventQueue)) {
+        eventQueue.push([name, payload], ['physics:contact', { ...payload, type: name }]);
+        return;
+      }
       events.emit(name, payload);
       events.emit('physics:contact', { ...payload, type: name });
     }
     _removeBodyContacts(entityId) {
       const remaining = new Map();
+      const removed = [];
       this.contacts.forEach((contact, key) => {
-        if (contact.bodyA.entityId === entityId || contact.bodyB.entityId === entityId) this._emitContactEvent(this.engine?.events, contact, 'end');
+        if (contact.bodyA.entityId === entityId || contact.bodyB.entityId === entityId) removed.push(contact);
         else remaining.set(key, contact);
       });
       this.contacts = remaining;
+      return removed;
     }
   }
 
@@ -871,18 +1518,31 @@
       }
       return this;
     }
-    destroyBody(entityId) {
+    destroyBody(entityId, options = {}) {
       const nativeBody = this.nativeBodies.get(entityId);
       if (nativeBody && this.world) {
         try { if (this.world.destroyBody) this.world.destroyBody(nativeBody); else this.world.DestroyBody?.(nativeBody); } catch (_) { /* Already removed. */ }
       }
       this.nativeBodies.delete(entityId);
-      return super.destroyBody(entityId);
+      return super.destroyBody(entityId, options);
     }
-    clear() { super.clear(); this.nativeBodies.clear(); }
+    clear(options = {}) {
+      let eventError = null;
+      try { super.clear(options); } catch (error) { eventError = error; }
+      if (this.world) {
+        for (const nativeBody of this.nativeBodies.values()) {
+          try { if (this.world.destroyBody) this.world.destroyBody(nativeBody); else this.world.DestroyBody?.(nativeBody); }
+          catch (_) { /* A native adapter must not leave the Engine half-cleared. */ }
+        }
+      }
+      this.nativeBodies.clear();
+      if (eventError) throw eventError;
+      return this;
+    }
     sync(engine, phase = 'both') {
       if (!this.usingNative) return super.sync(engine, phase);
       this.engine = engine;
+      let inheritedBodyChanged = false;
       if (phase !== 'after') {
         super.sync(engine, 'before');
         try { this.bodies.forEach(body => this._writeNativeBody(body)); } catch (error) { this._fallback(error); }
@@ -891,8 +1551,12 @@
         if (this.usingNative) {
           try { this.bodies.forEach(body => this._readNativeBody(body)); } catch (error) { this._fallback(error); }
         }
-        super.sync(engine, 'after');
+        inheritedBodyChanged = super.sync(engine, 'after');
+        if (inheritedBodyChanged && this.usingNative) {
+          try { this.bodies.forEach(body => this._writeNativeBody(body)); } catch (error) { this._fallback(error); }
+        }
       }
+      return inheritedBodyChanged;
     }
     step(dt, engine = this.engine) {
       if (!this.usingNative) return super.step(dt, engine);
@@ -910,12 +1574,58 @@
       }
       return { x, y };
     }
+    _nativeFixtureGeometry(body, collider) {
+      const worldShape = this._worldShape(body, collider);
+      const bodyAngle = body.rotation * DEG_TO_RAD;
+      const cosine = Math.cos(bodyAngle), sine = Math.sin(bodyAngle);
+      const deltaX = worldShape.center.x - body.position.x;
+      const deltaY = worldShape.center.y - body.position.y;
+      const geometry = {
+        shape: worldShape.type,
+        offsetX: cosine * deltaX + sine * deltaY,
+        offsetY: -sine * deltaX + cosine * deltaY
+      };
+      if (worldShape.type === COLLIDER_SHAPES.CIRCLE) geometry.radius = worldShape.radius;
+      else {
+        geometry.halfX = worldShape.halfX;
+        geometry.halfY = worldShape.halfY;
+        const relativeAngle = worldShape.angle - bodyAngle;
+        geometry.rotation = Math.atan2(Math.sin(relativeAngle), Math.cos(relativeAngle));
+      }
+      return geometry;
+    }
     _writeNativeBody(body) {
       let nativeBody = this.nativeBodies.get(body.entityId);
-      const signature = JSON.stringify(body.colliders.map(collider => ({
-        id: collider.id, shape: collider.shape, width: collider.width, height: collider.height, radius: collider.radius,
-        offsetX: collider.offsetX, offsetY: collider.offsetY, rotation: collider.rotation, trigger: collider.isTrigger
-      })));
+      const fixtures = body.colliders
+        .filter(collider => collider.enabled)
+        .map(collider => ({ collider, geometry: this._nativeFixtureGeometry(body, collider) }));
+      const signatureNumber = value => Math.round(value * 1e9) / 1e9;
+      const signature = JSON.stringify({
+        type: body.type,
+        mass: signatureNumber(body.mass),
+        enabled: body.enabled,
+        allowSleep: body.allowSleep,
+        bullet: body.bullet,
+        linearDamping: signatureNumber(body.linearDamping),
+        angularDamping: signatureNumber(body.angularDamping),
+        fixtures: fixtures.map(({ collider, geometry }) => ({
+          id: collider.id,
+          shape: geometry.shape,
+          offsetX: signatureNumber(geometry.offsetX),
+          offsetY: signatureNumber(geometry.offsetY),
+          radius: geometry.radius == null ? null : signatureNumber(geometry.radius),
+          halfX: geometry.halfX == null ? null : signatureNumber(geometry.halfX),
+          halfY: geometry.halfY == null ? null : signatureNumber(geometry.halfY),
+          rotation: geometry.rotation == null ? null : signatureNumber(geometry.rotation),
+          friction: signatureNumber(collider.friction),
+          restitution: signatureNumber(collider.restitution),
+          density: signatureNumber(collider.density),
+          isTrigger: collider.isTrigger,
+          categoryBits: collider.categoryBits,
+          maskBits: collider.maskBits,
+          groupIndex: collider.groupIndex
+        }))
+      });
       if (nativeBody && nativeBody.__ah2dColliderSignature !== signature) {
         try { if (this.world.destroyBody) this.world.destroyBody(nativeBody); else this.world.DestroyBody?.(nativeBody); } catch (_) { /* Recreated below. */ }
         this.nativeBodies.delete(body.entityId); nativeBody = null;
@@ -924,18 +1634,32 @@
         const definition = {
           type: body.type, position: this._nativeVector(body.position.x / this.pixelsPerMeter, body.position.y / this.pixelsPerMeter),
           angle: body.rotation * DEG_TO_RAD, linearDamping: body.linearDamping, angularDamping: body.angularDamping,
-          fixedRotation: body.fixedRotation, allowSleep: body.allowSleep, awake: !body.sleeping, userData: body.entityId
+          fixedRotation: body.fixedRotation, allowSleep: body.allowSleep, awake: !body.sleeping,
+          bullet: body.bullet, active: body.enabled, enabled: body.enabled, userData: body.entityId
         };
         nativeBody = this.world.createBody ? this.world.createBody(definition) : this.world.CreateBody(definition);
         nativeBody.__ah2dColliderSignature = signature;
         nativeBody.setUserData?.(body.entityId); nativeBody.SetUserData?.(body.entityId);
         this.nativeBodies.set(body.entityId, nativeBody);
-        const totalArea = body.colliders.reduce((sum, collider) => sum + (collider.shape === 'circle' ? Math.PI * collider.radius * collider.radius : collider.width * collider.height), 0) / (this.pixelsPerMeter * this.pixelsPerMeter);
-        body.colliders.forEach(collider => {
+        const totalArea = fixtures.reduce((sum, fixture) => {
+          const geometry = fixture.geometry;
+          return sum + (geometry.shape === COLLIDER_SHAPES.CIRCLE
+            ? Math.PI * geometry.radius * geometry.radius
+            : geometry.halfX * geometry.halfY * 4);
+        }, 0) / (this.pixelsPerMeter * this.pixelsPerMeter);
+        fixtures.forEach(({ collider, geometry }) => {
           let shape;
-          const offset = this._nativeVector(collider.offsetX / this.pixelsPerMeter, collider.offsetY / this.pixelsPerMeter);
-          if (collider.shape === 'circle' && this.api.Circle) shape = this.api.Circle(offset, collider.radius / this.pixelsPerMeter);
-          else if (collider.shape === 'box' && this.api.Box) shape = this.api.Box(collider.width * 0.5 / this.pixelsPerMeter, collider.height * 0.5 / this.pixelsPerMeter, offset, collider.rotation * DEG_TO_RAD);
+          const offset = this._nativeVector(geometry.offsetX / this.pixelsPerMeter, geometry.offsetY / this.pixelsPerMeter);
+          if (geometry.shape === COLLIDER_SHAPES.CIRCLE && this.api.Circle) {
+            shape = this.api.Circle(offset, geometry.radius / this.pixelsPerMeter);
+          } else if (geometry.shape === COLLIDER_SHAPES.BOX && this.api.Box) {
+            shape = this.api.Box(
+              geometry.halfX / this.pixelsPerMeter,
+              geometry.halfY / this.pixelsPerMeter,
+              offset,
+              geometry.rotation
+            );
+          }
           if (!shape || !nativeBody.createFixture) return;
           const fixture = nativeBody.createFixture(shape, {
             density: body.type === 'dynamic' ? body.mass / Math.max(PHYSICS_EPSILON, totalArea) : 0,
@@ -951,6 +1675,8 @@
       nativeBody.setLinearVelocity?.(velocity); nativeBody.SetLinearVelocity?.(velocity);
       nativeBody.setAngularVelocity?.(body.angularVelocity * DEG_TO_RAD); nativeBody.SetAngularVelocity?.(body.angularVelocity * DEG_TO_RAD);
       nativeBody.setGravityScale?.(body.gravityScale); nativeBody.setFixedRotation?.(body.fixedRotation);
+      nativeBody.setActive?.(body.enabled); nativeBody.SetActive?.(body.enabled);
+      nativeBody.setEnabled?.(body.enabled); nativeBody.SetEnabled?.(body.enabled);
       nativeBody.setAwake?.(!body.sleeping); nativeBody.SetAwake?.(!body.sleeping);
       if (body.force.x || body.force.y) {
         const force = this._nativeVector(body.force.x / this.pixelsPerMeter, body.force.y / this.pixelsPerMeter);
@@ -1010,6 +1736,7 @@
   class Engine {
     constructor(options = {}) {
       this.events = new EventBus();
+      this._destroyInProgress = false;
       if (options.entityCodec instanceof DataModel.EntityCodec) {
         this.entityCodec = options.entityCodec;
         this.componentSchemas = options.entityCodec.registry;
@@ -1023,6 +1750,26 @@
       this.ecs = new ECS(this.events, this.componentSchemas);
       this.graph = new SceneGraph(this.events);
       this.transform = new TransformSystem(this);
+      this.graph.bindTransformSystem(this.transform);
+      this.graph.bindEntityStore(id => this.ecs.entities.has(id));
+      this.ecs.bindDestroyGuard(id => {
+        if (!this.graph.has(id)) return;
+        const children = this.graph.getChildren(id);
+        if (children.length) {
+          throw graphError('E_GRAPH_HAS_CHILDREN', 'Cannot destroy ' + id + ' through low-level ECS while it has children', {
+            id, children
+          });
+        }
+        throw graphError('E_GRAPH_LIFECYCLE', 'Use Engine.destroyEntity() for an ECS-backed Scene Graph Entity', { id });
+      });
+      this.events.on('entity:create', id => this.graph.add(id));
+      this.events.on('entity:createRollback', id => {
+        if (this.graph.has(id)) this.graph.remove(id, { childPolicy: 'detach', [GRAPH_INTERNAL]: true });
+      });
+      this.events.on('entity:destroy', id => {
+        this.physics?.destroyBody(id);
+        this.transform.forget(id);
+      });
       this.camera = new CameraSystem(this);
       this.lighting = new LightingSystem(this);
       this.shadows = new ShadowSystem(this);
@@ -1073,16 +1820,84 @@
     createEntity(data = {}) {
       const decoded = this._decodeEntity(data);
       if (this.ecs.entities.has(decoded.id)) throw new DataModel.ComponentSchemaError('E_ENTITY_EXISTS', `Entity already exists: ${decoded.id}`);
-      if (decoded.parentId && (decoded.id === decoded.parentId || this.graph.isDescendant(decoded.parentId, decoded.id))) {
-        throw new Error('SceneGraph cycle detected');
+      if (decoded.parentId != null && decoded.parentId !== decoded.id && !this.graph.has(decoded.parentId)) {
+        throw new DataModel.ComponentSchemaError('E_DANGLING_PARENT', `Parent does not exist in this Scene: ${decoded.parentId}`, {
+          details: { entityId: decoded.id, parentId: decoded.parentId }
+        });
       }
-      const id = this.ecs.create(decoded.id);
-      Object.entries(decoded.components).forEach(([type, value]) => this.ecs.add(id, type, clone(value)));
-      this.graph.attach(id, decoded.parentId);
+      if (decoded.id === decoded.parentId) {
+        throw graphError('E_GRAPH_CYCLE', 'SceneGraph cycle detected while parenting ' + decoded.id + ' to itself', {
+          child: decoded.id, parent: decoded.parentId
+        });
+      }
+      let id = null;
+      try {
+        id = this.ecs.create(decoded.id);
+        Object.entries(decoded.components).forEach(([type, value]) => this.ecs.add(id, type, clone(value)));
+        this.graph.attach(id, decoded.parentId);
+      } catch (error) {
+        const rollbackId = id || decoded.id;
+        if (this.graph.has(rollbackId)) this.graph.remove(rollbackId, { childPolicy: 'detach', [GRAPH_INTERNAL]: true });
+        this.ecs.entities.delete(rollbackId);
+        this.ecs.components.forEach(store => store.delete(rollbackId));
+        this.transform.forget(rollbackId);
+        throw error;
+      }
       if (decoded.conflicts.length) {
         this.events.emit('component:conflict', { entityId: id, conflicts: clone(decoded.conflicts) });
       }
+      this.transform.update();
       return id;
+    }
+    reparent(childId, parentId = null, options = {}) {
+      this.graph.attach(childId, parentId, options);
+      this.transform.update();
+      return childId;
+    }
+    destroyEntity(id, options = {}) {
+      if (this._destroyInProgress) {
+        throw graphError('E_ENTITY_DESTROY_REENTRY', 'Nested Entity destruction is not allowed during an active destroy transaction', { id });
+      }
+      if (!this.ecs.entities.has(id)) return [];
+      if (typeof options === 'string') options = { childPolicy: options };
+      this._destroyInProgress = true;
+      try {
+        const graphEvents = [], physicsEvents = [];
+        const removed = this.graph.remove(id, {
+          ...options,
+          [GRAPH_INTERNAL]: true,
+          eventQueue: graphEvents,
+          beforeCommit: entityIds => {
+            for (const entityId of entityIds) this.events.emit('entity:beforeDestroy', entityId);
+          }
+        });
+
+        let eventError = null;
+        const retainFirstError = error => { if (!eventError) eventError = error; };
+        for (const entityId of removed) {
+          try { this.ecs.destroy(entityId, { [GRAPH_INTERNAL]: true, emit: false }); } catch (error) { retainFirstError(error); }
+          try { this.physics?.destroyBody(entityId, { eventQueue: physicsEvents }); } catch (error) { retainFirstError(error); }
+          try { this.transform.forget(entityId); } catch (error) { retainFirstError(error); }
+        }
+        try { this.transform.update(); } catch (error) { retainFirstError(error); }
+
+        const emitCommitted = (type, payload) => {
+          try { this.events.emit(type, payload); } catch (error) { retainFirstError(error); }
+        };
+        for (const [type, payload] of graphEvents) emitCommitted(type, payload);
+        for (const [type, payload] of physicsEvents) emitCommitted(type, payload);
+        for (const entityId of removed) emitCommitted('entity:destroy', entityId);
+        emitCommitted('entity:destroyTree', {
+          rootId: id,
+          entities: removed.slice(),
+          childPolicy: options.childPolicy || options.children || options.mode || 'reject',
+          engine: this
+        });
+        if (eventError) throw eventError;
+        return removed;
+      } finally {
+        this._destroyInProgress = false;
+      }
     }
     load(document, options = {}) {
       if (typeof options === 'string') options = { sceneId: options };
@@ -1111,6 +1926,8 @@
       const stagedEvents = new EventBus();
       const stagedEcs = new ECS(stagedEvents, this.componentSchemas);
       const stagedGraph = new SceneGraph(stagedEvents);
+      stagedGraph.bindEntityStore(id => stagedEcs.entities.has(id));
+      stagedEvents.on('entity:create', id => stagedGraph.add(id));
       const decodedEntities = entities.map(entity => this._decodeEntity(entity));
       const nextActiveScene = activeScene && Array.isArray(nextDocument.scenes)
         ? nextDocument.scenes[scenes.indexOf(activeScene)]
@@ -1126,7 +1943,7 @@
       }
       if (nextActiveScene) nextDocument.scene = Array.isArray(nextEntities) ? clone(nextEntities) : [];
       const stagedIds = new Set(decodedEntities.map(entity => entity.id));
-      const dangling = decodedEntities.find(entity => entity.parentId && !stagedIds.has(entity.parentId));
+      const dangling = decodedEntities.find(entity => entity.parentId != null && !stagedIds.has(entity.parentId));
       if (dangling) {
         throw new DataModel.ComponentSchemaError('E_DANGLING_PARENT', `Parent does not exist in this Scene: ${dangling.parentId}`, {
           details: { entityId: dangling.id, parentId: dangling.parentId }
@@ -1135,24 +1952,69 @@
       decodedEntities.forEach(decoded => {
         stagedEcs.create(decoded.id);
         Object.entries(decoded.components).forEach(([type, value]) => stagedEcs.add(decoded.id, type, value));
-        stagedGraph.attach(decoded.id, decoded.parentId);
       });
 
-      this.physics.clear(); this.ecs.clear(); this.graph.clear();
+      const disjointParent = new Map(decodedEntities.map(decoded => [decoded.id, decoded.id]));
+      const disjointRank = new Map(decodedEntities.map(decoded => [decoded.id, 0]));
+      const findRoot = id => {
+        let root = id;
+        while (disjointParent.get(root) !== root) root = disjointParent.get(root);
+        let current = id;
+        while (disjointParent.get(current) !== current) {
+          const next = disjointParent.get(current);
+          disjointParent.set(current, root);
+          current = next;
+        }
+        return root;
+      };
+      decodedEntities.forEach(decoded => {
+        if (decoded.parentId == null) return;
+        const childRoot = findRoot(decoded.id);
+        const parentRoot = findRoot(decoded.parentId);
+        if (childRoot === parentRoot) {
+          throw graphError('E_GRAPH_CYCLE', 'SceneGraph cycle detected while parenting ' + decoded.id + ' to ' + decoded.parentId, {
+            child: decoded.id, parent: decoded.parentId
+          });
+        }
+        const childRank = disjointRank.get(childRoot);
+        const parentRank = disjointRank.get(parentRoot);
+        if (childRank < parentRank) disjointParent.set(childRoot, parentRoot);
+        else if (childRank > parentRank) disjointParent.set(parentRoot, childRoot);
+        else {
+          disjointParent.set(parentRoot, childRoot);
+          disjointRank.set(childRoot, childRank + 1);
+        }
+      });
+      decodedEntities.forEach(decoded => stagedGraph._setParent(decoded.id, decoded.parentId));
+
+      const physicsEvents = [];
+      let eventError = null;
+      const retainFirstError = error => { if (!eventError) eventError = error; };
+      try { this.physics.clear({ eventQueue: physicsEvents }); } catch (error) { retainFirstError(error); }
+      this.ecs.clear(); this.graph.clear({ [GRAPH_INTERNAL]: true });
       stagedEcs.entities.forEach(id => this.ecs.entities.add(id));
       stagedEcs.components.forEach((store, type) => this.ecs.components.set(type, store));
+      stagedGraph.nodes.forEach(id => this.graph.nodes.add(id));
       stagedGraph.parent.forEach((parent, child) => this.graph.parent.set(child, parent));
       stagedGraph.children.forEach((children, id) => this.graph.children.set(id, children));
       this.document = nextDocument;
       this.activeSceneId = activeScene?.id || null;
-      this.postProcess.load(nextPostProcess);
+      this.postProcess.load(nextPostProcess, { emit: false });
+      const transformedEntities = this.transform.update(false, { emit: false });
+      const emitCommitted = (type, payload) => {
+        try { this.events.emit(type, payload); } catch (error) { retainFirstError(error); }
+      };
+      for (const [type, payload] of physicsEvents) emitCommitted(type, payload);
+      emitCommitted('postprocess:change', { postProcess: this.postProcess, engine: this });
       decodedEntities.forEach(decoded => {
-        this.events.emit('entity:create', decoded.id);
-        this.events.emit('graph:attach', { child: decoded.id, parent: decoded.parentId });
-        if (decoded.conflicts.length) this.events.emit('component:conflict', { entityId: decoded.id, conflicts: clone(decoded.conflicts) });
+        emitCommitted('entity:create', decoded.id);
+        emitCommitted('graph:attach', { child: decoded.id, parent: decoded.parentId });
+        if (decoded.conflicts.length) emitCommitted('component:conflict', { entityId: decoded.id, conflicts: clone(decoded.conflicts) });
       });
-      this.transform.update(); this.events.emit('document:load', source);
-      if (activeScene) this.events.emit('scene:change', { id: activeScene.id, name: activeScene.name || 'Scene', scene: activeScene, engine: this });
+      if (transformedEntities.length) emitCommitted('transform:update', { entities: transformedEntities.slice(), engine: this });
+      emitCommitted('document:load', source);
+      if (activeScene) emitCommitted('scene:change', { id: activeScene.id, name: activeScene.name || 'Scene', scene: activeScene, engine: this });
+      if (eventError) throw eventError;
       return this;
     }
     loadScene(sceneId) {
@@ -1289,7 +2151,7 @@
   }
 
   global.AH2D = Object.freeze({
-    VERSION, Engine, EventBus, ECS, SceneGraph, TransformSystem, CameraSystem,
+    VERSION, Engine, EventBus, ECS, SceneGraph, TransformSystem, Matrix2D, CameraSystem,
     DataModel,
     ComponentSchemaRegistry: DataModel.ComponentSchemaRegistry,
     EntityCodec: DataModel.EntityCodec,

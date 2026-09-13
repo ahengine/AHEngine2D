@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { main } = require('./ah2d.js');
-const { createProject, documentHash } = require('./AH2DProject.js');
+const { createProject, documentHash, validateDocument, listEntities, applyOperations } = require('./AH2DProject.js');
 
 function run(args) {
   let stdout = '', stderr = '';
@@ -15,6 +15,13 @@ function run(args) {
   const source = stdout.trim() || stderr.trim();
   if (source) payload = JSON.parse(source);
   return { exitCode, stdout, stderr, payload };
+}
+
+function runText(args) {
+  let stdout = '', stderr = '';
+  const io = { stdout: { write: value => { stdout += value; } }, stderr: { write: value => { stderr += value; } } };
+  const exitCode = main(args, io);
+  return { exitCode, stdout, stderr };
 }
 
 function success(args) {
@@ -33,6 +40,12 @@ function failure(args, code) {
   return result;
 }
 
+function assertMatrixClose(actual, expected, message) {
+  assert.strictEqual(actual.length, expected.length, message);
+  actual.forEach((value, index) => assert.ok(Math.abs(value - expected[index]) < 1e-8, (message || 'matrix mismatch') + ' at index ' + index + ': ' + value + ' !== ' + expected[index]));
+}
+
+
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ah2d-cli-test-'));
 const projectFile = path.join(tempRoot, 'Agent Project.ah2d.json');
 
@@ -49,6 +62,12 @@ try {
   assert.strictEqual(capabilities.componentSchemas.precedence, 'components');
   assert.ok(capabilities.componentSchemas.types.includes('Transform'));
   assert.ok(capabilities.componentSchemas.types.includes('Rigidbody'));
+  assert.strictEqual(capabilities.sceneGraph.authoringTransformSpace, 'local');
+  assert.strictEqual(capabilities.sceneGraph.reparentDefault, 'preserve-local');
+  assert.strictEqual(capabilities.sceneGraph.reparentModes.preserveWorld, '--preserve-world');
+  assert.strictEqual(capabilities.sceneGraph.treeOutput.includeWorld, '--world');
+  assert.ok(capabilities.commands.entity.includes('tree'));
+
 
   const schemaIndex = success(['schema', 'list']).data;
   assert.deepStrictEqual(schemaIndex.schemas, ['project', 'operation', 'batch']);
@@ -60,7 +79,10 @@ try {
   const aliasedSchema = success(['schema', 'show', 'component:Body']).data;
   assert.strictEqual(aliasedSchema.name, 'component:Rigidbody');
   assert.strictEqual(aliasedSchema.component.type, 'Rigidbody');
-  assert.strictEqual(success(['schema', 'show', '--name', 'project']).data.schema.title, 'AH2D Project');
+  const projectSchema = success(['schema', 'show', '--name', 'project']).data.schema;
+  assert.strictEqual(projectSchema.title, 'AH2D Project');
+  assert.deepStrictEqual(projectSchema.$defs.entity.properties.parentId.type, ['string', 'null']);
+  assert.ok(projectSchema.$defs.entity.properties.x.description.includes('Local'));
 
 
   const initialized = success(['init', '--file', projectFile, '--name', 'Agent Test']).data;
@@ -116,6 +138,77 @@ try {
   const strictFutureDescriptor = failure(['validate', '--file', descriptorFile, '--strict'], 'E_PROJECT_INVALID').payload;
   assert.ok(strictFutureDescriptor.diagnostics.some(item => item.code === 'E_FUTURE_DATA_MODEL_VERSION' && item.pointer === '/dataModel/version'));
 
+  const cycleFile = path.join(tempRoot, 'cycle-validation.ah2d.json');
+  fs.writeFileSync(cycleFile, JSON.stringify(createProject({ objects: [
+    { id: 'cycle-a', name: 'A', parentId: 'cycle-b' },
+    { id: 'cycle-b', name: 'B', parentId: 'cycle-c' },
+    { id: 'cycle-c', name: 'C', parentId: 'cycle-a' }
+  ] })));
+  const cycleValidation = failure(['validate', '--file', cycleFile], 'E_PROJECT_INVALID').payload;
+  const cycleDiagnostic = cycleValidation.diagnostics.find(item => item.code === 'E_PARENT_CYCLE');
+  assert.deepStrictEqual(cycleDiagnostic.details.cycle, ['cycle-a', 'cycle-b', 'cycle-c', 'cycle-a']);
+  assert.strictEqual(cycleDiagnostic.pointer, '/scenes/0/objects/2/parentId');
+  const invalidParentFile = path.join(tempRoot, 'invalid-parent.ah2d.json');
+  fs.writeFileSync(invalidParentFile, JSON.stringify(createProject({ objects: [{ id: 'bad-parent', name: 'Bad Parent', parentId: 42 }] })));
+  assert.ok(failure(['validate', '--file', invalidParentFile], 'E_PROJECT_INVALID').payload.diagnostics.some(item => item.code === 'E_PARENT_ID' && item.pointer === '/scenes/0/objects/0/parentId'));
+
+  const duplicateIdProject = createProject({ objects: [
+    { id: 'duplicate', name: 'First' },
+    { id: 'duplicate', name: 'Second' }
+  ] });
+  assert.ok(validateDocument(duplicateIdProject).some(item => item.code === 'E_DUPLICATE_ENTITY_ID' && item.pointer === '/scenes/0/objects/1/id'));
+
+  const deepObjectCount = 10000;
+  const deepObjects = Array.from({ length: deepObjectCount }, (_, index) => ({
+    id: 'deep-' + index,
+    name: 'Deep ' + index,
+    x: 1,
+    ...(index ? { parentId: 'deep-' + (index - 1) } : {})
+  }));
+  const deepProject = createProject({ objects: deepObjects });
+  let linearWorldLookups = 0;
+  Object.defineProperty(deepProject.scenes[0].objects, 'find', {
+    configurable: true,
+    value(callback, thisArg) { linearWorldLookups += 1;return Array.prototype.find.call(this, callback, thisArg); }
+  });
+  const deepTree = listEntities(deepProject.scenes[0], { tree: true, world: true, path: false });
+  assert.strictEqual(Object.hasOwn(deepTree.at(-1), 'path'), false);
+  assert.strictEqual(deepTree.at(-1).depth, deepObjectCount - 1);
+  assert.strictEqual(deepTree.at(-1).worldPosition.x, deepObjectCount);
+  assert.strictEqual(linearWorldLookups, 0, 'world traversal must use one scene-local Entity index instead of Array.find per ancestor');
+
+  const indexedObjects = Array.from({ length: deepObjectCount }, (_, index) => ({
+    id: 'indexed-' + index,
+    name: 'Indexed ' + index,
+    ...(index ? { parentId: 'indexed-' + (index - 1) } : {})
+  }));
+  const indexedProject = createProject({ objects: indexedObjects });
+  const originalArrayIterator = Array.prototype[Symbol.iterator];
+  let fullSceneScans = 0;
+  Array.prototype[Symbol.iterator] = function indexedTraversalIterator() {
+    if (this.length === deepObjectCount && this[0]?.id === 'indexed-0' && this[deepObjectCount - 1]?.id === 'indexed-' + (deepObjectCount - 1)) fullSceneScans += 1;
+    return originalArrayIterator.call(this);
+  };
+  try {
+    const deepClone = applyOperations(indexedProject, [{ op: 'entity.clone', sceneId: 'main', entityId: 'indexed-0', deep: true }]);
+    const clonedIds = deepClone.results[0].entityIds;
+    assert.strictEqual(clonedIds.length, deepObjectCount);
+    assert.strictEqual(deepClone.document.scenes[0].objects.length, deepObjectCount * 2);
+    const clonedById = new Map(deepClone.document.scenes[0].objects.map(entity => [entity.id, entity]));
+    assert.strictEqual(clonedById.get(clonedIds.at(-1)).parentId, clonedIds.at(-2), 'deep clone must preserve nested ordering and topology');
+
+    const deepCascade = applyOperations(indexedProject, [{ op: 'entity.delete', sceneId: 'main', entityId: 'indexed-0', cascade: true }]);
+    assert.strictEqual(deepCascade.results[0].entityIds.length, deepObjectCount);
+    assert.strictEqual(deepCascade.document.scenes[0].objects.length, 0);
+    assert.throws(
+      () => applyOperations(indexedProject, [{ op: 'entity.reparent', sceneId: 'main', entityId: 'indexed-0', parentId: 'indexed-' + (deepObjectCount - 1) }]),
+      error => error?.code === 'E_PARENT_CYCLE'
+    );
+  } finally {
+    Array.prototype[Symbol.iterator] = originalArrayIterator;
+  }
+  assert.ok(fullSceneScans <= 8, `deep clone/cascade/reparent should reuse child indexes; observed ${fullSceneScans} full Scene scans`);
+  assert.strictEqual(indexedProject.scenes[0].objects.length, deepObjectCount, 'deep operations must leave their source document untouched');
 
   const inspected = success(['inspect', '--file', projectFile]).data;
   const initialHash = inspected.sha256;
@@ -147,6 +240,84 @@ try {
   assert.strictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'arena', 'child']).data.entity.parentId, undefined);
   success(['entity', 'reparent', '--file', projectFile, '--scene', 'arena', 'child', 'root', '--write']);
   assert.strictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'arena', 'child']).data.entity.parentId, 'root');
+
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--id', 'graph-a', '--name', 'Graph A', '--x', '100', '--y', '50', '--rotation', '90', '--scale-x', '2', '--scale-y', '2', '--write']);
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--id', 'graph-b', '--name', 'Graph B', '--x', '-20', '--y', '10', '--scale-x', '2', '--scale-y', '2', '--write']);
+  const provenanceEntity = {
+    id: 'transform-provenance', name: 'Transform Provenance',
+    transform: { x: 900, y: 800, rotation: 0, scaleX: 1, scaleY: 1, legacyOnly: { keep: true } },
+    components: { Transform: { x: 40, y: 30, rotation: 0, scaleX: 1, scaleY: 1, canonicalOnly: { keep: true } } }
+  };
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--data', JSON.stringify(provenanceEntity), '--write']);
+  success(['entity', 'reparent', '--file', projectFile, '--scene', 'arena', 'transform-provenance', 'graph-b', '--preserve-world', '--write']);
+  const provenanceStored = JSON.parse(fs.readFileSync(projectFile, 'utf8')).scenes.find(scene => scene.id === 'arena').objects.find(entity => entity.id === 'transform-provenance');
+  assert.strictEqual(provenanceStored.components.Transform.canonicalOnly.keep, true);
+  assert.strictEqual(provenanceStored.components.Transform.legacyOnly, undefined, 'preserve-world must not copy a lower-precedence extension');
+  assert.deepStrictEqual(provenanceStored.transform, provenanceEntity.transform, 'lower-precedence Transform storage must remain untouched');
+  assert.strictEqual(provenanceStored.components.Transform.x, 30);
+  assert.strictEqual(provenanceStored.components.Transform.y, 10);
+  assert.strictEqual(provenanceStored.x, 0, 'flat lower-precedence Transform must remain untouched');
+  const provenanceCloneId = success(['entity', 'clone', '--file', projectFile, '--scene', 'arena', 'transform-provenance', '--name', 'Transform Provenance Copy', '--write']).data.results[0].entityId;
+  const provenanceClone = JSON.parse(fs.readFileSync(projectFile, 'utf8')).scenes.find(scene => scene.id === 'arena').objects.find(entity => entity.id === provenanceCloneId);
+  assert.strictEqual(provenanceClone.components.Transform.canonicalOnly.keep, true);
+  assert.strictEqual(provenanceClone.components.Transform.legacyOnly, undefined, 'clone offset must not promote a lower-precedence extension');
+  assert.deepStrictEqual(provenanceClone.transform, provenanceEntity.transform, 'clone offset must leave lower-precedence Transform storage untouched');
+  assert.strictEqual(provenanceClone.components.Transform.x, 54);
+  assert.strictEqual(provenanceClone.components.Transform.y, 34);
+
+
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--id', 'joint', '--name', 'Joint', '--parent', 'graph-a', '--x', '10', '--y', '0', '--write']);
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--id', 'leaf', '--name', 'Leaf', '--parent', 'joint', '--x', '0', '--y', '5', '--write']);
+  let worldTree = success(['entity', 'tree', '--file', projectFile, '--scene', 'arena', '--world']).data.entities;
+  let jointTree = worldTree.find(entity => entity.id === 'joint'), leafTree = worldTree.find(entity => entity.id === 'leaf');
+  assert.deepStrictEqual(leafTree.path, ['graph-a', 'joint', 'leaf']);
+  assert.strictEqual(leafTree.depth, 2);
+  assert.strictEqual(jointTree.childCount, 1);
+  assertMatrixClose(jointTree.worldMatrix, [0, 2, -2, 0, 100, 70], 'nested joint world');
+  assertMatrixClose(leafTree.worldMatrix, [0, 2, -2, 0, 90, 70], 'three-level leaf world');
+  const worldText = runText(['entity', 'tree', '--file', projectFile, '--scene', 'arena', '--world', '--format', 'text']);
+  assert.strictEqual(worldText.exitCode, 0, worldText.stderr);
+  assert.match(worldText.stdout, /joint\tJoint\tworld=\[/);
+
+
+  const preserveWorld = success(['entity', 'reparent', '--file', projectFile, '--scene', 'arena', 'joint', 'graph-b', '--preserve-world', '--write']).data.results[0];
+  assert.strictEqual(preserveWorld.transformMode, 'preserve-world');
+  assertMatrixClose(preserveWorld.worldMatrix, [0, 2, -2, 0, 100, 70], 'reparent must preserve joint world');
+  assertMatrixClose([preserveWorld.localTransform.x, preserveWorld.localTransform.y], [60, 30], 'reparent must derive local position');
+  worldTree = success(['entity', 'list', '--file', projectFile, '--scene', 'arena', '--tree', '--world']).data.entities;
+  leafTree = worldTree.find(entity => entity.id === 'leaf');
+  assert.deepStrictEqual(leafTree.path, ['graph-b', 'joint', 'leaf']);
+  assertMatrixClose(leafTree.worldMatrix, [0, 2, -2, 0, 90, 70], 'subtree world must remain stable');
+
+  const localBefore = success(['component', 'get', '--file', projectFile, '--scene', 'arena', 'joint', 'Transform']).data.value;
+  const preserveLocal = success(['entity', 'reparent', '--file', projectFile, '--scene', 'arena', 'joint', 'graph-a', '--preserve-local', '--write']).data.results[0];
+  assert.strictEqual(preserveLocal.transformMode, 'preserve-local');
+  assertMatrixClose([preserveLocal.localTransform.x, preserveLocal.localTransform.y, preserveLocal.localTransform.rotation, preserveLocal.localTransform.scaleX, preserveLocal.localTransform.scaleY], [localBefore.x, localBefore.y, localBefore.rotation, localBefore.scaleX, localBefore.scaleY], 'preserve-local must not rewrite Transform');
+  failure(['entity', 'reparent', '--file', projectFile, '--scene', 'arena', 'graph-a', 'leaf', '--write'], 'E_PARENT_CYCLE');
+  failure(['entity', 'reparent', '--file', projectFile, '--scene', 'arena', 'joint', 'graph-b', '--preserve-local', '--preserve-world', '--write'], 'E_REPARENT_TRANSFORM_MODE');
+
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--id', 'singular-parent', '--name', 'Singular', '--scale-x', '0', '--write']);
+  const beforeSingular = fs.readFileSync(projectFile, 'utf8');
+  failure(['entity', 'reparent', '--file', projectFile, '--scene', 'arena', 'joint', 'singular-parent', '--preserve-world', '--write'], 'E_NON_INVERTIBLE_TRANSFORM');
+  assert.strictEqual(fs.readFileSync(projectFile, 'utf8'), beforeSingular, 'failed preserve-world must be atomic');
+  const beforeDetachWorld = success(['entity', 'list', '--file', projectFile, '--scene', 'arena', '--tree', '--world']).data.entities.find(entity => entity.id === 'joint').worldMatrix;
+  const detachedWorld = success(['entity', 'reparent', '--file', projectFile, '--scene', 'arena', 'joint', '--root', '--preserve-world', '--write']).data.results[0];
+  assertMatrixClose(detachedWorld.worldMatrix, beforeDetachWorld, 'detach must preserve world when requested');
+
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--id', 'delete-grand', '--name', 'Delete Grand', '--x', '100', '--y', '50', '--rotation', '90', '--scale-x', '2', '--scale-y', '2', '--write']);
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--id', 'delete-middle', '--name', 'Delete Middle', '--parent', 'delete-grand', '--x', '10', '--write']);
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--id', 'delete-leaf', '--name', 'Delete Leaf', '--parent', 'delete-middle', '--y', '5', '--write']);
+  const beforeDeleteWorld = success(['entity', 'tree', '--file', projectFile, '--scene', 'arena', '--world']).data.entities.find(entity => entity.id === 'delete-leaf').worldMatrix;
+  const deleteReparent = success(['entity', 'delete', '--file', projectFile, '--scene', 'arena', 'delete-middle', '--reparent', '--preserve-world', '--write']).data.results[0];
+  assert.strictEqual(deleteReparent.transformMode, 'preserve-world');
+  assert.strictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'arena', 'delete-leaf']).data.entity.parentId, 'delete-grand');
+  const afterDeleteWorld = success(['entity', 'tree', '--file', projectFile, '--scene', 'arena', '--world']).data.entities.find(entity => entity.id === 'delete-leaf').worldMatrix;
+  assertMatrixClose(afterDeleteWorld, beforeDeleteWorld, 'delete --reparent --preserve-world must preserve each direct child world matrix');
+  failure(['entity', 'delete', '--file', projectFile, '--scene', 'arena', 'delete-leaf', '--preserve-world', '--dry-run'], 'E_DELETE_TRANSFORM_MODE');
+  failure(['entity', 'delete', '--file', projectFile, '--scene', 'arena', 'delete-leaf', '--reparent', '--preserve-local', '--preserve-world', '--dry-run'], 'E_REPARENT_TRANSFORM_MODE');
+  failure(['entity', 'delete', '--file', projectFile, '--scene', 'arena', 'delete-leaf', '--cascade', '--reparent', '--dry-run'], 'E_DELETE_MODE');
+  failure(['entity', 'delete', '--file', projectFile, '--scene', 'arena', 'delete-leaf', '--cascade', '--reparent', '--preserve-world', '--dry-run'], 'E_DELETE_MODE');
+
 
   const beforeCycle = fs.readFileSync(projectFile, 'utf8');
   failure(['entity', 'reparent', '--file', projectFile, '--scene', 'arena', 'root', 'child', '--write'], 'E_PARENT_CYCLE');
@@ -264,6 +435,17 @@ try {
   ];
   failure(['apply', '--file', projectFile, '--ops', JSON.stringify(failedBatch), '--write'], 'E_ENTITY_EXISTS');
   assert.strictEqual(fs.readFileSync(projectFile, 'utf8'), beforeFailedBatch, 'batch must be atomic');
+  for (const preserveWorld of [false, true]) {
+    const beforeDeleteModeBatch = fs.readFileSync(projectFile, 'utf8');
+    const deleteOperation = { op: 'entity.delete', sceneId: 'arena', entityId: 'root', cascade: true, reparent: true };
+    if (preserveWorld) deleteOperation.preserveWorld = true;
+    const contradictoryDeleteBatch = [
+      { op: 'entity.create', sceneId: 'arena', id: 'delete-mode-temporary', name: 'Temporary' },
+      deleteOperation
+    ];
+    failure(['apply', '--file', projectFile, '--ops', JSON.stringify(contradictoryDeleteBatch), '--write'], 'E_DELETE_MODE');
+    assert.strictEqual(fs.readFileSync(projectFile, 'utf8'), beforeDeleteModeBatch, 'contradictory delete mode must roll back its complete apply batch');
+  }
 
   const longTransformEntity = {
     id: 'long-transform', name: 'Long Transform', x: 0, y: 0,

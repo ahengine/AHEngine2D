@@ -60,6 +60,44 @@ test('registers every built-in with independent collider types and only Rigidbod
   }
 });
 
+test('keeps public descriptors isolated while runtime decoding uses lightweight registry metadata', () => {
+  const registry = createDefaultComponentRegistry();
+  const described = registry.describe('Transform');
+  const listed = registry.list();
+  described.aliases.push('MutatedAlias');
+  listed.find(item => item.type === 'Transform').storage.preferred = 'mutated';
+  assert.deepStrictEqual(registry.describe('Transform').aliases, []);
+  assert.strictEqual(registry.describe('Transform').storage.preferred, 'flat-transform');
+
+  let publicListCalls = 0;
+  let publicDescribeCalls = 0;
+  const publicList = registry.list.bind(registry);
+  const publicDescribe = registry.describe.bind(registry);
+  registry.list = (...args) => { publicListCalls += 1; return publicList(...args); };
+  registry.describe = (...args) => { publicDescribeCalls += 1; return publicDescribe(...args); };
+  const codec = createDefaultEntityCodec({ registry });
+  const count = 2000;
+  const startedAt = Date.now();
+  let decoded;
+  for (let index = 0; index < count; index += 1) {
+    decoded = codec.decodeToRuntime({
+      id: `deep-${index}`,
+      parentId: index === 0 ? null : `deep-${index - 1}`,
+      x: 1,
+      y: 0,
+      components: { FutureData: { index, nested: { keep: true } } }
+    });
+  }
+  const elapsed = Date.now() - startedAt;
+
+  assert.strictEqual(publicListCalls, 0, 'runtime decoding must not clone the complete public registry list per Entity');
+  assert.strictEqual(publicDescribeCalls, 0, 'runtime decoding must not clone public schema descriptors per Component');
+  assert.strictEqual(decoded.parentId, 'deep-1998');
+  assert.strictEqual(decoded.components.Transform.x, 1);
+  assert.deepStrictEqual(decoded.components.FutureData, { index: 1999, nested: { keep: true } });
+  assert.ok(elapsed < 5000, `decoding ${count} Entities took ${elapsed}ms; expected the lightweight metadata path to stay below 5000ms`);
+});
+
 test('rejects canonical and alias collisions without mutating the registry', () => {
   const registry = new ComponentSchemaRegistry();
   registry.register({ type: 'Motion', aliases: ['Mover'], schema: { type: 'object' } });

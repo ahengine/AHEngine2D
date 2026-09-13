@@ -25,6 +25,10 @@ For multiple related changes, prefer one atomic `apply` call with an operations 
 
 Use `--scene-name` and `--entity-name` only for explicit name lookup; ordinary selectors are stable IDs. Use `entity reparent ... --root` to unparent rather than overloading a possible Entity ID such as `root`.
 
+Treat every authored Transform as local to `parentId`; `Transform.world` is derived Runtime state and must not be persisted as authoring truth. Inspect deep hierarchy with `entity tree --world`. Reparent defaults to preserve-local for compatibility; use `--preserve-world` when the Entity/subtree must not move visually, and never approximate a singular/sheared conversion.
+
+At Runtime, mutate hierarchy through `engine.graph` or `engine.reparent`, and delete graph Entities through `engine.destroyEntity` with an explicit child policy. Do not use low-level `ecs.destroy` as a complete Entity lifecycle operation.
+
 Do not replace a universal project with `Engine.export()`. That method intentionally exports the active ECS runtime snapshot. Use `ecs export` only when an ECS snapshot is explicitly required.
 
 Universal Project version `4` is the authoring source of truth. New projects use `dataModel: { id: "ah2d.ecs", version: 1, componentSchemaVersion: 1 }`; this descriptor and the lossy ECS snapshot version `3` are independent version axes. Persist with the `authoring` component profile, use `runtime` inside systems, and use `snapshot` only for active ECS exports.

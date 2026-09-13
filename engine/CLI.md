@@ -37,6 +37,8 @@ stdout is JSON by default:
 
 Errors use the same protocol on stderr and a non-zero, categorized exit code. `capabilities` is the machine-readable discovery contract. It reports `dataModel`, the three component-schema profiles, registry types, `unknownComponents: "preserve"`, and `precedence: "components"`. Human-readable output is opt-in with `--format text`.
 
+The `sceneGraph` capability declares `parentId` storage, local authoring Transform space, the derived world-matrix shape, the default Reparent mode, both preservation flags, and the tree/world inspection command. Agents should discover these fields instead of assuming Editor behavior.
+
 Exit codes:
 
 | Code | Meaning |
@@ -87,17 +89,34 @@ Selectors are IDs by default. Name lookup must be explicit with `--scene-name "L
 
 ```text
 npm run ah2d -- entity list --file game.ah2d.json --scene main --tree --format text
+npm run ah2d -- entity tree --file game.ah2d.json --scene main --world --pretty
 npm run ah2d -- entity create --file game.ah2d.json --scene main --id player --name Player --kind character --x 320 --y 180 --write
 npm run ah2d -- entity create --file game.ah2d.json --scene main --data @player.json --write
 npm run ah2d -- entity set --file game.ah2d.json --scene main player x 480 --write
 npm run ah2d -- entity patch --file game.ah2d.json --scene main player '{"color":"#55aaff","tag":"Player"}' --write
-npm run ah2d -- entity reparent --file game.ah2d.json --scene main weapon player --write
-npm run ah2d -- entity reparent --file game.ah2d.json --scene main weapon --root --write
+npm run ah2d -- entity reparent --file game.ah2d.json --scene main weapon player --preserve-local --write
+npm run ah2d -- entity reparent --file game.ah2d.json --scene main weapon vehicle --preserve-world --write
+npm run ah2d -- entity reparent --file game.ah2d.json --scene main weapon --root --preserve-world --write
 npm run ah2d -- entity clone --file game.ah2d.json --scene main player --deep --name "Player 2" --write
 npm run ah2d -- entity delete --file game.ah2d.json --scene main player --cascade --write
+npm run ah2d -- entity delete --file game.ah2d.json --scene main container --reparent --preserve-world --write
 ```
 
-Use `--root` to unparent an Entity explicitly; therefore an actual Entity whose ID is `root` remains addressable as a normal parent. Deleting an entity that has children requires either `--cascade` or `--reparent`. Cyclic parenting, dangling parents, duplicate IDs, and ambiguous names are rejected before writing.
+Every authored Transform is local to its `parentId`; a root Entity's local and world matrices are equal. World state is derived by multiplying matrices from the root to the Entity and is not persisted in the authoring Transform. `entity tree --world` (equivalent to `entity list --tree --world`) returns DFS order plus `depth`, the stable-ID `path`, `childCount`, `localTransform`, `localMatrix`, `worldMatrix`, and `worldPosition`.
+
+`entity reparent` keeps the local Transform by default for backward compatibility; `--preserve-local` makes that choice explicit. The Entity can therefore move in world space when the parent changes. `--preserve-world` snapshots the old world matrix, assigns the new parent, and derives a new local Transform so the Entity and its complete subtree stay visually fixed. The same option works with `--root`.
+
+`--preserve-local` and `--preserve-world` are mutually exclusive. Preserve-world is rejected atomically with `E_NON_INVERTIBLE_TRANSFORM` when the new parent's world matrix is singular, or `E_TRANSFORM_SHEAR` when an exact local result would require shear that the current `x/y/rotation/scaleX/scaleY` contract cannot represent.
+Preserve-world rewrites only the selected Transform provenance. It does not promote or merge custom fields from conflicting lower-precedence legacy copies into the effective component.
+
+
+Use `--root` to unparent an Entity explicitly; therefore an actual Entity whose ID is `root` remains addressable as a normal parent. `parentId` must be null/absent or the non-empty stable ID of another Entity in the same Scene. Nesting may be arbitrarily deep, but the result must remain a finite tree/forest. Deleting an Entity that has children requires either `--cascade` or `--reparent`. Self-parenting, cyclic parenting, dangling parents, duplicate IDs, and ambiguous names are rejected before writing.
+`--cascade` and `--reparent` are mutually exclusive delete modes. Supplying both is rejected with `E_DELETE_MODE` before mutation, including inside an atomic `apply` batch.
+
+With `entity delete --reparent`, direct children preserve their local Transforms by default. Add `--preserve-world` to recompute every direct child's local Transform before removing the intermediate parent, keeping each retained subtree visually fixed. Transform-mode flags without `--reparent` are rejected with `E_DELETE_TRANSFORM_MODE`; all child conversions are prepared before mutation, so one singular/sheared failure rolls back the complete operation.
+
+
+For an atomic `apply` batch, use `{ "op": "entity.reparent", "sceneId": "main", "entityId": "weapon", "parentId": "player", "preserveWorld": true }`. Omission of `preserveWorld` means preserve-local.
 
 ## Schema discovery
 

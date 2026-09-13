@@ -472,6 +472,10 @@
       return this._definitions.get(canonical) || null;
     }
 
+    _registeredTypes() {
+      return this._definitions.keys();
+    }
+
     _requireType(type) {
       const canonical = this.resolve(type);
       if (!canonical) throw new ComponentSchemaError('E_COMPONENT_NAME', `Invalid or unknown Component name: ${type || '(empty)'}`);
@@ -698,7 +702,7 @@
       matching.sort((left, right) => {
         if (left === canonical) return -1;
         if (right === canonical) return 1;
-        const aliases = this.registry.describe(canonical)?.aliases || [];
+        const aliases = this.registry._definition(canonical)?.aliases || [];
         const leftIndex = aliases.findIndex(alias => alias.toLowerCase() === left.toLowerCase());
         const rightIndex = aliases.findIndex(alias => alias.toLowerCase() === right.toLowerCase());
         return (leftIndex < 0 ? aliases.length : leftIndex) - (rightIndex < 0 ? aliases.length : rightIndex);
@@ -799,10 +803,11 @@
       const componentCandidates = this._componentCandidates(entity, canonical);
       const legacyCandidates = this._legacyCandidates(entity, canonical);
       const candidates = [...componentCandidates, ...legacyCandidates];
-      const descriptor = this.registry.describe(canonical);
-      const found = candidates.length > 0 || Boolean(descriptor && descriptor.required);
+      const metadata = this.registry._definition(canonical);
+      const found = candidates.length > 0 || Boolean(metadata && metadata.required);
       if (!found) return { found: false, type: canonical, value: undefined, storage: null, provenance: null, conflicts: [], candidates: [] };
-      const selected = candidates[0] || { storage: descriptor.storage.preferred, provenance: descriptor.storage.preferred, value: this.registry.create(canonical, {}, { entity }) };
+      const preferredStorage = metadata?.storage?.preferred || `components.${canonical}`;
+      const selected = candidates[0] || { storage: preferredStorage, provenance: preferredStorage, value: this.registry.create(canonical, {}, { entity }) };
       const effectiveValue = canonical === 'Transform' ? this._transformValue(entity, candidates) : selected.value;
       const conflicts = candidates.slice(1).filter(candidate => candidate.explicit && selected.explicit !== false && this._candidatesConflict(canonical, selected.rawValue, candidate.rawValue)).map(candidate => ({
         type: canonical, storage: candidate.storage, provenance: candidate.provenance, value: candidate.value,
@@ -819,8 +824,8 @@
       if (!isPlainObject(entity)) throw new ComponentSchemaError('E_ENTITY_VALUE', 'Entity must be a plain object');
       const output = [];
       const included = new Set();
-      for (const descriptor of this.registry.list()) {
-        const resolved = this.resolve(entity, descriptor.type, options);
+      for (const type of this.registry._registeredTypes()) {
+        const resolved = this.resolve(entity, type, options);
         if (resolved.found) {
           output.push({ type: resolved.type, value: resolved.value, storage: resolved.storage, provenance: resolved.provenance, conflicts: resolved.conflicts });
           included.add(resolved.type);
@@ -853,19 +858,19 @@
           diagnostics.push(...this.registry.validate(key, value, { ...options, pointer }));
         }
       }
-      for (const descriptor of this.registry.list()) {
-        const candidates = [...this._componentCandidates(entity, descriptor.type), ...this._legacyCandidates(entity, descriptor.type)];
+      for (const type of this.registry._registeredTypes()) {
+        const candidates = [...this._componentCandidates(entity, type), ...this._legacyCandidates(entity, type)];
         for (const candidate of candidates) {
           if (!candidate.explicit || candidate.storage.startsWith('components.')) continue;
-          const candidateDiagnostics = this.registry.validate(descriptor.type, candidate.rawValue, { ...options, pointer: '' });
+          const candidateDiagnostics = this.registry.validate(type, candidate.rawValue, { ...options, pointer: '' });
           diagnostics.push(...candidateDiagnostics.map(item => ({
             ...item,
             pointer: this._legacyDiagnosticPointer(entity, candidate, item.pointer, base)
           })));
         }
-        const resolved = this.resolve(entity, descriptor.type);
+        const resolved = this.resolve(entity, type);
         for (const conflict of resolved.conflicts) {
-          diagnostics.push(diagnostic('E_COMPONENT_CONFLICT', `${descriptor.type} has conflicting values at ${resolved.storage} and ${conflict.storage}`, `${base}${pointerForStorage(resolved.storage)}`, { type: descriptor.type, selected: resolved.storage, conflicting: conflict.storage }, options.strict ? 'error' : 'warning'));
+          diagnostics.push(diagnostic('E_COMPONENT_CONFLICT', `${type} has conflicting values at ${resolved.storage} and ${conflict.storage}`, `${base}${pointerForStorage(resolved.storage)}`, { type, selected: resolved.storage, conflicting: conflict.storage }, options.strict ? 'error' : 'warning'));
         }
       }
       return diagnostics;

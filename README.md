@@ -331,7 +331,9 @@ npm run ah2d -- patch --file game.ah2d.json --patch @postprocess.patch.json --wr
 }
 ```
 
-قرارداد فعلی Editor برای Transform از `x/y/rot/sx/sy` استفاده می‌کند. `Engine.createEntity()` آن را به `Transform` تبدیل می‌کند. مقدار `parentId` وارد Scene Graph می‌شود؛ Transform فرزند نسبت به والد محاسبه می‌شود. محور `+Y` در صحنهٔ Editor رو به پایین و rotation بر حسب درجه است.
+قرارداد Editor برای Transform از `x/y/rot/sx/sy` و قرارداد canonical از `x/y/rotation/scaleX/scaleY` استفاده می‌کند. این مقادیر **همیشه local نسبت به `parentId`** هستند؛ برای Entity ریشه، local و world برابرند. `Engine.createEntity()` dialect ذخیره‌شده را به Component `Transform` تبدیل می‌کند و `parentId` را وارد Scene Graph می‌کند.
+
+ماتریس `Transform.world` با ترتیب root-to-leaf از ضرب world والد در local فرزند محاسبه می‌شود و فیلدی مشتق‌شده در profileهای Runtime/Snapshot است؛ آن را در Universal Authoring JSON منبع حقیقت نکنید. محور `+Y` در Editor رو به پایین، rotation بر حسب درجه و ماتریس‌ها Canvas-style به شکل `[a,b,c,d,e,f]` هستند.
 
 Shortcutهای ورودی و component متناظر در Runtime:
 
@@ -366,6 +368,16 @@ npm run ah2d -- validate --file game.ah2d.json --engine --pretty
 npm run ah2d -- entity create --file game.ah2d.json --scene level-1 --id player --name Player --x 320 --y 180 --dry-run --include-document --pretty
 npm run ah2d -- entity create --file game.ah2d.json --scene level-1 --id player --name Player --x 320 --y 180 --write --expect-sha256 <hash>
 ```
+
+برای مشاهدهٔ hierarchy واقعی و Transformهای مشتق‌شده، سپس جابه‌جایی parent بدون تغییر ظاهر:
+
+```powershell
+npm run ah2d -- entity tree --file game.ah2d.json --scene level-1 --world --pretty
+npm run ah2d -- entity reparent --file game.ah2d.json --scene level-1 sword player --preserve-world --dry-run --include-document --pretty
+npm run ah2d -- entity reparent --file game.ah2d.json --scene level-1 sword player --preserve-world --write --expect-sha256 <hash>
+```
+
+بدون `--preserve-world`، دستور Reparent برای سازگاری قبلی local Transform را ثابت نگه می‌دارد؛ `--preserve-local` همین رفتار را صریح می‌کند.
 
 برای چند تغییر وابسته از Batch اتمیک استفاده کنید:
 
@@ -639,19 +651,49 @@ engine.registerComponent({
 
 ```js
 engine.createEntity({ id: 'player', name: 'Player', x: 300, y: 300 });
-engine.createEntity({ id: 'weapon', name: 'Sword', x: 32, y: 0 });
+engine.createEntity({
+  id: 'weapon',
+  name: 'Sword',
+  parentId: 'player',
+  x: 32, // local نسبت به player
+  y: 0
+});
 
-engine.graph.attach('weapon', 'player'); // child سپس parent
-engine.transform.update();
+console.log(engine.graph.getParent('weapon'));   // player
+console.log(engine.graph.getChildren('player')); // ['weapon']
+console.log(engine.transform.getLocal('weapon'));
+console.log(engine.transform.getLocalMatrix('weapon'));
+console.log(engine.transform.getWorldMatrix('weapon')); // [a,b,c,d,e,f]
 
-console.log(engine.graph.getParent('weapon'));       // player
-console.log(engine.graph.getChildren('player'));     // ['weapon']
-console.log(engine.ecs.get('weapon', 'Transform').world);
+// child سپس parent؛ local ثابت می‌ماند و ممکن است world عوض شود.
+engine.graph.attach('weapon', 'vehicle');
 
-engine.graph.detach('weapon');
+// world ثابت می‌ماند و local جدید دقیقاً محاسبه می‌شود.
+engine.reparent('weapon', 'player', { preserveWorld: true });
+engine.graph.detach('weapon', { preserveWorld: true });
+
+engine.graph.traverse(null, (id, { depth, parentId, path }) => {
+  console.log({ id, depth, parentId, path });
+});
+console.log(engine.graph.ancestors('weapon'));
+console.log(engine.graph.descendants('player'));
+
+const worldPoint = engine.transform.localToWorld('weapon', { x: 8, y: 0 });
+const localPoint = engine.transform.worldToLocal('weapon', worldPoint);
+
+engine.transform.setLocal('weapon', { x: 48, rotation: 15 });
+engine.transform.setWorld('weapon', { x: 500, y: 240 });
 ```
 
-Scene Graph چرخه را رد می‌کند. برای تغییر دائمی hierarchy در فایل پروژه، از `entity reparent` در CLI استفاده کنید.
+`x/y/rotation/scaleX/scaleY` وضعیت local و `Transform.world`/خروجی `getWorldMatrix()` وضعیت مشتق‌شده است. تغییر مستقیم مقدار local یک Component در update بعدی تشخیص داده می‌شود؛ برای کد شفاف‌تر از `setLocal()` استفاده کنید. `setWorld()` مقدار world دلخواه را با inverse world والد به local تبدیل می‌کند.
+
+ماتریس world مرجع دقیق رندر است. ترکیب rotation با scale غیرهمسان در چند سطح ممکن است world shear بسازد؛ در آن حالت decomposition به TRS یکتا/دقیق نیست. عملیات‌هایی که نیازمند decomposition دقیق هستند با `E_TRANSFORM_SHEAR` رد می‌شوند. parent با scale صفر نیز برای preserve-world یا تبدیل world-to-local قابل‌معکوس نیست و `E_NON_INVERTIBLE_TRANSFORM` می‌دهد.
+در همگام‌سازی Physics، انتقال مکانیِ فرزند dynamic زیر والد دارای scale غیرهمسان یا reflection با ماتریس world انجام می‌شود و امن است؛ اما angular motion اگر برای بازنویسی local Transform به shear نیاز داشته باشد با `E_TRANSFORM_SHEAR` رد می‌شود و Engine آن را تقریبی نمی‌کند. برای bodyهای physics-driven که آزادانه می‌چرخند، والد بدون non-uniform/reflected scale یا یک root مستقل انتخاب کنید.
+
+
+Scene Graph از hierarchy با عمق دلخواه، traversal پیش‌/پس‌ترتیب، ancestor/descendant و چند root پشتیبانی می‌کند و self-parent، parent گمشده و cycle را رد می‌کند. برای حذف امن Runtime Entity از `engine.destroyEntity(id, { childPolicy })` استفاده کنید: policy پیش‌فرض `reject` است؛ `cascade` کل subtree را حذف می‌کند، `reparent` فرزندان مستقیم را به والد قبلی می‌برد و `detach`/`root` آن‌ها را root می‌کند. برای دو policy آخر می‌توان `preserveWorld: true` داد.
+
+برای تغییر دائمی hierarchy در Universal Project از `entity reparent` در CLI و برای مشاهدهٔ local/world مشتق‌شده از `entity tree --world` استفاده کنید.
 
 ### Multi-Scene و تغییر Level
 
@@ -910,6 +952,8 @@ new AH2D.Engine(options)
 engine.registerComponent(definition)
 engine.load(project, { sceneId })
 engine.loadScene(sceneId)
+engine.reparent(childId, parentId, options)
+engine.destroyEntity(id, options)
 engine.createEntity(data)
 engine.update(dt)
 engine.start(target, options)
@@ -928,10 +972,25 @@ engine.ecs.has(id, type)
 engine.ecs.remove(id, type)
 engine.ecs.query(...types)
 
-engine.graph.attach(childId, parentId)
-engine.graph.detach(childId)
+engine.graph.attach(childId, parentId, { preserveWorld })
+engine.graph.reparent(childId, parentId, { preserveWorld })
+engine.graph.detach(childId, { preserveWorld })
 engine.graph.getParent(id)
 engine.graph.getChildren(id)
+engine.graph.roots()
+engine.graph.ancestors(id, options)
+engine.graph.descendants(id, options)
+engine.graph.traverse(root, visitor, options)
+
+engine.transform.getLocal(id)
+engine.transform.getLocalMatrix(id)
+engine.transform.getWorldTransform(id)
+engine.transform.getWorldMatrix(id)
+engine.transform.setLocal(id, transformOrMatrix)
+engine.transform.setWorld(id, transformOrMatrix)
+engine.transform.localToWorld(id, point)
+engine.transform.worldToLocal(id, point)
+AH2D.Matrix2D
 
 engine.postProcess.load(config)
 engine.postProcess.get(idOrType)
@@ -946,7 +1005,7 @@ engine.events.emit(type, payload)
 
 `engine.update(dt)` مقدار `dt` را در بازهٔ `0..0.25` محدود می‌کند. سیستم Script/Behavior scheduler داخلی هنوز وجود ندارد؛ systemهای gameplay را در حلقهٔ دستی قبل از `engine.update(dt)` یا با listener رویداد `engine:update` اجرا کنید. listener دوم بعد از systemهای داخلی اجرا می‌شود و برای تغییرات frame بعد مناسب است.
 
-`engine.ecs.destroy(id)` componentها را حذف می‌کند، اما رابطه‌های Scene Graph را مدیریت نمی‌کند. برای حذف Runtime Entity ابتدا فرزندان را detach/reparent کنید، سپس `engine.graph.detach(id)`، `engine.physics.destroyBody(id)` و در پایان `engine.ecs.destroy(id)` را اجرا کنید.
+`engine.ecs.destroy(id)` API سطح پایین ECS است و به‌تنهایی hierarchy یا body فیزیک را مدیریت نمی‌کند. در کد بازی از `engine.destroyEntity(id, { childPolicy: 'reject' | 'cascade' | 'reparent' | 'detach' })` استفاده کنید تا Scene Graph، ECS، Transform cache و bodyهای Physics در همان lifecycle operation هماهنگ پاک‌سازی شوند.
 
 ## وضعیت فعلی Authoring Assetها
 
@@ -973,6 +1032,6 @@ npm test
 npm run ah2d -- validate --file game.ah2d.json --engine --pretty
 ```
 
-Test suite شامل Scene Graph، Multi-Scene، Transform، Runtime selection، Rigidbody، colliderهای box/circle، trigger، collision filtering، auto mass، impulse، kinematic body، sleeping، snapshot/restore، مسیر Box2D و قرارداد Editor است.
+Test suite شامل hierarchy عمیق و چندریشه، local/world Transform، propagation، traversal، تشخیص cycle/ID تکراری، Reparent و Delete با preserve-world، rollback اتمیک برای shear/singular، Multi-Scene، Runtime selection، Rigidbody، colliderهای box/circle، trigger، collision filtering، auto mass، impulse، kinematic body، sleeping، snapshot/restore، مسیر Box2D و قرارداد Editor است.
 
 برای workflow استاندارد توسعه توسط Agent، [`Agent.md`](./Agent.md) را بخوانید.

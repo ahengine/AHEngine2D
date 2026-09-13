@@ -26,6 +26,7 @@ Keep Studio identity and collaboration concerns outside the framework-neutral En
 - Preserve unknown fields. They may belong to game code, a renderer adapter, or a future Editor version. Use the CLI for lossless mutations because the current HTML Editor reconstructs several top-level sections during Load/Export.
 - Components must be JSON-safe objects or arrays. Keep functions, `undefined`, non-finite numbers, DOM nodes, textures, sockets, class instances, and circular references in runtime-side Maps.
 - Component keys use safe PascalCase. The Editor's authoring dialect uses flat `x/y/rot/sx/sy`, `rigidbody`, and `collider`; generic ECS components live under `components`.
+- Authored `Transform.x/y/rotation/scaleX/scaleY` values are local to `parentId`. `Transform.world` is runtime-derived; do not persist or hand-edit it in a Universal Project.
 - When the same component exists in multiple locations, `components.<canonical-or-alias>` has precedence over legacy/flat authoring fields. Preserve the selected `storage`/`provenance`; do not silently merge, delete, or canonicalize duplicate locations. Normal validation warns on conflicts and strict validation rejects them.
 - Use the `authoring` schema profile for persisted project data, `runtime` for Engine/system values, and `snapshot` only for active ECS exports. Authoring normalization removes registered runtime-derived fields while preserving unknown JSON extensions.
 - Compatibility validation may accept legacy numeric/boolean strings without coercing them; runtime decoding remains strict. Normalize authored scalar types before Engine load, and use `--strict` in CI.
@@ -239,23 +240,43 @@ Do not assume runtime mutations are persisted by `loadScene`; authoring changes 
 
 ```powershell
 npm run ah2d -- entity list --file game.ah2d.json --scene level-1 --tree --format text
+npm run ah2d -- entity tree --file game.ah2d.json --scene level-1 --world --pretty
 npm run ah2d -- entity create --file game.ah2d.json --scene level-1 --id player --name Player --kind character --x 320 --y 180 --write
 npm run ah2d -- entity create --file game.ah2d.json --scene level-1 --id sword --name Sword --parent player --x 32 --y 0 --write
-npm run ah2d -- entity reparent --file game.ah2d.json --scene level-1 sword player --write
-npm run ah2d -- entity reparent --file game.ah2d.json --scene level-1 sword --root --write
+npm run ah2d -- entity reparent --file game.ah2d.json --scene level-1 sword player --preserve-local --write
+npm run ah2d -- entity reparent --file game.ah2d.json --scene level-1 sword vehicle --preserve-world --write
+npm run ah2d -- entity reparent --file game.ah2d.json --scene level-1 sword --root --preserve-world --write
 npm run ah2d -- entity clone --file game.ah2d.json --scene level-1 player --deep --name "Player 2" --write
+npm run ah2d -- entity delete --file game.ah2d.json --scene level-1 temporary-parent --reparent --preserve-world --write
 ```
 
-`--root` means unparent. The string `root` without `--root` remains a valid Entity ID. Cycles, self-parenting, dangling parents, duplicate IDs, and unsafe deletes are rejected.
+`parentId` is absent/null for a root or a stable Entity ID in the same Scene. Nesting is unrestricted, but every Scene must remain a finite forest. `--root` means unparent; the string `root` without the flag remains a valid Entity ID.
 
-Use `--cascade` only when deleting the selected Entity and all descendants is explicitly intended. Use `--reparent` to retain direct children at the deleted Entity's parent.
+Reparent preserves the authored local Transform by default; use `--preserve-local` to be explicit. Use `--preserve-world` when an Editor-style reparent/detach must not move the Entity or its subtree visually. Never emulate preserve-world by copying world x/y: use the matrix conversion so parent rotation and scale are included. The two flags are mutually exclusive. A derived local write must update only the effective Transform provenance; never merge custom fields from lower-precedence legacy copies into canonical storage.
 
-Runtime hierarchy uses child-first argument order:
+Cycle/self-parent/dangling-parent errors and preserve-world failures are atomic. A singular parent returns `E_NON_INVERTIBLE_TRANSFORM`; a required local shear outside the TRS schema returns `E_TRANSFORM_SHEAR`. Do not fall back to an approximate transform.
+
+Use `--cascade` only when deleting the selected Entity and all descendants is explicitly intended. Use `--reparent` to retain direct children at the deleted Entity's parent. This deletion mode preserves each child's local Transform by default; pair it with `--preserve-world` when the retained child subtrees must not move. Transform-mode flags without `--reparent` are invalid, and every child conversion must succeed before any hierarchy mutation is committed.
+Never combine `--cascade` and `--reparent`; the CLI and direct `entity.delete` apply operation reject that contradictory policy with `E_DELETE_MODE`.
+
+
+Runtime hierarchy uses child-first argument order. Graph mutation preserves local space unless `preserveWorld` is true:
 
 ```js
 engine.graph.attach('sword', 'player');
-engine.graph.detach('sword');
+engine.reparent('sword', 'vehicle', { preserveWorld: true });
+engine.graph.detach('sword', { preserveWorld: true });
+
+engine.graph.traverse(null, (id, { depth, parentId, path }) => {
+  inspect(id, depth, parentId, path);
+});
+
+engine.transform.setLocal('sword', { x: 24, rotation: 10 });
+engine.transform.setWorld('sword', { x: 500, y: 220 });
+const world = engine.transform.getWorldMatrix('sword');
 ```
+
+Use `getLocal/getLocalMatrix` for authored-relative state and `getWorldTransform/getWorldMatrix` for derived state. The matrix is authoritative because nested rotated non-uniform scales can produce world shear. Use `engine.destroyEntity(id, { childPolicy })` for safe Runtime deletion; do not call low-level `ecs.destroy` on a graph node.
 
 ## Component workflow
 
@@ -331,7 +352,7 @@ const unsubscribe = engine.events.on('engine:update', ({ dt, engine }) => {
 
 Do not run both a manual loop and `engine.start()` for the same Engine. That would update physics twice per rendered frame.
 
-`ecs.destroy(id)` does not clean Scene Graph relationships. Before destroying a runtime Entity, detach or reparent its children, detach the Entity, destroy its physics body, and then call `ecs.destroy(id)`.
+Use `engine.destroyEntity(id, { childPolicy: 'reject' | 'cascade' | 'reparent' | 'detach', preserveWorld })` for Runtime deletion so Graph nodes, ECS components, descendant policy, and Transform caches stay synchronized. Treat `ecs.destroy(id)` as a low-level component-store operation, not an Entity lifecycle API.
 
 ## Physics rules
 
@@ -369,7 +390,7 @@ Use `--commit --write` only when the user explicitly wants the simulated final t
 
 ### Custom Canvas
 
-Read `Transform.world` and `Renderable` for every visible Entity. `Transform.world` is `[a,b,c,d,e,f]` and can be passed directly to Canvas 2D `setTransform` when the canvas uses project coordinates.
+Read `Transform.world` and `Renderable` for every visible Entity. `Transform.world` is the authoritative derived `[a,b,c,d,e,f]` matrix and can be passed directly to Canvas 2D `setTransform` when the canvas uses project coordinates. Never render a nested Entity from its local `x/y/rotation/scale` alone.
 
 Skip Entities with the `Hidden` component. Keep loaded `Image`, `Texture`, and GPU resources in a renderer-owned cache keyed by `assetId` or `imageSrc`.
 
