@@ -74,6 +74,8 @@ Universal Project نسخهٔ `4` منبع Authoring است. سند پیش‌فر
 
 Componentهای document با profile `authoring` و در حالت strict اعتبارسنجی می‌شوند. `components.<canonical-or-alias>` بر محل legacy/تخت precedence دارد و اختلاف دو محل conflict است. componentها و فیلدهای ناشناختهٔ JSON را در read/merge/write حفظ کنید.
 
+Prefab Assetهای canonical در `document.prefabs` و Instanceهای expandشده داخل Scene قرار دارند. Frame bridge هر دو `prefabs` و آینهٔ قدیمی `prefab` را در autosave عبور می‌دهد؛ server همان invariantهای Asset/source/member/Override را پیش از افزایش revision اعتبارسنجی می‌کند. قرارداد کامل در [`PREFABS.md`](./PREFABS.md) است.
+
 ## Editor bridge و Autosave
 
 صفحهٔ `/projects/:projectId` محتوای `/api/editor/frame` را بارگذاری می‌کند. این route و `/api/editor/engine` عمومی‌اند. iframe عمداً `allow-same-origin` ندارد و با `sandbox="allow-scripts allow-downloads allow-modals"` اجرا می‌شود؛ بنابراین document داخل Frame یک origin مبهم (`null`) دارد و به storage یا DOM صفحهٔ والد دسترسی مستقیم ندارد. form، popup، top-level navigation و object/plugin نیز مجاز نیستند.

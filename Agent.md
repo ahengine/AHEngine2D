@@ -280,6 +280,21 @@ const world = engine.transform.getWorldMatrix('sword');
 
 Use `getLocal/getLocalMatrix` for authored-relative state and `getWorldTransform/getWorldMatrix` for derived state. The matrix is authoritative because nested rotated non-uniform scales can produce world shear. Use `engine.destroyEntity(id, { childPolicy })` for safe Runtime deletion; do not call low-level `ecs.destroy` on a graph node.
 
+## Prefab workflow
+
+Use the same inspect/Dry Run/hash precondition around every mutation:
+
+```powershell
+npm run ah2d -- prefab asset create --file game.ah2d.json --scene level-1 --entity crate --id crate-prefab --name Crate --dry-run --include-document --pretty
+npm run ah2d -- prefab instantiate --file game.ah2d.json --scene level-1 crate-prefab --id crate-2 --x 480 --y 240 --write --expect-sha256 <sha256>
+npm run ah2d -- prefab override set --file game.ah2d.json --scene level-1 crate-2 --path /color --value '"#ff8844"' --write --expect-sha256 <sha256>
+npm run ah2d -- prefab override inspect --file game.ah2d.json --scene level-1 crate-2 --all --pretty
+npm run ah2d -- prefab override revert --file game.ah2d.json --scene level-1 crate-2 --path /color --write --expect-sha256 <sha256>
+npm run ah2d -- prefab unpack --file game.ah2d.json --scene level-1 crate-2 --write --expect-sha256 <sha256>
+```
+
+Creating an Asset from a Scene root captures the full subtree and connects it as the first Instance unless explicitly disabled through the direct Engine API. Resolve the actual `instanceRootId` and generated member IDs from command output; do not predict generated IDs. Prefer the domain commands over raw `resource` mutation so revision, expanded members, Overrides, active-Scene mirror, validation, and unknown fields remain synchronized.
+
 ## Component workflow
 
 Inspect the registered contract before mutating a built-in component:
@@ -450,7 +465,13 @@ console.log(engine.runtime.backend); // phaserjs or editor-bridge
 
 - The built-in AnimationSystem advances `{ playing, time, duration, speed }`; the renderer maps time to frames.
 - Animation event dispatch, sprite-sheet slicing, interpolation, and hitbox tracks must be implemented by game code until the serialized asset contract is extended.
-- The current `prefab` output is an authoring workspace, not a complete variant/override system. Do not infer reusable prefab definitions that are absent from JSON.
+- Reusable Prefab definitions live in canonical top-level `prefabs`; the legacy `prefab` workspace is not authoritative. Read [`docs/PREFABS.md`](./docs/PREFABS.md) before changing this contract.
+- A connected Instance is an expanded Scene subtree. Every member must map one source Entity through canonical `components.PrefabInstance` fields `prefabId`, `sourceEntityId`, and `instanceRootId`; do not replace it with a renderer placeholder.
+- Keep one `prefabRevision` across every member of an expanded Instance. A stale Instance remains stale as a complete group until it is fully synchronized; never partially stamp its members to a newer Asset revision.
+- Root Transform and its external `parentId` are per-Instance placement. Asset synchronization must preserve them. Child Transform changes may be path-based Overrides.
+- Store Overrides as RFC 6901 Entity-relative pointers with explicit `add`, `replace`, or `remove` records. Never write identity, hierarchy, legacy `prefab`, or the `PrefabInstance` marker through an Override.
+- Use `engine.prefabs` at Runtime and `prefab ...` / `prefab.*` operations in the CLI. Apply updates the Asset revision and synchronizes only current Instances without a conflicting Override; stale Instance groups remain untouched. Revert restores the source; Unpack removes markers while preserving Scene data.
+- Structural Overrides and nested Prefab Assets are intentionally unsupported. Unpack before add/remove/reparent of connected members. Reject Asset deletion while Instances are connected unless an explicit unpack-instances policy was requested.
 - Current Particle JSON is emitter configuration. A runtime particle renderer must interpret it; live preview particles are not exported.
 - Do not invent missing fields during a read-only task. When a requested feature requires a schema extension, update validation, migration, Editor export/load, CLI, runtime consumption, tests, and docs together.
 

@@ -3,7 +3,8 @@
 const crypto = require('crypto');
 const {
   DATA_MODEL_ID, DATA_MODEL_VERSION, COMPONENT_SCHEMA_VERSION, PROFILE_NAMES,
-  ComponentSchemaError, EntityCodec, createDefaultComponentRegistry
+  ComponentSchemaError, EntityCodec, createDefaultComponentRegistry, applyJsonPointerOperation, applyPrefabOverrideOperation, validatePrefabDocument,
+  parseJsonPointer, prefabOverridePathAllowed, jsonPointerLookup, PREFAB_ASSET_SCHEMA
 } = require('../AH2DDataModel.js');
 
 const PROTOCOL = 'ah2d.cli/v1';
@@ -141,7 +142,7 @@ function createProject(options = {}) {
     scene: clone(objects),
     postProcess: createDefaultPostProcess(),
     assets: [], folders: ['Environment', 'Props', 'Characters', 'FX', 'UI', 'Prefabs', 'Animations'],
-    prefab: [], animations: [], particles: []
+    prefabs: [], animations: [], particles: []
   };
 }
 
@@ -177,7 +178,7 @@ function migrateDocument(input, options = {}) {
   document.meta = isObject(document.meta) ? document.meta : { name: 'AH2D Project', units: 'px' };
   document.assets = Array.isArray(document.assets) ? document.assets : [];
   document.folders = Array.isArray(document.folders) ? document.folders : [];
-  document.prefab = Array.isArray(document.prefab) ? document.prefab : [];
+  if (document.prefabs == null && document.prefab == null) document.prefabs = [];
   document.animations = Array.isArray(document.animations) ? document.animations : [];
   document.particles = Array.isArray(document.particles) ? document.particles : [];
   if (!isObject(document.postProcess)) { document.postProcess = createDefaultPostProcess(); migrated = true; }
@@ -345,8 +346,13 @@ function validateDocument(document, options = {}) {
       }
     }
   }
-  for (const key of ['assets', 'folders', 'prefab', 'animations', 'particles']) if (document[key] != null && !Array.isArray(document[key])) diagnostics.push(diagnostic('error', 'E_RESOURCE_ARRAY', `${key} must be an array`, `/${key}`));
+  validatePrefabContract(document, diagnostics, options);
+  for (const key of ['assets', 'folders', 'prefab', 'prefabs', 'animations', 'particles']) if (document[key] != null && !Array.isArray(document[key])) diagnostics.push(diagnostic('error', 'E_RESOURCE_ARRAY', `${key} must be an array`, `/${key}`));
   return diagnostics;
+}
+
+function validatePrefabContract(document, diagnostics, options = {}) {
+  diagnostics.push(...validatePrefabDocument(document, { entityCodec, strict: Boolean(options.strict) }));
 }
 
 function assertValid(document, options = {}) {
@@ -360,7 +366,14 @@ function remapObjects(objects) {
   const ids = new Map();
   for (const entity of objects) if (entity?.id) ids.set(entity.id, generateId('entity'));
   return objects.map(entity => {
-    const next = clone(entity);if (next.id) next.id = ids.get(next.id);if (next.parentId && ids.has(next.parentId)) next.parentId = ids.get(next.parentId);return next;
+    const next = clone(entity);
+    if (next.id) next.id = ids.get(next.id);
+    if (next.parentId && ids.has(next.parentId)) next.parentId = ids.get(next.parentId);
+    const marker = prefabMarker(next);
+    if (marker && ids.has(marker.value.instanceRootId)) {
+      attachPrefabMarker(next, { ...marker.value, instanceRootId: ids.get(marker.value.instanceRootId) });
+    }
+    return next;
   });
 }
 
@@ -621,6 +634,538 @@ function requireObjectPatch(patch, operation) {
   return patch;
 }
 
+function prefabStorage(document, create = false) {
+  if (Array.isArray(document.prefabs)) return { field: 'prefabs', list: document.prefabs };
+  if (document.prefabs != null) throw new DomainError('E_PREFABS_TYPE', 'prefabs must be an array', { exitCode: EXIT.VALIDATION, pointer: '/prefabs' });
+  if (!create) return { field: 'prefabs', list: [] };
+  document.prefabs = [];
+  return { field: 'prefabs', list: document.prefabs };
+}
+
+function prefabAssets(document) {
+  return prefabStorage(document).list;
+}
+
+function resolvePrefab(document, reference) {
+  const target = String(reference || '');
+  const prefab = prefabAssets(document).find(item => isObject(item) && String(item.id) === target);
+  if (!prefab) throw new DomainError('E_PREFAB_NOT_FOUND', `Prefab Asset not found: ${target}`, { exitCode: EXIT.NOT_FOUND, details: { reference: target } });
+  if (!Array.isArray(prefab.entities) || typeof prefab.rootEntityId !== 'string' || !prefab.rootEntityId) {
+    throw new DomainError('E_PREFAB_DEFINITION', `Prefab Asset is not a reusable definition: ${target}`, { exitCode: EXIT.VALIDATION, details: { prefabId: target } });
+  }
+  return prefab;
+}
+
+function prefabMarker(entity) {
+  const resolved = getComponent(entity, 'PrefabInstance');
+  if (!isObject(resolved.value)) return null;
+  const lifecycle = ['sourceEntityId', 'instanceRootId'].some(key => Object.prototype.hasOwnProperty.call(resolved.value, key) && resolved.value[key] != null);
+  return lifecycle ? { resolved, value: resolved.value } : null;
+}
+
+function prefabInstanceError(entity, marker, action, structural = false) {
+  const code = structural ? 'E_PREFAB_STRUCTURAL_EDIT' : 'E_PREFAB_INSTANCE_EDIT';
+  const message = structural
+    ? `Cannot ${action} while Entity ${entity.id} is connected to Prefab ${marker.value.prefabId}; unpack the instance first`
+    : `Cannot ${action} directly on connected Prefab Entity ${entity.id}; use prefab override set or unpack the instance first`;
+  return new DomainError(code, message, {
+    exitCode: EXIT.CONFLICT,
+    details: {
+      action,
+      entityId: entity.id,
+      prefabId: marker.value.prefabId,
+      instanceRootId: marker.value.instanceRootId,
+      sourceEntityId: marker.value.sourceEntityId
+    }
+  });
+}
+
+function assertOrdinaryPrefabEntity(entity, action, structural = false) {
+  const marker = prefabMarker(entity);
+  if (marker) throw prefabInstanceError(entity, marker, action, structural);
+  return entity;
+}
+
+function assertNoConnectedPrefabMembers(entities, action) {
+  for (const entity of entities) assertOrdinaryPrefabEntity(entity, action, true);
+}
+
+function assertPrefabPropertyMutation(entity, path, action) {
+  const marker = prefabMarker(entity);
+  if (!marker) return;
+  let rootPlacement = false;
+  if (String(entity.id) === String(marker.value.instanceRootId)) {
+    try { rootPlacement = isRootPlacementPath({ ...marker.value, instanceEntityId: entity.id }, normalizeOverridePath(path)); }
+    catch (_) { rootPlacement = false; }
+  }
+  if (!rootPlacement) throw prefabInstanceError(entity, marker, action, false);
+}
+
+function assertPrefabComponentMutation(entity, type, action) {
+  const marker = prefabMarker(entity);
+  if (!marker) return;
+  const rootPlacement = String(entity.id) === String(marker.value.instanceRootId) && type === 'Transform';
+  if (!rootPlacement) throw prefabInstanceError(entity, marker, action, false);
+}
+
+function stripPrefabMarker(entity) {
+  removeComponent(entity, 'PrefabInstance', { allLocations: true });
+  if (entity.prefab === false) delete entity.prefab;
+  return entity;
+}
+
+function capturePrefabAsset(scene, root, options = {}) {
+  const index = buildSceneIndex(scene);
+  const included = new Set([root.id, ...descendants(scene, root.id, index)]);
+  const entities = scene.objects.filter(entity => included.has(entity.id)).map(entity => clone(entity));
+  const capturedRoot = entities.find(entity => entity.id === root.id);
+  if (capturedRoot) {
+    delete capturedRoot.parentId;
+    writeLocalTransform(capturedRoot, { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 });
+  }
+  const timestamp = now();
+  return {
+    ...(isObject(options.base) ? clone(options.base) : {}),
+    id: String(options.id || options.base?.id || generateId('prefab')),
+    name: String(options.name || options.base?.name || entityName(root) || 'Prefab'),
+    rootEntityId: String(root.id),
+    entities,
+    revision: Number.isInteger(options.revision) ? options.revision : (Number.isInteger(options.base?.revision) ? options.base.revision : 1),
+    ...(options.base?.createdAt ? {} : { createdAt: timestamp }),
+    updatedAt: timestamp
+  };
+}
+
+function normalizePrefabAssetRoot(asset) {
+  if (!isObject(asset) || !Array.isArray(asset.entities) || typeof asset.rootEntityId !== 'string') return asset;
+  const root = asset.entities.find(entity => isObject(entity) && String(entity.id) === String(asset.rootEntityId));
+  if (!root) return asset;
+  delete root.parentId;
+  writeLocalTransform(root, { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 });
+  return asset;
+}
+
+function normalizeOverridePath(path) {
+  const source = String(path || '');
+  const segments = source.startsWith('/') ? componentCall(() => parseJsonPointer(source)) : pathSegments(source);
+  if (!segments.length) throw new DomainError('E_PREFAB_OVERRIDE_PATH', 'Prefab override path cannot target the complete Entity', { exitCode: EXIT.USAGE });
+  const canonical = '/' + segments.map(escapePointer).join('/');
+  if (!prefabOverridePathAllowed(canonical)) {
+    throw new DomainError('E_PREFAB_OVERRIDE_PATH', `Prefab override cannot change identity, hierarchy, or its PrefabInstance marker: ${source}`, { exitCode: EXIT.CONFLICT });
+  }
+  return canonical;
+}
+
+function overrideSegments(path) {
+  return decodePointer(normalizeOverridePath(path));
+}
+
+function readRelative(target, path) {
+  let cursor = target;
+  for (const segment of overrideSegments(path)) {
+    if ((cursor == null || (typeof cursor !== 'object')) || !Object.prototype.hasOwnProperty.call(cursor, segment)) return { exists: false, value: undefined };
+    cursor = cursor[segment];
+  }
+  return { exists: true, value: clone(cursor) };
+}
+
+function normalizeOverrideRecord(record, sourceExists = true) {
+  if (isObject(record) && ['add', 'replace', 'remove'].includes(record.op)) {
+    if (record.op === 'remove') return { op: 'remove' };
+    if (!Object.prototype.hasOwnProperty.call(record, 'value')) throw new DomainError('E_PREFAB_OVERRIDE_RECORD', `Prefab ${record.op} override requires value`, { exitCode: EXIT.VALIDATION });
+    return { op: record.op, value: clone(record.value) };
+  }
+  if (isObject(record) && record.op === 'set' && Object.prototype.hasOwnProperty.call(record, 'value')) {
+    return { op: sourceExists ? 'replace' : 'add', value: clone(record.value) };
+  }
+  return { op: sourceExists ? 'replace' : 'add', value: clone(record) };
+}
+
+function overridePathOwns(owner, nested) {
+  return owner === nested || nested.startsWith(`${owner}/`);
+}
+
+function clearOverlappingOverrides(overrides, path) {
+  const next = isObject(overrides) ? clone(overrides) : {};
+  for (const existing of Object.keys(next)) if (overridePathOwns(existing, path) || overridePathOwns(path, existing)) delete next[existing];
+  return next;
+}
+
+function rebaseOverrideRecord(source, target, path, prior = {}) {
+  const sourceState = readRelative(source, path), targetState = readRelative(target, path);
+  if ((!sourceState.exists && !targetState.exists) || (sourceState.exists && targetState.exists && equal(sourceState.value, targetState.value))) return null;
+  if (!targetState.exists) {
+    const record = { ...(isObject(prior) ? clone(prior) : {}), op: 'remove' };
+    delete record.value;
+    return record;
+  }
+  return {
+    ...(isObject(prior) ? clone(prior) : {}),
+    op: sourceState.exists ? 'replace' : 'add',
+    value: clone(targetState.value)
+  };
+}
+
+function applyOverrideRecord(target, path, record, sourceExists = true) {
+  const normalized = normalizeOverrideRecord(record, sourceExists);
+  componentCall(() => applyPrefabOverrideOperation(target, normalizeOverridePath(path), normalized));
+  return normalized;
+}
+
+function writeRelativeState(target, path, state) {
+  const current = readRelative(target, path);
+  if (!state.exists) {
+    if (current.exists) componentCall(() => applyJsonPointerOperation(target, normalizeOverridePath(path), { op: 'remove' }));
+    return target;
+  }
+  componentCall(() => applyJsonPointerOperation(target, normalizeOverridePath(path), { op: current.exists ? 'replace' : 'add', value: state.value }));
+  return target;
+}
+
+function revertOverrideRecord(source, target, path, record) {
+  const sourceState = readRelative(source, path), targetState = readRelative(target, path);
+  const operation = normalizeOverrideRecord(record, sourceState.exists);
+  if (operation.op === 'add') {
+    if (targetState.exists) componentCall(() => applyJsonPointerOperation(target, normalizeOverridePath(path), { op: 'remove' }));
+    return operation;
+  }
+  if (!sourceState.exists) {
+    if (targetState.exists) componentCall(() => applyJsonPointerOperation(target, normalizeOverridePath(path), { op: 'remove' }));
+    return operation;
+  }
+  componentCall(() => applyJsonPointerOperation(target, normalizeOverridePath(path), {
+    op: operation.op === 'remove' ? 'add' : (targetState.exists ? 'replace' : 'add'),
+    value: sourceState.value
+  }));
+  return operation;
+}
+
+function isRootPlacementPath(marker, path) {
+  if (String(marker.instanceRootId) === '' || String(marker.instanceRootId) !== String(marker.instanceEntityId || '')) return false;
+  const segments = overrideSegments(path);
+  const first = String(segments[0] || '').toLowerCase();
+  return ['x', 'y', 'rot', 'rotation', 'sx', 'sy', 'scalex', 'scaley'].includes(first)
+    || first === 'transform'
+    || (first === 'components' && String(segments[1] || '').toLowerCase() === 'transform');
+}
+
+function instanceGroups(document, prefabId = null) {
+  const groups = [];
+  for (const scene of document.scenes || []) {
+    const byRoot = new Map();
+    for (const entity of scene.objects || []) {
+      const marker = prefabMarker(entity);
+      if (!marker || (prefabId != null && String(marker.value.prefabId) !== String(prefabId))) continue;
+      const rootId = String(marker.value.instanceRootId || '');
+      if (!rootId) continue;
+      const key = `${marker.value.prefabId}\u0000${rootId}`;
+      if (!byRoot.has(key)) byRoot.set(key, { scene, prefabId: String(marker.value.prefabId), rootId, members: [] });
+      byRoot.get(key).members.push({ entity, marker });
+    }
+    groups.push(...byRoot.values());
+  }
+  return groups;
+}
+
+function instanceGroupForEntity(document, scene, entity) {
+  const marker = prefabMarker(entity);
+  if (!marker) throw new DomainError('E_PREFAB_INSTANCE', `Entity is not a connected Prefab Instance: ${entity.id}`, { exitCode: EXIT.CONFLICT, details: { sceneId: scene.id, entityId: entity.id } });
+  const group = instanceGroups(document, marker.value.prefabId).find(item => item.scene.id === scene.id && item.rootId === String(marker.value.instanceRootId));
+  if (!group) throw new DomainError('E_PREFAB_INSTANCE', `Prefab Instance group is incomplete: ${marker.value.instanceRootId}`, { exitCode: EXIT.CONFLICT });
+  return { marker, group, prefab: resolvePrefab(document, marker.value.prefabId) };
+}
+
+function nextEntityId(used, preferred = null) {
+  if (preferred != null) {
+    const id = String(preferred);
+    if (!id) throw new DomainError('E_ENTITY_ID', 'Instance root Entity ID must be non-empty', { exitCode: EXIT.USAGE });
+    if (used.has(id)) throw new DomainError('E_ENTITY_EXISTS', `Entity already exists: ${id}`, { exitCode: EXIT.CONFLICT });
+    used.add(id);
+    return id;
+  }
+  let id;
+  do { id = generateId('entity'); } while (used.has(id));
+  used.add(id);
+  return id;
+}
+
+function attachPrefabMarker(entity, value) {
+  const resolved = getComponent(entity, 'PrefabInstance'), current = isObject(resolved.value) ? resolved.value : null;
+  putComponent(entity, 'PrefabInstance', { ...(isObject(current) ? clone(current) : {}), ...clone(value) });
+}
+
+function instantiatePrefab(document, scene, prefab, operation = {}) {
+  const source = Array.isArray(prefab.entities) ? prefab.entities : [];
+  const sourceRoot = source.find(entity => entity?.id === prefab.rootEntityId);
+  if (!sourceRoot) throw new DomainError('E_PREFAB_ROOT', `Prefab root Entity does not exist: ${prefab.rootEntityId}`, { exitCode: EXIT.VALIDATION });
+  const used = new Set(scene.objects.map(entity => String(entity?.id)));
+  const ids = new Map();
+  ids.set(sourceRoot.id, nextEntityId(used, operation.rootId || operation.id));
+  for (const entity of source) if (entity !== sourceRoot) ids.set(entity.id, nextEntityId(used));
+  const parentId = operation.parentId == null || operation.parentId === '' ? null : String(operation.parentId);
+  if (parentId) assertOrdinaryPrefabEntity(resolveEntity(scene, parentId), 'instantiate a Prefab as a child of a connected instance', true);
+  const instanceRootId = ids.get(sourceRoot.id);
+  const entities = source.map(sourceEntity => {
+    const sourceMarker = getComponent(sourceEntity, 'PrefabInstance');
+    const entity = stripPrefabMarker(clone(sourceEntity));
+    entity.id = ids.get(sourceEntity.id);
+    if (sourceEntity.id === sourceRoot.id) {
+      if (parentId) entity.parentId = parentId; else delete entity.parentId;
+      if (operation.x != null || operation.y != null) {
+        const transform = localTransformOf(entity);
+        writeLocalTransform(entity, { ...transform, x: operation.x == null ? transform.x : Number(operation.x), y: operation.y == null ? transform.y : Number(operation.y) });
+      }
+    } else if (sourceEntity.parentId && ids.has(sourceEntity.parentId)) entity.parentId = ids.get(sourceEntity.parentId);
+    attachPrefabMarker(entity, {
+      ...(isObject(sourceMarker.value) ? clone(sourceMarker.value) : {}),
+      prefabId: prefab.id, sourceEntityId: sourceEntity.id, instanceRootId, prefabRevision: Number.isInteger(prefab.revision) ? prefab.revision : 0, overrides: {}
+    });
+    return entity;
+  });
+  scene.objects.push(...entities);
+  return { sceneId: scene.id, prefabId: prefab.id, entityId: instanceRootId, entityIds: entities.map(entity => entity.id), idMap: Object.fromEntries(ids) };
+}
+
+function preserveRootPlacement(source, current) {
+  const sourceCandidates = componentCall(() => entityCodec.resolve(source, 'Transform', { clone: true })).candidates.filter(candidate => candidate.explicit);
+  const placementCandidates = componentCall(() => entityCodec.resolve(current, 'Transform', { clone: true })).candidates.filter(candidate => candidate.explicit);
+
+  for (const candidate of sourceCandidates) {
+    const provenance = candidate.provenance;
+    if (provenance?.startsWith('components.')) {
+      if (isObject(source.components)) delete source.components[provenance.slice('components.'.length)];
+    } else if (provenance === 'transform') delete source.transform;
+    else if (provenance === 'flat-transform') {
+      for (const key of ['x', 'y', 'rot', 'rotation', 'sx', 'sy', 'scaleX', 'scaleY']) delete source[key];
+    }
+  }
+
+  for (const candidate of placementCandidates) {
+    if (candidate.provenance === 'flat-transform') {
+      // The codec identifies this authored location, while copying the raw
+      // aliases retains whether the document used rot/sx/sy or their long
+      // spellings when several Transform locations coexist.
+      for (const key of ['x', 'y', 'rot', 'rotation', 'sx', 'sy', 'scaleX', 'scaleY']) {
+        if (Object.prototype.hasOwnProperty.call(current, key)) source[key] = clone(current[key]);
+      }
+      continue;
+    }
+    componentCall(() => entityCodec.write(source, 'Transform', candidate.value, {
+      storage: 'preserve', provenance: candidate.provenance, profile: 'authoring', mode: 'compat'
+    }));
+  }
+
+  if (isObject(source.components) && !Object.keys(source.components).length) delete source.components;
+}
+
+function syncPrefabInstances(document, prefab, options = {}) {
+  const previousRevision = Number.isInteger(options.previousRevision) ? options.previousRevision : null;
+  let instanceCount = 0, staleInstanceCount = 0, created = 0, removed = 0;
+  for (const group of instanceGroups(document, prefab.id)) {
+    if (previousRevision != null && !group.members.every(member => member.marker.value.prefabRevision === previousRevision)) {
+      staleInstanceCount += 1;
+      continue;
+    }
+    const scene = group.scene, currentObjects = scene.objects;
+    const currentBySource = new Map(group.members.map(member => [String(member.marker.value.sourceEntityId), member]));
+    const rootMember = group.members.find(member => member.entity.id === group.rootId);
+    if (!rootMember) throw new DomainError('E_PREFAB_INSTANCE_ROOT', `Prefab Instance root does not exist: ${group.rootId}`, { exitCode: EXIT.CONFLICT });
+    const used = new Set(currentObjects.filter(entity => !group.members.some(member => member.entity.id === entity.id)).map(entity => String(entity.id)));
+    const ids = new Map();
+    ids.set(prefab.rootEntityId, group.rootId);used.add(group.rootId);
+    for (const sourceEntity of prefab.entities) {
+      if (sourceEntity.id === prefab.rootEntityId) continue;
+      const existing = currentBySource.get(String(sourceEntity.id));
+      ids.set(sourceEntity.id, existing ? existing.entity.id : nextEntityId(used));
+      if (!existing) created += 1;
+    }
+    const rebuilt = prefab.entities.map(sourceEntity => {
+      const existing = sourceEntity.id === prefab.rootEntityId ? rootMember : currentBySource.get(String(sourceEntity.id));
+      const sourceMarker = getComponent(sourceEntity, 'PrefabInstance');
+      const entity = stripPrefabMarker(clone(sourceEntity));
+      entity.id = ids.get(sourceEntity.id);
+      if (sourceEntity.id === prefab.rootEntityId) {
+        if (rootMember.entity.parentId) entity.parentId = rootMember.entity.parentId; else delete entity.parentId;
+        preserveRootPlacement(entity, rootMember.entity);
+      } else if (sourceEntity.parentId && ids.has(sourceEntity.parentId)) entity.parentId = ids.get(sourceEntity.parentId);
+      const previousOverrides = isObject(existing?.marker.value.overrides) ? existing.marker.value.overrides : {};
+      const overrides = {};
+      for (const [path, record] of Object.entries(previousOverrides)) {
+        const effective = readRelative(existing.entity, path);
+        try { writeRelativeState(entity, path, effective); }
+        catch (error) {
+          throw new DomainError('E_PREFAB_OVERRIDE_REBASE', `Cannot preserve Prefab override ${path} while rebuilding Asset ${prefab.id}`, {
+            exitCode: EXIT.CONFLICT,
+            details: { prefabId: prefab.id, instanceRootId: group.rootId, entityId: existing.entity.id, sourceEntityId: sourceEntity.id, path, cause: error.code || error.message }
+          });
+        }
+        const rebased = rebaseOverrideRecord(sourceEntity, entity, path, record);
+        if (rebased) overrides[path] = rebased;
+      }
+      attachPrefabMarker(entity, {
+        ...(isObject(sourceMarker.value) ? clone(sourceMarker.value) : {}),
+        ...(isObject(existing?.marker.value) ? clone(existing.marker.value) : {}),
+        prefabId: prefab.id, sourceEntityId: sourceEntity.id, instanceRootId: group.rootId, prefabRevision: Number.isInteger(prefab.revision) ? prefab.revision : 0, overrides
+      });
+      return entity;
+    });
+    const groupIds = new Set(group.members.map(member => member.entity.id));
+    const rebuiltIds = new Set(rebuilt.map(entity => entity.id));
+    const deletedIds = new Set([...groupIds].filter(id => !rebuiltIds.has(id)));
+    removed += deletedIds.size;
+    for (const entity of currentObjects) if (!groupIds.has(entity.id) && deletedIds.has(entity.parentId)) entity.parentId = group.rootId;
+    const insertion = Math.min(...group.members.map(member => currentObjects.indexOf(member.entity)).filter(index => index >= 0));
+    const retained = currentObjects.filter(entity => !groupIds.has(entity.id));
+    retained.splice(Math.min(insertion, retained.length), 0, ...rebuilt);
+    scene.objects = retained;
+    instanceCount += 1;
+  }
+  return { instanceCount, staleInstanceCount, createdEntityCount: created, removedEntityCount: removed };
+}
+
+function sourceEntityForMarker(prefab, marker) {
+  const source = prefab.entities.find(entity => String(entity?.id) === String(marker.sourceEntityId));
+  if (!source) throw new DomainError('E_PREFAB_SOURCE_ENTITY', `Prefab source Entity does not exist: ${marker.sourceEntityId}`, { exitCode: EXIT.CONFLICT, details: { prefabId: prefab.id, sourceEntityId: marker.sourceEntityId } });
+  return source;
+}
+
+function overrideEntries(document, scene, entity, all = false) {
+  const context = instanceGroupForEntity(document, scene, entity);
+  const members = all ? context.group.members : [context.group.members.find(member => member.entity.id === entity.id)];
+  const entries = [];
+  for (const member of members.filter(Boolean)) {
+    const source = sourceEntityForMarker(context.prefab, member.marker.value);
+    const overrides = isObject(member.marker.value.overrides) ? member.marker.value.overrides : {};
+    for (const [path, stored] of Object.entries(overrides)) {
+      const sourceState = readRelative(source, path), currentState = readRelative(member.entity, path);
+      entries.push({
+        entityId: member.entity.id, sourceEntityId: source.id, path: normalizeOverridePath(path),
+        source: { exists: sourceState.exists, ...(sourceState.exists ? { value: sourceState.value } : {}) },
+        current: { exists: currentState.exists, ...(currentState.exists ? { value: currentState.value } : {}) },
+        override: normalizeOverrideRecord(stored, sourceState.exists)
+      });
+    }
+  }
+  return { context, entries };
+}
+
+function inspectPrefabOverrides(document, scene, entity, options = {}) {
+  const { context, entries } = overrideEntries(document, scene, entity, Boolean(options.all));
+  return { sceneId: scene.id, prefabId: context.prefab.id, instanceRootId: context.group.rootId, entityId: entity.id, overrides: entries };
+}
+
+function pointerFromSegments(segments) {
+  return '/' + segments.map(escapePointer).join('/');
+}
+
+function syncArrayMutation(source, target, path, overrides, operation) {
+  if (!['add', 'remove'].includes(operation.op)) return null;
+  const segments = componentCall(() => parseJsonPointer(path));
+  const rawIndex = segments.at(-1);
+  if (!/^(0|[1-9]\d*)$/.test(rawIndex || '')) return null;
+  const parentSegments = segments.slice(0, -1);
+  const parentPath = parentSegments.length ? pointerFromSegments(parentSegments) : '';
+  const sourceParent = componentCall(() => jsonPointerLookup(source, parentPath, { allowRoot: true }));
+  const targetParent = componentCall(() => jsonPointerLookup(target, parentPath, { allowRoot: true }));
+  if (!sourceParent.found || !targetParent.found || !Array.isArray(sourceParent.value) || !Array.isArray(targetParent.value)) return null;
+
+  const index = Number(rawIndex);
+  const next = isObject(overrides) ? clone(overrides) : {};
+  const entries = Object.keys(next).map(existing => {
+    let parts;
+    try { parts = parseJsonPointer(existing); }
+    catch (_) { return null; }
+    if (parts.length <= parentSegments.length ||
+        parentSegments.some((segment, position) => parts[position] !== segment) ||
+        !/^(0|[1-9]\d*)$/.test(parts[parentSegments.length])) return null;
+    return { path: existing, parts, index: Number(parts[parentSegments.length]), record: next[existing] };
+  }).filter(Boolean);
+  const ancestorOwner = Object.keys(next)
+    .filter(existing => existing !== path && path.startsWith(`${existing}/`))
+    .sort((left, right) => right.length - left.length)[0];
+  if (ancestorOwner) {
+    const rebased = rebaseOverrideRecord(source, target, ancestorOwner, next[ancestorOwner]);
+    if (rebased) next[ancestorOwner] = rebased;
+    else delete next[ancestorOwner];
+    return next;
+  }
+
+  if (operation.op === 'remove' && entries.some(entry => entry.index === index)) {
+    const prior = entries.find(entry => entry.index === index)?.record || {};
+    for (const entry of entries) delete next[entry.path];
+    const promoted = rebaseOverrideRecord(source, target, parentPath, prior);
+    if (promoted) next[parentPath] = promoted;
+    return next;
+  }
+
+  applyOverrideRecord(target, path, operation, readRelative(source, path).exists);
+  for (const entry of entries) {
+    if (operation.op === 'remove' && entry.index <= index) continue;
+    if (operation.op === 'add' && entry.index < index) continue;
+    delete next[entry.path];
+    const shiftedParts = entry.parts.slice();
+    shiftedParts[parentSegments.length] = String(entry.index + (operation.op === 'add' ? 1 : -1));
+    const shiftedPath = pointerFromSegments(shiftedParts);
+    const rebased = rebaseOverrideRecord(source, target, shiftedPath, entry.record);
+    if (rebased) next[shiftedPath] = rebased;
+  }
+  return next;
+}
+
+function syncPathPreservingOverrides(source, target, path, overrides, operation) {
+  const next = isObject(overrides) ? clone(overrides) : {}, paths = Object.keys(next);
+  const arrayResult = syncArrayMutation(source, target, path, next, operation);
+  if (arrayResult) return arrayResult;
+  const owner = paths
+    .filter(existing => existing === path || path.startsWith(`${existing}/`))
+    .sort((left, right) => right.length - left.length)[0];
+  if (owner) {
+    const rebased = rebaseOverrideRecord(source, target, owner, next[owner]);
+    if (rebased) next[owner] = rebased;
+    else delete next[owner];
+    return next;
+  }
+  const branchBefore = readRelative(target, path);
+  const descendants = paths.filter(existing => overridePathOwns(path, existing) && existing !== path).map(existing => ({ path: existing, effective: readRelative(target, existing) }));
+  applyOverrideRecord(target, path, operation, readRelative(source, path).exists);
+  for (const descendant of descendants) {
+    try { writeRelativeState(target, descendant.path, descendant.effective); }
+    catch (error) {
+      if (!branchBefore.exists) throw error;
+      writeRelativeState(target, path, branchBefore);
+      const prior = next[descendant.path];
+      for (const existing of Object.keys(next)) {
+        if (existing === path || existing.startsWith(`${path}/`)) delete next[existing];
+      }
+      const promoted = rebaseOverrideRecord(source, target, path, prior);
+      if (promoted) next[path] = promoted;
+      return next;
+    }
+    const sourceState = readRelative(source, descendant.path);
+    if (!descendant.effective.exists && !sourceState.exists) delete next[descendant.path];
+    else next[descendant.path] = descendant.effective.exists
+      ? { ...next[descendant.path], op: sourceState.exists ? 'replace' : 'add', value: clone(descendant.effective.value) }
+      : { ...next[descendant.path], op: 'remove' };
+  }
+  return next;
+}
+
+function syncPrefabPath(document, prefab, sourceEntity, path, operation, applying = null, previousRevision = null) {
+  let synced = 0;
+  for (const group of instanceGroups(document, prefab.id)) {
+    if (previousRevision != null && !group.members.every(member => member.marker.value.prefabRevision === previousRevision)) continue;
+    for (const member of group.members) {
+      if (String(member.marker.value.sourceEntityId) !== String(sourceEntity.id)) continue;
+      if (applying && String(group.scene.id) === String(applying.sceneId) && String(group.rootId) === String(applying.instanceRootId) && String(member.entity.id) === String(applying.entityId)) continue;
+      if (member.entity.id === group.rootId && isRootPlacementPath({ ...member.marker.value, instanceEntityId: member.entity.id }, path)) continue;
+      const overrides = syncPathPreservingOverrides(sourceEntity, member.entity, path, member.marker.value.overrides, operation);
+      attachPrefabMarker(member.entity, { ...member.marker.value, overrides });
+      synced += 1;
+    }
+  }
+  return synced;
+}
+
 function operationScene(document, operation) {
   return resolveScene(document, operation.sceneId || operation.scene || operation.sceneName || null, { allowName: operation.sceneName != null });
 }
@@ -649,24 +1194,197 @@ function applyOperationMutable(document, operation) {
     else if (document.currentSceneId === scene.id) document.currentSceneId = document.scenes[Math.min(index, document.scenes.length - 1)].id;
     return { sceneId: scene.id, deleted: true, currentSceneId: document.currentSceneId };
   }
+  if (op.startsWith('prefab.')) {
+    if (op === 'prefab.asset.create') {
+      const storage = prefabStorage(document, true), id = String(operation.prefabId || operation.id || generateId('prefab'));
+      if (!id) throw new DomainError('E_PREFAB_ID', 'Prefab Asset id is required', { exitCode: EXIT.USAGE });
+      if (storage.list.some(item => isObject(item) && String(item.id) === id)) throw new DomainError('E_PREFAB_EXISTS', `Prefab Asset already exists: ${id}`, { exitCode: EXIT.CONFLICT });
+      let asset, sourceScene = null, sourceRoot = null;
+      if (operation.value !== undefined) {
+        if (!isObject(operation.value)) throw new DomainError('E_PREFAB_VALUE', 'Prefab Asset value must be a JSON object', { exitCode: EXIT.USAGE });
+        asset = { ...clone(operation.value), id, name: String(operation.name || operation.value.name || 'Prefab'), revision: Number.isInteger(operation.value.revision) ? operation.value.revision : 1 };
+      } else {
+        sourceScene = operationScene(document, operation);
+        sourceRoot = resolveEntity(sourceScene, operation.entityId || operation.entity || operation.entityName, { allowName: operation.entityName != null });
+        const sourceIds = new Set([sourceRoot.id, ...descendants(sourceScene, sourceRoot.id)]);
+        for (const entity of sourceScene.objects.filter(item => sourceIds.has(item.id))) {
+          if (prefabMarker(entity)) throw new DomainError('E_PREFAB_NESTED_INSTANCE', `Connected Prefab Instance must be unpacked before creating an Asset from it: ${entity.id}`, { exitCode: EXIT.CONFLICT, details: { entityId: entity.id } });
+        }
+        asset = capturePrefabAsset(sourceScene, sourceRoot, { id, name: operation.name });
+      }
+      normalizePrefabAssetRoot(asset);
+      storage.list.push(asset);
+      if (sourceScene && sourceRoot) {
+        const sourceIds = new Set(asset.entities.map(entity => entity.id));
+        for (const entity of sourceScene.objects.filter(item => sourceIds.has(item.id))) {
+          attachPrefabMarker(entity, { prefabId: asset.id, sourceEntityId: entity.id, instanceRootId: sourceRoot.id, prefabRevision: asset.revision, overrides: {} });
+        }
+      }
+      return { prefabId: asset.id, name: asset.name, rootEntityId: asset.rootEntityId, entityCount: asset.entities?.length || 0, sourceSceneId: sourceScene?.id || null, sourceEntityId: sourceRoot?.id || null };
+    }
+    if (op === 'prefab.asset.update') {
+      const storage = prefabStorage(document), current = resolvePrefab(document, operation.prefabId || operation.id), index = storage.list.indexOf(current);
+      const previousRevision = Number.isInteger(current.revision) ? current.revision : 0;
+      let asset;
+      if (operation.patch !== undefined) {
+        asset = mergePatch(current, requireObjectPatch(operation.patch, op));
+        asset.id = current.id;
+        asset.revision = (Number.isInteger(current.revision) ? current.revision : 0) + 1;
+        asset.updatedAt = now();
+      } else {
+        const scene = operationScene(document, operation), root = resolveEntity(scene, operation.entityId || operation.entity || operation.entityName, { allowName: operation.entityName != null });
+        const index = buildSceneIndex(scene), capturedIds = new Set([root.id, ...descendants(scene, root.id, index)]);
+        const connected = scene.objects.find(entity => capturedIds.has(entity.id) && prefabMarker(entity));
+        if (connected) throw new DomainError('E_PREFAB_UPDATE_SOURCE_INSTANCE', 'Recapture Prefab Asset from an ordinary Scene subtree; use override apply for a connected instance', { exitCode: EXIT.CONFLICT, details: { sceneId: scene.id, entityId: connected.id, rootEntityId: root.id, prefabId: current.id } });
+        asset = capturePrefabAsset(scene, root, { base: current, id: current.id, name: operation.name || current.name, revision: (Number.isInteger(current.revision) ? current.revision : 0) + 1 });
+      }
+      if (operation.name != null) asset.name = String(operation.name);
+      normalizePrefabAssetRoot(asset);
+      if (!Array.isArray(asset.entities) || typeof asset.rootEntityId !== 'string' || !asset.entities.some(entity => entity?.id === asset.rootEntityId)) {
+        throw new DomainError('E_PREFAB_DEFINITION', `Updated Prefab Asset is missing a valid root/entities definition: ${current.id}`, { exitCode: EXIT.VALIDATION });
+      }
+      storage.list[index] = asset;
+      const synchronized = syncPrefabInstances(document, asset, { previousRevision });
+      return { prefabId: asset.id, name: asset.name, rootEntityId: asset.rootEntityId, entityCount: asset.entities.length, synchronized };
+    }
+    if (op === 'prefab.asset.delete') {
+      const storage = prefabStorage(document), prefab = resolvePrefab(document, operation.prefabId || operation.id), groups = instanceGroups(document, prefab.id);
+      if (groups.length && !operation.unpackInstances) {
+        throw new DomainError('E_PREFAB_IN_USE', `Prefab Asset has ${groups.length} connected instance${groups.length === 1 ? '' : 's'}; use --unpack-instances to keep their Entities`, { exitCode: EXIT.CONFLICT, details: { prefabId: prefab.id, instanceRootIds: groups.map(group => group.rootId) } });
+      }
+      let unpackedEntityCount = 0;
+      for (const group of groups) for (const member of group.members) { stripPrefabMarker(member.entity);unpackedEntityCount += 1; }
+      storage.list.splice(storage.list.indexOf(prefab), 1);
+      return { prefabId: prefab.id, deleted: true, unpackedInstanceCount: groups.length, unpackedEntityCount };
+    }
+    if (op === 'prefab.instantiate') {
+      const scene = operationScene(document, operation), prefab = resolvePrefab(document, operation.prefabId || operation.id);
+      return instantiatePrefab(document, scene, prefab, operation);
+    }
+    if (op === 'prefab.override.set') {
+      const scene = operationScene(document, operation), entity = resolveEntity(scene, operation.entityId || operation.entity || operation.entityName, { allowName: operation.entityName != null });
+      const { marker, prefab } = instanceGroupForEntity(document, scene, entity), source = sourceEntityForMarker(prefab, marker.value), path = normalizeOverridePath(operation.path);
+      if (entity.id === marker.value.instanceRootId && isRootPlacementPath({ ...marker.value, instanceEntityId: entity.id }, path)) {
+        throw new DomainError('E_PREFAB_PLACEMENT_PATH', 'Prefab Instance root Transform is placement state; edit it with entity/component commands instead of an override', { exitCode: EXIT.CONFLICT, details: { entityId: entity.id, path } });
+      }
+      const sourceState = readRelative(source, path), currentOverrides = isObject(marker.value.overrides) ? marker.value.overrides : {};
+      const ownerPath = Object.keys(currentOverrides).find(existing => existing !== path && overridePathOwns(existing, path)) || null;
+      const ownerRecord = ownerPath ? currentOverrides[ownerPath] : null;
+      const exactRecord = isObject(currentOverrides[path]) ? currentOverrides[path] : {};
+      const overrides = clearOverlappingOverrides(currentOverrides, path);
+      let record;
+      if (operation.remove === true) {
+        writeRelativeState(entity, path, { exists: false });
+        if (ownerPath) {
+          record = rebaseOverrideRecord(source, entity, ownerPath, ownerRecord);
+          if (record) overrides[ownerPath] = record;
+          attachPrefabMarker(entity, { ...marker.value, overrides });
+          return { sceneId: scene.id, prefabId: prefab.id, instanceRootId: marker.value.instanceRootId, entityId: entity.id, sourceEntityId: source.id, path, storedPath: ownerPath, override: record, reverted: record == null };
+        }
+        if (!sourceState.exists) {
+          attachPrefabMarker(entity, { ...marker.value, overrides });
+          return { sceneId: scene.id, prefabId: prefab.id, instanceRootId: marker.value.instanceRootId, entityId: entity.id, sourceEntityId: source.id, path, override: null, reverted: true };
+        }
+        record = { ...clone(exactRecord), op: 'remove' };
+        delete record.value;
+      }
+      else {
+        if (operation.value === undefined) throw new DomainError('E_PREFAB_OVERRIDE_VALUE', 'prefab override set requires --value or --remove', { exitCode: EXIT.USAGE });
+        if (ownerPath && !readRelative(entity, ownerPath).exists) {
+          const ownerSource = readRelative(source, ownerPath);
+          if (ownerSource.exists) writeRelativeState(entity, ownerPath, ownerSource);
+        }
+        record = { ...clone(exactRecord), op: sourceState.exists ? 'replace' : 'add', value: clone(operation.value) };
+        writeRelativeState(entity, path, { exists: true, value: operation.value });
+        if (ownerPath) {
+          record = rebaseOverrideRecord(source, entity, ownerPath, ownerRecord);
+          if (record) overrides[ownerPath] = record;
+          attachPrefabMarker(entity, { ...marker.value, overrides });
+          return { sceneId: scene.id, prefabId: prefab.id, instanceRootId: marker.value.instanceRootId, entityId: entity.id, sourceEntityId: source.id, path, storedPath: ownerPath, override: record, reverted: record == null };
+        }
+      }
+      overrides[path] = record;
+      attachPrefabMarker(entity, { ...marker.value, overrides });
+      return { sceneId: scene.id, prefabId: prefab.id, instanceRootId: marker.value.instanceRootId, entityId: entity.id, sourceEntityId: source.id, path, override: record };
+    }
+    if (op === 'prefab.override.apply') {
+      const scene = operationScene(document, operation), entity = resolveEntity(scene, operation.entityId || operation.entity || operation.entityName, { allowName: operation.entityName != null });
+      const selectedPath = operation.path == null ? null : normalizeOverridePath(operation.path);
+      const inspected = overrideEntries(document, scene, entity, Boolean(operation.all));
+      const entries = inspected.entries.filter(entry => selectedPath == null || entry.path === selectedPath);
+      if (!entries.length) throw new DomainError('E_PREFAB_OVERRIDE_NOT_FOUND', 'No matching Prefab override was found', { exitCode: EXIT.NOT_FOUND, details: { entityId: entity.id, path: selectedPath } });
+      const previousRevision = Number.isInteger(inspected.context.prefab.revision) ? inspected.context.prefab.revision : 0;
+      let synchronizedEntityCount = 0;
+      for (const entry of entries) {
+        const member = inspected.context.group.members.find(item => item.entity.id === entry.entityId), currentMarker = prefabMarker(member.entity).value, source = sourceEntityForMarker(inspected.context.prefab, currentMarker);
+        const sourceState = readRelative(source, entry.path), appliedOperation = normalizeOverrideRecord(entry.override, sourceState.exists);
+        applyOverrideRecord(source, entry.path, appliedOperation, sourceState.exists);
+        const overrides = clone(currentMarker.overrides || {});delete overrides[entry.path];
+        attachPrefabMarker(member.entity, { ...currentMarker, overrides });
+        synchronizedEntityCount += syncPrefabPath(document, inspected.context.prefab, source, entry.path, appliedOperation, {
+          sceneId: scene.id, instanceRootId: inspected.context.group.rootId, entityId: member.entity.id
+        }, previousRevision);
+      }
+      const currentGroups = new Map(instanceGroups(document, inspected.context.prefab.id).map(group => [
+        `${group.scene.id}\u0000${group.prefabId}\u0000${group.rootId}`,
+        group.members.every(member => member.marker.value.prefabRevision === previousRevision)
+      ]));
+      inspected.context.prefab.revision = previousRevision + 1;
+      inspected.context.prefab.updatedAt = now();
+      for (const group of instanceGroups(document, inspected.context.prefab.id)) for (const member of group.members) {
+        const key = `${group.scene.id}\u0000${group.prefabId}\u0000${group.rootId}`;
+        attachPrefabMarker(member.entity, {
+          ...member.marker.value,
+          prefabRevision: currentGroups.get(key) === true ? inspected.context.prefab.revision : member.marker.value.prefabRevision
+        });
+      }
+      return { sceneId: scene.id, prefabId: inspected.context.prefab.id, instanceRootId: inspected.context.group.rootId, entityId: entity.id, appliedCount: entries.length, synchronizedEntityCount, paths: entries.map(entry => entry.path) };
+    }
+    if (op === 'prefab.override.revert') {
+      const scene = operationScene(document, operation), entity = resolveEntity(scene, operation.entityId || operation.entity || operation.entityName, { allowName: operation.entityName != null });
+      const selectedPath = operation.path == null ? null : normalizeOverridePath(operation.path);
+      const inspected = overrideEntries(document, scene, entity, Boolean(operation.all));
+      const entries = inspected.entries.filter(entry => selectedPath == null || entry.path === selectedPath);
+      if (!entries.length) throw new DomainError('E_PREFAB_OVERRIDE_NOT_FOUND', 'No matching Prefab override was found', { exitCode: EXIT.NOT_FOUND, details: { entityId: entity.id, path: selectedPath } });
+      for (const entry of entries) {
+        const member = inspected.context.group.members.find(item => item.entity.id === entry.entityId), currentMarker = prefabMarker(member.entity).value, source = sourceEntityForMarker(inspected.context.prefab, currentMarker);
+        revertOverrideRecord(source, member.entity, entry.path, entry.override);
+        const overrides = clone(currentMarker.overrides || {});delete overrides[entry.path];
+        attachPrefabMarker(member.entity, { ...currentMarker, overrides });
+      }
+      return { sceneId: scene.id, prefabId: inspected.context.prefab.id, instanceRootId: inspected.context.group.rootId, entityId: entity.id, revertedCount: entries.length, paths: entries.map(entry => entry.path) };
+    }
+    if (op === 'prefab.unpack') {
+      const scene = operationScene(document, operation), entity = resolveEntity(scene, operation.entityId || operation.entity || operation.entityName, { allowName: operation.entityName != null }), context = instanceGroupForEntity(document, scene, entity);
+      const entityIds = context.group.members.map(member => member.entity.id);
+      for (const member of context.group.members) stripPrefabMarker(member.entity);
+      return { sceneId: scene.id, prefabId: context.prefab.id, instanceRootId: context.group.rootId, entityIds, unpacked: true };
+    }
+  }
   if (op.startsWith('entity.')) {
     const scene = operationScene(document, operation);scene.objects = Array.isArray(scene.objects) ? scene.objects : [];
     const sceneIndex = buildSceneIndex(scene);
     if (op === 'entity.create') {
       const entity = defaultEntity(operation);if (scene.objects.some(item => item.id === entity.id)) throw new DomainError('E_ENTITY_EXISTS', `Entity already exists: ${entity.id}`, { exitCode: EXIT.CONFLICT });
-      if (operation.parentId) { const parent = resolveEntity(scene, operation.parentId, { index: sceneIndex });entity.parentId = parent.id; }
+      assertOrdinaryPrefabEntity(entity, 'create a connected Prefab member through entity.create', true);
+      if (entity.parentId || operation.parentId) {
+        const parent = resolveEntity(scene, operation.parentId || entity.parentId, { index: sceneIndex });
+        assertOrdinaryPrefabEntity(parent, 'create a child inside a connected Prefab instance', true);
+        entity.parentId = parent.id;
+      }
       if (operation.layer == null && operation.entity?.layer == null) entity.layer = scene.objects.length ? Math.max(...scene.objects.map(item => finite(item.layer) ? Number(item.layer) : 0)) + 1 : 0;
       scene.objects.push(entity);return { sceneId: scene.id, entityId: entity.id, entity: clone(entity) };
     }
     const entity = resolveEntity(scene, operation.entityId || operation.id || operation.entityName, { allowName: operation.entityName != null, index: sceneIndex });
     if (op === 'entity.clone') {
       const include = operation.deep ? new Set([entity.id, ...descendants(scene, entity.id, sceneIndex)]) : new Set([entity.id]), originals = scene.objects.filter(item => include.has(item.id)), remapped = remapObjects(originals);
+      assertNoConnectedPrefabMembers(originals, 'clone a connected Prefab member');
       const rootIndex = originals.findIndex(item => item.id === entity.id), rootCopy = remapped[rootIndex];renameEntityValue(rootCopy, operation.name || `${entityName(entity)} Copy`);offsetEntityValue(rootCopy, Number(operation.offsetX ?? 24), Number(operation.offsetY ?? 24));
       if (!operation.deep && entity.parentId) rootCopy.parentId = entity.parentId;scene.objects.push(...remapped);return { sceneId: scene.id, entityId: rootCopy.id, entityIds: remapped.map(item => item.id) };
     }
-    if (op === 'entity.rename') { const name = renameEntityValue(entity, operation.name);return { sceneId: scene.id, entityId: entity.id, name }; }
-    if (op === 'entity.patch') { const index = scene.objects.indexOf(entity), patch = requireObjectPatch(operation.patch, op);scene.objects[index] = mergePatch(entity, patch);scene.objects[index].id = entity.id;return { sceneId: scene.id, entityId: entity.id, entity: clone(scene.objects[index]) }; }
-    if (op === 'entity.set') { setPath(entity, operation.path, operation.value);return { sceneId: scene.id, entityId: entity.id, path: operation.path, value: clone(operation.value) }; }
+    if (op === 'entity.rename') { assertOrdinaryPrefabEntity(entity, 'rename this Entity', false);const name = renameEntityValue(entity, operation.name);return { sceneId: scene.id, entityId: entity.id, name }; }
+    if (op === 'entity.patch') { assertOrdinaryPrefabEntity(entity, 'patch this Entity', false);const index = scene.objects.indexOf(entity), patch = requireObjectPatch(operation.patch, op);scene.objects[index] = mergePatch(entity, patch);scene.objects[index].id = entity.id;return { sceneId: scene.id, entityId: entity.id, entity: clone(scene.objects[index]) }; }
+    if (op === 'entity.set') { assertPrefabPropertyMutation(entity, operation.path, 'set this property');setPath(entity, operation.path, operation.value);return { sceneId: scene.id, entityId: entity.id, path: operation.path, value: clone(operation.value) }; }
     if (op === 'entity.reparent') {
       const parentId = operation.parentId === null || operation.parentId === '' ? null : String(operation.parentId);
       const preserveWorld = operation.preserveWorld === true;
@@ -677,7 +1395,10 @@ function applyOperationMutable(document, operation) {
       if (parentId) {
         parent = resolveEntity(scene, parentId, { index: sceneIndex });
         if (parentId === entity.id || descendants(scene, entity.id, sceneIndex).has(parentId)) throw new DomainError('E_PARENT_CYCLE', 'Reparent would create a cycle', { exitCode: EXIT.CONFLICT });
+        assertOrdinaryPrefabEntity(parent, 'reparent an Entity inside a connected Prefab instance', true);
       }
+      const marker = prefabMarker(entity);
+      if (marker && String(entity.id) !== String(marker.value.instanceRootId)) throw prefabInstanceError(entity, marker, 'reparent a connected Prefab member', true);
       let nextLocal = null;
       if (preserveWorld) {
         const worldCache = new Map();
@@ -692,6 +1413,7 @@ function applyOperationMutable(document, operation) {
       return { sceneId: scene.id, entityId: entity.id, parentId, transformMode: preserveWorld ? 'preserve-world' : 'preserve-local', localTransform, worldMatrix };
     }
     if (op === 'entity.delete') {
+      assertOrdinaryPrefabEntity(entity, 'delete a connected Prefab member', true);
       const children = sceneIndex.childrenByParent.get(entity.id) || [];
       const preserveWorld = operation.preserveWorld === true;
       const preserveLocal = operation.preserveLocal === true;
@@ -706,6 +1428,7 @@ function applyOperationMutable(document, operation) {
       }
       if (children.length && !operation.cascade && !operation.reparent) throw new DomainError('E_ENTITY_HAS_CHILDREN', 'Entity has children; choose cascade or reparent', { exitCode: EXIT.CONFLICT, details: { children: children.map(item => item.id) } });
       const removed = operation.cascade ? new Set([entity.id, ...descendants(scene, entity.id, sceneIndex)]) : new Set([entity.id]);
+      assertNoConnectedPrefabMembers(scene.objects.filter(item => removed.has(item.id)), 'delete a subtree containing connected Prefab members');
       let preparedTransforms = null;
       if (operation.reparent && preserveWorld) {
         const cache = new Map();
@@ -727,6 +1450,7 @@ function applyOperationMutable(document, operation) {
   }
   if (op.startsWith('component.')) {
     const scene = operationScene(document, operation), entity = resolveEntity(scene, operation.entityId || operation.id || operation.entityName, { allowName: operation.entityName != null }), type = componentAlias(operation.component || operation.type);
+    assertPrefabComponentMutation(entity, type, `${op} ${type}`);
     const pointer = componentValuePointer(document, scene, entity, type);
     if (op === 'component.put') {
       const value = putComponent(entity, type, operation.value, { pointer }), written = getComponent(entity, type);
@@ -903,10 +1627,12 @@ function documentHash(value) {
 module.exports = {
   PROTOCOL, PROJECT_VERSION, RUNTIMES, PHYSICS_BACKENDS, PHYSICS_IMPLEMENTATIONS, BODY_TYPES, COLLIDER_SHAPES, EXIT, DomainError,
   DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES: PROFILE_NAMES, componentRegistry, entityCodec,
+  PREFAB_ASSET_SCHEMA,
   clone, generateId, detectDialect, createProject, createDefaultPostProcess, migrateDocument, syncActiveMirror,
   validateDocument, assertValid, resolveScene, resolveEntity, entityName,
   applyOperations, applyJsonPatch, mergePatch, setPath, getPointer,
   listComponents, listEntities, getComponent, putComponent, removeComponent, resourceField, documentHash, escapePointer,
+  prefabAssets, resolvePrefab, inspectPrefabOverrides,
   localTransformOf, localMatrixOf, worldMatrixOf, multiplyMatrices, invertMatrix, decomposeMatrix,
   IDENTITY_MATRIX, TRANSFORM_EPSILON, TRANSFORM_TOLERANCE
 };

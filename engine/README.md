@@ -14,6 +14,7 @@ AH2D keeps editor data independent from a specific renderer. The editor can prev
 - Runtime adapters for PixiJS, PhaserJS, and custom hosts
 - Editor bridge for `AH2DEdtior.html`
 - Multi-Scene project loading and runtime Scene switching
+- Reusable Prefab Assets with expanded Scene Instances, path-based Overrides, Apply/Revert, and lossless Unpack
 - Agent-friendly CLI for lossless project automation; Runtime physics commands use the installed Planck package
 
 ## CLI
@@ -24,7 +25,7 @@ npm run ah2d -- inspect --file game.ah2d.json --pretty
 npm run ah2d -- validate --file game.ah2d.json --engine
 ```
 
-See [`CLI.md`](./CLI.md) for Scene, Entity, component, runtime, physics, simulation, JSON Patch, and atomic batch workflows.
+See [`CLI.md`](./CLI.md) for Scene, Entity, component, Prefab, runtime, physics, simulation, JSON Patch, and atomic batch workflows. The serialized contract and lifecycle rules are documented in [`../docs/PREFABS.md`](../docs/PREFABS.md).
 
 ## Unified ECS and Component Schema contract
 
@@ -122,6 +123,27 @@ const project = {
 engine.load(project);       // Loads currentSceneId.
 engine.loadScene('boss');   // Switches without runtime-specific data.
 ```
+
+## Prefab lifecycle
+
+Top-level `prefabs[]` stores reusable definitions. Scene Instances stay expanded as ordinary Entity subtrees; every member maps to a stable source Entity through `components.PrefabInstance`. This keeps rendering, Physics and Scene Graph behavior independent from a particular editor or runtime adapter.
+
+```js
+const asset = engine.prefabs.createAsset('crate', { id: 'crate-prefab', name: 'Crate' });
+const instance = engine.prefabs.instantiate(asset.id, {
+  rootId: 'crate-2',
+  parentId: 'props',
+  transform: { x: 480, y: 240 }
+});
+
+engine.prefabs.setOverride('crate-2', '/color', '#ff8844');
+engine.prefabs.revert('crate-2', '/color');
+engine.prefabs.setOverride('crate-2', '/color', '#22cc88');
+engine.prefabs.apply('crate-2', { paths: ['/color'] });
+engine.prefabs.unpack(instance.instanceRootId);
+```
+
+The instance root Transform and external parent are placement, not Overrides. Identity, hierarchy, the legacy `prefab` projection and the `PrefabInstance` marker are protected paths. Structural Overrides and nested Prefab Assets are not supported; Unpack before changing the connected hierarchy. Asset deletion rejects connected Instances unless `deleteAsset(id, { unpackInstances: true })` is explicit.
 
 ## Runtime selection and preview lifecycle
 

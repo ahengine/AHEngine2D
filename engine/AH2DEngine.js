@@ -2675,6 +2675,845 @@
     destroy() { this.hooks.destroy?.(); super.destroy(); }
   }
 
+  const prefabError = (code, message, details, pointer = '') => new DataModel.ComponentSchemaError(code, message, { pointer, details });
+
+  class PrefabSystem {
+    constructor(engine) { this.engine = engine; }
+    _document() {
+      const document = this.engine.document;
+      if (!isPlainObject(document) || Number(document.version) !== 4 || !Array.isArray(document.scenes)) {
+        throw prefabError('E_PREFAB_AUTHORING_DOCUMENT', 'Prefab authoring requires a loaded Universal Project version 4 with Scenes');
+      }
+      return document;
+    }
+    _activeScene(document = this._document()) {
+      const id = this.engine.activeSceneId || document.currentSceneId || document.meta?.currentSceneId;
+      const scene = document.scenes.find(item => item?.id === id) || document.scenes[0];
+      if (!scene || !Array.isArray(scene.objects)) throw prefabError('E_PREFAB_SCENE', 'The active Scene must contain an objects array', { sceneId: id });
+      return scene;
+    }
+    _asset(document, prefabId, required = true) {
+      const asset = (Array.isArray(document.prefabs) ? document.prefabs : []).find(item => item?.id === prefabId) || null;
+      if (!asset && required) throw prefabError('E_PREFAB_ASSET_MISSING', `Prefab Asset does not exist: ${prefabId}`, { prefabId });
+      return asset;
+    }
+    _marker(entity) {
+      if (!isPlainObject(entity)) return null;
+      const resolved = this.engine.entityCodec.resolve(entity, 'PrefabInstance');
+      if (!resolved.found || !isPlainObject(resolved.value)) return null;
+      const value = resolved.value;
+      if (!['sourceEntityId', 'instanceRootId'].some(key => value[key] != null)) return null;
+      if (!['prefabId', 'sourceEntityId', 'instanceRootId'].every(key => typeof value[key] === 'string' && value[key].trim())) {
+        throw prefabError('E_PREFAB_INSTANCE_ID', 'PrefabInstance requires non-empty prefabId, sourceEntityId, and instanceRootId', { entityId: entity.id });
+      }
+      return { resolved, value };
+    }
+    _setMarker(entity, value) {
+      this.engine.entityCodec.write(entity, 'PrefabInstance', value, { storage: 'preserve', profile: DataModel.PROFILES.AUTHORING });
+      return entity;
+    }
+    _removeMarker(entity) {
+      return this.engine.entityCodec.remove(entity, 'PrefabInstance', { allLocations: true });
+    }
+    _scopes(document) {
+      return (Array.isArray(document.scenes) ? document.scenes : [])
+        .filter(scene => isPlainObject(scene) && Array.isArray(scene.objects))
+        .map(scene => ({ scene, objects: scene.objects }));
+    }
+    _findActiveEntity(document, entityId) {
+      const scene = this._activeScene(document);
+      const entity = scene.objects.find(item => item?.id === entityId);
+      if (!entity) throw prefabError('E_PREFAB_INSTANCE_ENTITY', `Entity does not exist in the active Scene: ${entityId}`, { entityId, sceneId: scene.id });
+      return { scene, entity };
+    }
+    _instanceMembers(objects, marker) {
+      return objects.map(entity => ({ entity, marker: this._marker(entity) })).filter(item => item.marker &&
+        item.marker.value.prefabId === marker.prefabId && item.marker.value.instanceRootId === marker.instanceRootId);
+    }
+    _source(asset, sourceEntityId) {
+      const source = asset.entities.find(entity => entity?.id === sourceEntityId);
+      if (!source) throw prefabError('E_PREFAB_INSTANCE_SOURCE_MISSING', `Prefab source Entity does not exist: ${sourceEntityId}`, { prefabId: asset.id, sourceEntityId });
+      return source;
+    }
+    _syncMirror(document) {
+      const scene = this._activeScene(document);
+      document.currentSceneId = scene.id;
+      if (isPlainObject(document.meta)) document.meta.currentSceneId = scene.id;
+      document.scene = clone(scene.objects);
+    }
+    _commit(document, event, payload) {
+      this._syncMirror(document);
+      DataModel.assertPrefabDocument(document, { entityCodec: this.engine.entityCodec });
+      const sceneId = this._activeScene(document).id;
+      this.engine.load(document, { sceneId });
+      const detail = clone(payload);
+      this.engine.events.emit(event, { ...detail, engine: this.engine });
+      return detail;
+    }
+    _uniqueEntityId(objects, prefix) {
+      const occupied = new Set(objects.map(entity => entity?.id));
+      let candidate;
+      do { candidate = `${prefix}_${uid()}`; } while (occupied.has(candidate));
+      return candidate;
+    }
+    _assertOverridePath(path) {
+      DataModel.parseJsonPointer(path);
+      if (!DataModel.prefabOverridePathAllowed(path)) {
+        throw prefabError('E_PREFAB_OVERRIDE_PROTECTED', 'Prefab override cannot change Entity identity, hierarchy, or its PrefabInstance marker', { path }, path);
+      }
+      return path;
+    }
+    _assertMemberOverridePath(entity, marker, path) {
+      this._assertOverridePath(path);
+      if (entity.id === marker.instanceRootId && DataModel.prefabRootPlacementPath(path)) {
+        throw prefabError('E_PREFAB_PLACEMENT_PATH', 'Transform fields on an instance root are placement and cannot be stored as Prefab overrides', {
+          entityId: entity.id, path
+        }, path);
+      }
+      return path;
+    }
+    _overrideRecordForState(source, target, path, prior = {}) {
+      const sourceState = DataModel.jsonPointerLookup(source, path);
+      const targetState = DataModel.jsonPointerLookup(target, path);
+      if (!sourceState.found && !targetState.found) return null;
+      if (sourceState.found && targetState.found && JSON.stringify(sourceState.value) === JSON.stringify(targetState.value)) return null;
+      if (!targetState.found) {
+        const record = { ...(isPlainObject(prior) ? clone(prior) : {}), op: 'remove' };
+        delete record.value;
+        return record;
+      }
+      return {
+        ...(isPlainObject(prior) ? clone(prior) : {}),
+        op: sourceState.found ? 'replace' : 'add',
+        value: clone(targetState.value)
+      };
+    }
+    _rebaseApplyOperation(source, target, path, prior = {}) {
+      const candidates = [];
+      const segments = DataModel.parseJsonPointer(path);
+      for (let length = segments.length; length > 0; length -= 1) {
+        const candidatePath = this._pointerFromSegments(segments.slice(0, length));
+        if (!DataModel.prefabOverridePathAllowed(candidatePath)) continue;
+        const operation = this._overrideRecordForState(source, target, candidatePath, prior);
+        if (!operation) {
+          if (length === segments.length) return null;
+          continue;
+        }
+        candidates.push({ path: candidatePath, operation });
+      }
+      let firstError = null;
+      for (const candidate of candidates) {
+        try {
+          const projected = clone(source);
+          DataModel.applyPrefabOverrideOperation(projected, candidate.path, candidate.operation);
+          return candidate;
+        } catch (error) {
+          if (!firstError) firstError = error;
+          if (error?.code !== 'E_PREFAB_OVERRIDE_TARGET') throw error;
+        }
+      }
+      if (firstError) throw firstError;
+      return null;
+    }
+    _pointerFromSegments(segments) {
+      return '/' + segments.map(segment => String(segment).replace(/~/g, '~0').replace(/\//g, '~1')).join('/');
+    }
+    _projectPrefabOverrides(source, overrides) {
+      const projected = clone(source);
+      for (const [overridePath, record] of Object.entries(isPlainObject(overrides) ? overrides : {})) {
+        if (!isPlainObject(record) || !DataModel.PREFAB_OVERRIDE_OPERATIONS.includes(record.op)) continue;
+        DataModel.applyPrefabOverrideOperation(projected, overridePath, record);
+      }
+      return projected;
+    }
+    _replaceProjectedBranch(target, projected, path) {
+      const expected = DataModel.jsonPointerLookup(projected, path);
+      const current = DataModel.jsonPointerLookup(target, path);
+      if (!expected.found) {
+        if (current.found) DataModel.applyJsonPointerOperation(target, path, { op: 'remove' });
+        return target;
+      }
+      DataModel.applyJsonPointerOperation(target, path, {
+        op: current.found ? 'replace' : 'add',
+        value: expected.value
+      });
+      return target;
+    }
+    _arrayParentContext(source, target, path) {
+      const segments = DataModel.parseJsonPointer(path);
+      const rawIndex = segments.at(-1);
+      if (!/^(0|[1-9]\d*)$/.test(rawIndex || '')) return null;
+      const parentSegments = segments.slice(0, -1);
+      if (!parentSegments.length) return null;
+      const parentPath = this._pointerFromSegments(parentSegments);
+      const sourceParent = DataModel.jsonPointerLookup(source, parentPath);
+      const targetParent = DataModel.jsonPointerLookup(target, parentPath);
+      if (!sourceParent.found || !targetParent.found || !Array.isArray(sourceParent.value) || !Array.isArray(targetParent.value)) return null;
+      return { segments, rawIndex, index: Number(rawIndex), parentSegments, parentPath, sourceParent, targetParent };
+    }
+    _arrayBranchPath(source, target, path) {
+      const segments = DataModel.parseJsonPointer(path);
+      for (let position = segments.length - 1; position >= 0; position -= 1) {
+        if (!/^(0|[1-9]\d*)$/.test(segments[position]) || position === 0) continue;
+        const parentPath = this._pointerFromSegments(segments.slice(0, position));
+        const sourceParent = DataModel.jsonPointerLookup(source, parentPath);
+        const targetParent = DataModel.jsonPointerLookup(target, parentPath);
+        if ((sourceParent.found && Array.isArray(sourceParent.value)) || (targetParent.found && Array.isArray(targetParent.value))) return parentPath;
+      }
+      return null;
+    }
+    _promoteArrayOverride(source, target, parentPath, overrides, prior = {}) {
+      const next = {};
+      for (const [existing, record] of Object.entries(isPlainObject(overrides) ? overrides : {})) {
+        if (existing === parentPath || existing.startsWith(`${parentPath}/`)) continue;
+        Object.defineProperty(next, existing, { value: clone(record), enumerable: true, writable: true, configurable: true });
+      }
+      const promoted = this._overrideRecordForState(source, target, parentPath, prior);
+      if (promoted) Object.defineProperty(next, parentPath, { value: promoted, enumerable: true, writable: true, configurable: true });
+      return next;
+    }
+    _normalizeArrayOverrideState(source, target, marker, editedPath) {
+      const overrides = isPlainObject(marker.overrides) ? clone(marker.overrides) : {};
+      const parentPath = this._arrayBranchPath(source, target, editedPath);
+      if (!parentPath) return { ...marker, overrides };
+      try {
+        const projected = this._projectPrefabOverrides(source, overrides);
+        const expected = DataModel.jsonPointerLookup(projected, parentPath);
+        const actual = DataModel.jsonPointerLookup(target, parentPath);
+        if (expected.found === actual.found && (!expected.found || JSON.stringify(expected.value) === JSON.stringify(actual.value))) {
+          return { ...marker, overrides };
+        }
+      } catch (_) {}
+      return {
+        ...marker,
+        overrides: this._promoteArrayOverride(source, target, parentPath, overrides, overrides[editedPath] || {})
+      };
+    }
+    _syncArrayMutation(source, target, path, overrides, operation, options = {}) {
+      if (!['add', 'replace', 'remove'].includes(operation.op)) return null;
+      const context = this._arrayParentContext(source, target, path);
+      if (!context) {
+        const parentPath = this._arrayBranchPath(source, target, path);
+        if (!parentPath) return null;
+        const next = isPlainObject(overrides) ? clone(overrides) : {};
+        const projected = this._projectPrefabOverrides(source, next);
+        this._replaceProjectedBranch(target, projected, parentPath);
+        return next;
+      }
+      const { parentSegments, parentPath, index } = context;
+      const next = isPlainObject(overrides) ? clone(overrides) : {};
+      const entries = Object.entries(next).map(([existing, record], order) => {
+        let parts;
+        try { parts = DataModel.parseJsonPointer(existing); } catch (_) { return null; }
+        if (parts.length <= parentSegments.length ||
+            parentSegments.some((segment, position) => parts[position] !== segment) ||
+            !/^(0|[1-9]\d*)$/.test(parts[parentSegments.length])) return null;
+        return { path: existing, parts, index: Number(parts[parentSegments.length]), record, order };
+      }).filter(Boolean);
+      const ancestorOwner = Object.keys(next)
+        .filter(existing => existing !== path && path.startsWith(`${existing}/`))
+        .sort((a, b) => b.length - a.length)[0];
+      if (ancestorOwner) {
+        const rebased = this._overrideRecordForState(source, target, ancestorOwner, next[ancestorOwner]);
+        if (rebased) next[ancestorOwner] = rebased; else delete next[ancestorOwner];
+        return next;
+      }
+
+      let limitedPaths = options.reindexPaths instanceof Set ? options.reindexPaths : null;
+      if (operation.op === 'remove' && entries.some(entry => entry.index === index)) {
+        const exactEntries = entries.filter(entry => entry.index === index);
+        const redundantRemove = exactEntries.find(entry =>
+          entry.index === index && entry.parts.length === parentSegments.length + 1 && entry.record?.op === 'remove'
+        );
+        const localInsertion = exactEntries.length === 1 &&
+          exactEntries[0].parts.length === parentSegments.length + 1 && exactEntries[0].record?.op === 'add';
+        if (redundantRemove) {
+          // The local removal and Asset removal now express the same change.
+          // Records authored before that local removal still use the old Asset
+          // coordinates; later records already use the shortened array.
+          delete next[redundantRemove.path];
+          limitedPaths = new Set(entries.filter(entry => entry.order < redundantRemove.order).map(entry => entry.path));
+        } else if (!localInsertion) {
+        // Removing the Asset element would orphan an exact/descendant override.
+        // Promote ownership to the complete array so the effective instance
+        // remains reconstructable against the shorter Asset array.
+          const prior = entries.find(entry => entry.index === index)?.record || {};
+          return this._promoteArrayOverride(source, target, parentPath, next, prior);
+        }
+      }
+
+      const remapped = new Map(entries.map(entry => [entry.path, entry.path]));
+      for (const entry of entries) {
+        if (limitedPaths && !limitedPaths.has(entry.path)) continue;
+        if (operation.op === 'replace') continue;
+        if (operation.op === 'remove' && entry.index <= index) continue;
+        if (operation.op === 'add' && entry.index < index) continue;
+        const shiftedParts = entry.parts.slice();
+        shiftedParts[parentSegments.length] = String(entry.index + (operation.op === 'add' ? 1 : -1));
+        remapped.set(entry.path, this._pointerFromSegments(shiftedParts));
+      }
+      const staged = {};
+      for (const [existing, record] of Object.entries(next)) {
+        const shiftedPath = remapped.get(existing) || existing;
+        if (Object.prototype.hasOwnProperty.call(staged, shiftedPath)) {
+          return this._promoteArrayOverride(source, target, parentPath, next, record);
+        }
+        Object.defineProperty(staged, shiftedPath, { value: clone(record), enumerable: true, writable: true, configurable: true });
+      }
+      try {
+        const projected = this._projectPrefabOverrides(source, staged);
+        this._replaceProjectedBranch(target, projected, parentPath);
+      } catch (_) {
+        return this._promoteArrayOverride(source, target, parentPath, staged, entries[0]?.record || {});
+      }
+      return staged;
+    }
+    _rebaseArrayAfterRevert(source, target, path, overrides, operation, followingPaths) {
+      if (!['add', 'remove'].includes(operation.op)) return null;
+      const context = this._arrayParentContext(source, target, path);
+      if (!context) return null;
+      const { parentSegments, parentPath, index } = context;
+      const following = followingPaths instanceof Set ? followingPaths : new Set(followingPaths || []);
+      const remapped = new Map();
+      for (const existing of Object.keys(overrides)) {
+        if (!following.has(existing)) continue;
+        let parts;
+        try { parts = DataModel.parseJsonPointer(existing); } catch (_) { continue; }
+        if (parts.length <= parentSegments.length ||
+            parentSegments.some((segment, position) => parts[position] !== segment) ||
+            !/^(0|[1-9]\d*)$/.test(parts[parentSegments.length])) continue;
+        const existingIndex = Number(parts[parentSegments.length]);
+        const shouldShift = operation.op === 'add' ? existingIndex > index : existingIndex >= index;
+        if (!shouldShift) continue;
+        parts[parentSegments.length] = String(existingIndex + (operation.op === 'add' ? -1 : 1));
+        remapped.set(existing, this._pointerFromSegments(parts));
+      }
+      const staged = {};
+      for (const [existing, record] of Object.entries(overrides)) {
+        const shiftedPath = remapped.get(existing) || existing;
+        if (Object.prototype.hasOwnProperty.call(staged, shiftedPath)) {
+          return this._promoteArrayOverride(source, target, parentPath, overrides, record);
+        }
+        Object.defineProperty(staged, shiftedPath, { value: clone(record), enumerable: true, writable: true, configurable: true });
+      }
+      try {
+        const projected = this._projectPrefabOverrides(source, staged);
+        this._replaceProjectedBranch(target, projected, parentPath);
+        return staged;
+      } catch (_) {
+        return this._promoteArrayOverride(source, target, parentPath, staged, Object.values(staged)[0] || {});
+      }
+    }
+    _syncPathPreservingOverrides(source, target, path, overrides, operation, options = {}) {
+      const nextOverrides = isPlainObject(overrides) ? clone(overrides) : {};
+      const paths = Object.keys(nextOverrides);
+      const arrayResult = this._syncArrayMutation(source, target, path, nextOverrides, operation, options);
+      if (arrayResult) return arrayResult;
+      if (options.operationAlreadyApplied === true) return nextOverrides;
+      // An exact override or an override of an ancestor owns the effective
+      // value, so this Asset change must not touch that branch.
+      const owner = paths
+        .filter(existing => existing === path || path.startsWith(`${existing}/`))
+        .sort((a, b) => b.length - a.length)[0];
+      if (owner) {
+        const rebased = this._overrideRecordForState(source, target, owner, nextOverrides[owner]);
+        if (rebased) nextOverrides[owner] = rebased; else delete nextOverrides[owner];
+        return nextOverrides;
+      }
+      const branchBefore = DataModel.jsonPointerLookup(target, path);
+      const descendants = paths.filter(existing => existing.startsWith(`${path}/`)).map(existing => ({
+        path: existing,
+        effective: (() => {
+          const current = DataModel.jsonPointerLookup(target, existing);
+          return { found: current.found, value: current.found ? clone(current.value) : undefined };
+        })()
+      }));
+      DataModel.applyJsonPointerOperation(target, path, operation);
+      for (const descendant of descendants) {
+        const after = DataModel.jsonPointerLookup(target, descendant.path);
+        try {
+          if (descendant.effective.found) {
+            DataModel.applyJsonPointerOperation(target, descendant.path, {
+              op: after.found ? 'replace' : 'add', value: descendant.effective.value
+            });
+          } else if (after.found) DataModel.applyJsonPointerOperation(target, descendant.path, { op: 'remove' });
+        } catch (error) {
+          // The Asset removed/retyped a parent required by this descendant
+          // override. Preserve the previous effective branch and promote the
+          // record to the changed ancestor so validation and future sync stay
+          // deterministic.
+          const currentBranch = DataModel.jsonPointerLookup(target, path);
+          if (!branchBefore.found) throw error;
+          DataModel.applyJsonPointerOperation(target, path, {
+            op: currentBranch.found ? 'replace' : 'add', value: branchBefore.value
+          });
+          const prior = nextOverrides[descendant.path];
+          for (const existing of Object.keys(nextOverrides)) {
+            if (existing === path || existing.startsWith(`${path}/`)) delete nextOverrides[existing];
+          }
+          const promoted = this._overrideRecordForState(source, target, path, prior);
+          if (promoted) nextOverrides[path] = promoted;
+          return nextOverrides;
+        }
+        const sourceValue = DataModel.jsonPointerLookup(source, descendant.path);
+        if (!descendant.effective.found && !sourceValue.found) delete nextOverrides[descendant.path];
+        else nextOverrides[descendant.path] = descendant.effective.found
+          ? { ...nextOverrides[descendant.path], op: sourceValue.found ? 'replace' : 'add', value: clone(descendant.effective.value) }
+          : { ...nextOverrides[descendant.path], op: 'remove' };
+      }
+      return nextOverrides;
+    }
+    _recordOverride(marker, path, operation, entity = null) {
+      const overrides = isPlainObject(marker.overrides) ? clone(marker.overrides) : {};
+      const priorAtPath = isPlainObject(overrides[path]) ? clone(overrides[path]) : null;
+      const owner = Object.keys(overrides)
+        .filter(existing => existing !== path && path.startsWith(`${existing}/`))
+        .sort((a, b) => b.length - a.length)[0];
+      if (owner && entity) {
+        const ownerOperation = overrides[owner];
+        const effective = DataModel.jsonPointerLookup(entity, owner);
+        // A descendant edit inside an existing add/replace is still one
+        // override of the owning branch. Rebase its value from the effective
+        // Entity instead of replacing it with a narrower record, otherwise
+        // sibling differences owned by the ancestor would be lost on sync.
+        if (effective.found && isPlainObject(ownerOperation) && ownerOperation.op !== 'remove') {
+          for (const existing of Object.keys(overrides)) {
+            if (existing !== owner && (existing.startsWith(`${owner}/`) || owner.startsWith(`${existing}/`))) delete overrides[existing];
+          }
+          overrides[owner] = { ...ownerOperation, value: clone(effective.value) };
+          return { ...marker, overrides };
+        }
+      }
+      for (const existing of Object.keys(overrides)) {
+        if (existing !== path && (existing.startsWith(`${path}/`) || path.startsWith(`${existing}/`))) delete overrides[existing];
+      }
+      if (!operation) delete overrides[path];
+      if (operation) {
+        const record = { ...(priorAtPath || {}), ...clone(operation) };
+        if (record.op === 'remove') delete record.value;
+        Object.defineProperty(overrides, path, { value: record, enumerable: true, writable: true, configurable: true });
+      }
+      return { ...marker, overrides };
+    }
+    _revertOperation(source, target, path, operation) {
+      const sourceValue = DataModel.jsonPointerLookup(source, path);
+      const targetValue = DataModel.jsonPointerLookup(target, path);
+      if (operation.op === 'add' && !sourceValue.found) {
+        if (targetValue.found) DataModel.applyJsonPointerOperation(target, path, { op: 'remove' });
+        return;
+      }
+      if (!sourceValue.found) {
+        if (targetValue.found) DataModel.applyJsonPointerOperation(target, path, { op: 'remove' });
+        return;
+      }
+      DataModel.applyJsonPointerOperation(target, path, {
+        // A remove shifts an array; add restores the element even when the
+        // same numeric index now resolves to its former sibling. A stale add
+        // rebases to the current source instead of deleting a newly-owned path.
+        op: operation.op === 'remove' ? 'add' : (targetValue.found ? 'replace' : 'add'),
+        value: sourceValue.value
+      });
+    }
+    list() { return clone(Array.isArray(this.engine.document?.prefabs) ? this.engine.document.prefabs : []); }
+    get(prefabId) {
+      const asset = this._asset(this._document(), prefabId, false);
+      return asset ? clone(asset) : null;
+    }
+    getInstance(entityId) {
+      const document = this._document();
+      const { scene, entity } = this._findActiveEntity(document, entityId);
+      const marker = this._marker(entity);
+      if (!marker) return null;
+      const asset = this._asset(document, marker.value.prefabId);
+      const members = this._instanceMembers(scene.objects, marker.value);
+      return clone({
+        prefabId: marker.value.prefabId,
+        instanceRootId: marker.value.instanceRootId,
+        prefabRevision: marker.value.prefabRevision ?? null,
+        asset,
+        members: members.map(item => ({
+          entityId: item.entity.id,
+          sourceEntityId: item.marker.value.sourceEntityId,
+          overrides: item.marker.value.overrides || {}
+        }))
+      });
+    }
+    createAsset(rootEntityId, options = {}) {
+      const document = clone(this._document());
+      const scene = this._activeScene(document);
+      const root = scene.objects.find(entity => entity?.id === rootEntityId);
+      if (!root) throw prefabError('E_PREFAB_SOURCE_ROOT', `Entity does not exist in the active Scene: ${rootEntityId}`, { rootEntityId });
+      if (this._marker(root)) throw prefabError('E_PREFAB_ALREADY_INSTANCE', `Entity is already part of a Prefab instance: ${rootEntityId}`, { rootEntityId });
+      const prefabId = String(options.id || `prefab_${rootEntityId}`).trim();
+      if (!prefabId) throw prefabError('E_PREFAB_ID', 'Prefab Asset id must be a non-empty string');
+      if (this._asset(document, prefabId, false)) throw prefabError('E_PREFAB_ID_DUPLICATE', `Prefab Asset already exists: ${prefabId}`, { prefabId });
+      const selected = new Set([rootEntityId]);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const entity of scene.objects) {
+          if (!selected.has(entity.id) && selected.has(entity.parentId)) { selected.add(entity.id); changed = true; }
+        }
+      }
+      const connectedDescendant = scene.objects.find(entity => selected.has(entity.id) && this._marker(entity));
+      if (connectedDescendant) {
+        throw prefabError(
+          'E_PREFAB_NESTED_INSTANCE',
+          `Connected Prefab member must be unpacked before creating an Asset from this subtree: ${connectedDescendant.id}`,
+          { rootEntityId, entityId: connectedDescendant.id }
+        );
+      }
+      const entities = scene.objects.filter(entity => selected.has(entity.id)).map(entity => clone(entity));
+      const sourceRoot = entities.find(entity => entity.id === rootEntityId);
+      sourceRoot.parentId = null;
+      const sourceTransform = this.engine.entityCodec.resolve(sourceRoot, 'Transform');
+      this.engine.entityCodec.write(sourceRoot, 'Transform', {
+        ...sourceTransform.value,
+        x: 0,
+        y: 0,
+        rotation: 0,
+        scaleX: 1,
+        scaleY: 1
+      }, { storage: 'preserve', profile: DataModel.PROFILES.AUTHORING });
+      const revision = options.revision == null ? 1 : options.revision;
+      const extensions = isPlainObject(options.extensions) ? clone(options.extensions) : {};
+      const asset = {
+        ...extensions,
+        id: prefabId,
+        name: options.name == null ? String(root.name || rootEntityId) : String(options.name),
+        rootEntityId,
+        revision,
+        entities
+      };
+      if (!Array.isArray(document.prefabs)) document.prefabs = [];
+      document.prefabs.push(asset);
+      const linkedEntityIds = [];
+      if (options.linkSource !== false) {
+        for (const entity of scene.objects) {
+          if (!selected.has(entity.id)) continue;
+          const existingMarker = this.engine.entityCodec.resolve(entity, 'PrefabInstance');
+          this._setMarker(entity, {
+            ...(existingMarker.found && isPlainObject(existingMarker.value) ? clone(existingMarker.value) : {}),
+            prefabId,
+            sourceEntityId: entity.id,
+            instanceRootId: rootEntityId,
+            prefabRevision: revision,
+            overrides: {}
+          });
+          linkedEntityIds.push(entity.id);
+        }
+      }
+      this._commit(document, 'prefab:assetCreate', { prefabId, rootEntityId, linkedEntityIds });
+      return this.get(prefabId);
+    }
+    deleteAsset(prefabId, options = {}) {
+      const document = clone(this._document());
+      const asset = this._asset(document, prefabId);
+      const linked = [];
+      for (const { scene, objects } of this._scopes(document)) {
+        for (const entity of objects) {
+          const marker = this._marker(entity);
+          if (marker?.value.prefabId === prefabId) linked.push({ sceneId: scene.id, entity, marker: marker.value });
+        }
+      }
+      if (linked.length && options.unpackInstances !== true) {
+        throw prefabError('E_PREFAB_ASSET_IN_USE', `Cannot delete Prefab Asset ${prefabId} while linked instances exist`, {
+          prefabId, instanceRootIds: [...new Set(linked.map(item => item.marker.instanceRootId))]
+        });
+      }
+      if (options.unpackInstances === true) linked.forEach(item => this._removeMarker(item.entity));
+      document.prefabs.splice(document.prefabs.indexOf(asset), 1);
+      const instanceRootIds = [...new Set(linked.map(item => item.marker.instanceRootId))];
+      this._commit(document, 'prefab:assetDelete', { prefabId, instanceRootIds, unpacked: options.unpackInstances === true });
+      return true;
+    }
+    instantiate(prefabId, options = {}) {
+      const document = clone(this._document());
+      const asset = this._asset(document, prefabId);
+      const scene = this._activeScene(document);
+      const existingIds = new Set(scene.objects.map(entity => entity?.id));
+      const parentId = options.parentId == null ? null : options.parentId;
+      if (parentId != null && !existingIds.has(parentId)) throw prefabError('E_DANGLING_PARENT', `Parent does not exist in the active Scene: ${parentId}`, { parentId });
+      if (parentId != null) {
+        const parent = scene.objects.find(entity => entity?.id === parentId);
+        const parentMarker = this._marker(parent);
+        if (parentMarker) {
+          throw prefabError(
+            'E_PREFAB_STRUCTURAL_EDIT',
+            `Cannot instantiate a Prefab below a connected Prefab member: ${parentId}`,
+            { prefabId, parentId, instanceRootId: parentMarker.value.instanceRootId }
+          );
+        }
+      }
+      const requestedMap = options.idMap instanceof Map ? options.idMap : new Map(Object.entries(isPlainObject(options.idMap) ? options.idMap : {}));
+      if (options.rootId != null) requestedMap.set(asset.rootEntityId, options.rootId);
+      const idMap = new Map();
+      for (const source of asset.entities) {
+        let id = requestedMap.get(source.id);
+        if (id == null && typeof options.idFactory === 'function') id = options.idFactory(source, asset, scene);
+        if (id == null) id = this._uniqueEntityId([...scene.objects, ...[...idMap.values()].map(value => ({ id: value }))], `${prefabId}_${source.id}`);
+        id = String(id).trim();
+        if (!id) throw prefabError('E_ENTITY_ID', `Generated instance Entity id is empty for source ${source.id}`, { prefabId, sourceEntityId: source.id });
+        if (existingIds.has(id) || [...idMap.values()].includes(id)) throw prefabError('E_ENTITY_EXISTS', `Entity already exists: ${id}`, { prefabId, sourceEntityId: source.id, entityId: id });
+        idMap.set(source.id, id);
+      }
+      const instanceRootId = idMap.get(asset.rootEntityId);
+      const instances = asset.entities.map(source => {
+        const entity = clone(source);
+        entity.id = idMap.get(source.id);
+        entity.parentId = source.id === asset.rootEntityId ? parentId : idMap.get(source.parentId);
+        const existingMarker = this.engine.entityCodec.resolve(entity, 'PrefabInstance');
+        this._removeMarker(entity);
+        this._setMarker(entity, {
+          ...(existingMarker.found && isPlainObject(existingMarker.value) ? clone(existingMarker.value) : {}),
+          prefabId,
+          sourceEntityId: source.id,
+          instanceRootId,
+          prefabRevision: Number.isInteger(asset.revision) ? asset.revision : 0,
+          overrides: {}
+        });
+        return entity;
+      });
+      const instanceRoot = instances.find(entity => entity.id === instanceRootId);
+      if (isPlainObject(options.transform)) {
+        const resolved = this.engine.entityCodec.resolve(instanceRoot, 'Transform');
+        this.engine.entityCodec.write(instanceRoot, 'Transform', { ...resolved.value, ...clone(options.transform) }, {
+          storage: 'preserve', profile: DataModel.PROFILES.AUTHORING
+        });
+      }
+      scene.objects.push(...instances);
+      const result = {
+        prefabId,
+        instanceRootId,
+        entityIds: instances.map(entity => entity.id),
+        idMap: Object.fromEntries(idMap)
+      };
+      this._commit(document, 'prefab:instantiate', result);
+      return clone(result);
+    }
+    setOverride(entityId, path, value, options = {}) {
+      const document = clone(this._document());
+      const { entity } = this._findActiveEntity(document, entityId);
+      const marker = this._marker(entity);
+      if (!marker) throw prefabError('E_PREFAB_NOT_INSTANCE', `Entity is not part of a Prefab instance: ${entityId}`, { entityId });
+      this._assertMemberOverridePath(entity, marker.value, path);
+      const asset = this._asset(document, marker.value.prefabId);
+      const source = this._source(asset, marker.value.sourceEntityId);
+      const current = DataModel.jsonPointerLookup(entity, path);
+      const sourceCurrent = DataModel.jsonPointerLookup(source, path);
+      const op = sourceCurrent.found ? 'replace' : 'add';
+      if (options.op != null && options.op !== op) throw prefabError('E_PREFAB_OVERRIDE_OPERATION', `Override must use ${op} because the path ${sourceCurrent.found ? 'exists in' : 'is absent from'} the Prefab Asset`, { requested: options.op, expected: op, path });
+      const operation = { op, value: clone(value) };
+      DataModel.applyJsonPointerOperation(entity, path, { op: current.found ? 'replace' : 'add', value });
+      const recorded = this._recordOverride(marker.value, path, operation, entity);
+      this._setMarker(entity, this._normalizeArrayOverrideState(source, entity, recorded, path));
+      const result = { entityId, prefabId: marker.value.prefabId, instanceRootId: marker.value.instanceRootId, path, operation };
+      this._commit(document, 'prefab:override', result);
+      return clone(result);
+    }
+    removeOverride(entityId, path) {
+      const document = clone(this._document());
+      const { entity } = this._findActiveEntity(document, entityId);
+      const marker = this._marker(entity);
+      if (!marker) throw prefabError('E_PREFAB_NOT_INSTANCE', `Entity is not part of a Prefab instance: ${entityId}`, { entityId });
+      this._assertMemberOverridePath(entity, marker.value, path);
+      const asset = this._asset(document, marker.value.prefabId);
+      const source = this._source(asset, marker.value.sourceEntityId);
+      const sourceCurrent = DataModel.jsonPointerLookup(source, path);
+      const current = DataModel.jsonPointerLookup(entity, path);
+      if (!current.found) throw prefabError('E_PREFAB_OVERRIDE_TARGET', `Prefab override target does not exist: ${path}`, { entityId, path });
+      if (!sourceCurrent.found) {
+        DataModel.applyJsonPointerOperation(entity, path, { op: 'remove' });
+        const recorded = this._recordOverride(marker.value, path, null, entity);
+        this._setMarker(entity, this._normalizeArrayOverrideState(source, entity, recorded, path));
+        const result = { entityId, prefabId: marker.value.prefabId, instanceRootId: marker.value.instanceRootId, path, operation: null, reverted: true };
+        this._commit(document, 'prefab:override', result);
+        return clone(result);
+      }
+      const operation = { op: 'remove' };
+      DataModel.applyJsonPointerOperation(entity, path, operation);
+      const recorded = this._recordOverride(marker.value, path, operation, entity);
+      this._setMarker(entity, this._normalizeArrayOverrideState(source, entity, recorded, path));
+      const result = { entityId, prefabId: marker.value.prefabId, instanceRootId: marker.value.instanceRootId, path, operation };
+      this._commit(document, 'prefab:override', result);
+      return clone(result);
+    }
+    revert(entityId, path = null, options = {}) {
+      if (isPlainObject(path)) { options = path; path = null; }
+      if (path != null) this._assertOverridePath(path);
+      const document = clone(this._document());
+      const { scene, entity } = this._findActiveEntity(document, entityId);
+      const marker = this._marker(entity);
+      if (!marker) throw prefabError('E_PREFAB_NOT_INSTANCE', `Entity is not part of a Prefab instance: ${entityId}`, { entityId });
+      if (path != null) this._assertMemberOverridePath(entity, marker.value, path);
+      const asset = this._asset(document, marker.value.prefabId);
+      const targets = options.instance === true ? this._instanceMembers(scene.objects, marker.value) : [{ entity, marker }];
+      const reverted = [];
+      for (const target of targets) {
+        let overrides = isPlainObject(target.marker.value.overrides) ? clone(target.marker.value.overrides) : {};
+        const paths = path == null ? Object.keys(overrides) : [path];
+        const source = this._source(asset, target.marker.value.sourceEntityId);
+        for (const targetPath of paths) {
+          if (!Object.prototype.hasOwnProperty.call(overrides, targetPath)) {
+            if (path != null) throw prefabError('E_PREFAB_OVERRIDE_MISSING', `Prefab override does not exist: ${targetPath}`, { entityId: target.entity.id, path: targetPath });
+            continue;
+          }
+          if (!isPlainObject(overrides[targetPath]) || !DataModel.PREFAB_OVERRIDE_OPERATIONS.includes(overrides[targetPath].op)) {
+            throw prefabError('E_PREFAB_OVERRIDE_OPERATION', `Legacy Prefab override cannot be reverted automatically: ${targetPath}`, { entityId: target.entity.id, path: targetPath });
+          }
+          const operation = overrides[targetPath];
+          const orderedPaths = Object.keys(overrides);
+          const targetIndex = orderedPaths.indexOf(targetPath);
+          const followingPaths = targetIndex < 0 ? [] : orderedPaths.slice(targetIndex + 1);
+          this._revertOperation(source, target.entity, targetPath, operation);
+          delete overrides[targetPath];
+          if (path != null) {
+            overrides = this._rebaseArrayAfterRevert(source, target.entity, targetPath, overrides, operation, new Set(followingPaths)) || overrides;
+          }
+          reverted.push({ entityId: target.entity.id, sourceEntityId: target.marker.value.sourceEntityId, path: targetPath });
+        }
+        this._setMarker(target.entity, { ...target.marker.value, overrides });
+      }
+      const result = { prefabId: marker.value.prefabId, instanceRootId: marker.value.instanceRootId, reverted };
+      this._commit(document, 'prefab:revert', result);
+      return clone(result);
+    }
+    apply(entityId, options = {}) {
+      const document = clone(this._document());
+      const { scene, entity } = this._findActiveEntity(document, entityId);
+      const marker = this._marker(entity);
+      if (!marker) throw prefabError('E_PREFAB_NOT_INSTANCE', `Entity is not part of a Prefab instance: ${entityId}`, { entityId });
+      const asset = this._asset(document, marker.value.prefabId);
+      const previousRevision = Number.isInteger(asset.revision) ? asset.revision : 0;
+      const requestedPaths = options.paths == null ? null : (Array.isArray(options.paths) ? options.paths : [options.paths]);
+      requestedPaths?.forEach(path => this._assertMemberOverridePath(entity, marker.value, path));
+      const targets = requestedPaths || options.instance === false
+        ? [{ entity, marker }]
+        : this._instanceMembers(scene.objects, marker.value);
+      const changes = [];
+      const syncChanges = [];
+      const cleared = [];
+      for (const target of targets) {
+        const overrides = isPlainObject(target.marker.value.overrides) ? clone(target.marker.value.overrides) : {};
+        const paths = requestedPaths || Object.keys(overrides);
+        const source = this._source(asset, target.marker.value.sourceEntityId);
+        for (const path of paths) {
+          const orderedOverridePaths = Object.keys(overrides);
+          const pathIndex = orderedOverridePaths.indexOf(path);
+          const priorOverridePaths = pathIndex < 0 ? [] : orderedOverridePaths.slice(0, pathIndex);
+          let operation = overrides[path];
+          if (!isPlainObject(operation) || !DataModel.PREFAB_OVERRIDE_OPERATIONS.includes(operation.op)) {
+            throw prefabError('E_PREFAB_OVERRIDE_MISSING', `Canonical Prefab override does not exist: ${path}`, { entityId: target.entity.id, path });
+          }
+          let applyPath = path;
+          if (target.marker.value.prefabRevision !== previousRevision) {
+            const rebased = this._rebaseApplyOperation(source, target.entity, path, operation);
+            if (!rebased) {
+              delete overrides[path];
+              cleared.push({ sourceEntityId: source.id, entityId: target.entity.id, path });
+              continue;
+            }
+            applyPath = rebased.path;
+            operation = rebased.operation;
+          }
+          try {
+            DataModel.applyPrefabOverrideOperation(source, applyPath, operation);
+          } catch (error) {
+            if (error?.code !== 'E_PREFAB_OVERRIDE_TARGET') throw error;
+            const rebased = this._rebaseApplyOperation(source, target.entity, path, operation);
+            if (!rebased) {
+              delete overrides[path];
+              cleared.push({ sourceEntityId: source.id, entityId: target.entity.id, path });
+              continue;
+            }
+            applyPath = rebased.path;
+            operation = rebased.operation;
+            DataModel.applyPrefabOverrideOperation(source, applyPath, operation);
+          }
+          delete overrides[path];
+          if (applyPath !== path) {
+            for (const existing of Object.keys(overrides)) {
+              if (existing === applyPath || existing.startsWith(`${applyPath}/`) || applyPath.startsWith(`${existing}/`)) {
+                delete overrides[existing];
+                cleared.push({ sourceEntityId: source.id, entityId: target.entity.id, path: existing, promotedBy: path });
+              }
+            }
+          }
+          const change = {
+            sourceEntityId: source.id,
+            entityId: target.entity.id,
+            sceneId: scene.id,
+            instanceRootId: target.marker.value.instanceRootId,
+            path: applyPath,
+            operation: clone(operation)
+          };
+          changes.push(change);
+          syncChanges.push({ ...change, originalPath: path, priorOverridePaths, sourceAfter: clone(source) });
+        }
+        this._setMarker(target.entity, { ...target.marker.value, overrides });
+      }
+      if (!changes.length && !cleared.length) throw prefabError('E_PREFAB_NO_OVERRIDES', 'No Prefab overrides are available to apply', { entityId });
+      if (!changes.length) {
+        const result = { prefabId: asset.id, instanceRootId: marker.value.instanceRootId, revision: previousRevision, changes, cleared };
+        this._commit(document, 'prefab:apply', result);
+        return clone(result);
+      }
+      const currentGroups = new Map();
+      for (const { scene: candidateScene, objects } of this._scopes(document)) {
+        for (const candidate of objects) {
+          const candidateMarker = this._marker(candidate);
+          if (!candidateMarker || candidateMarker.value.prefabId !== asset.id) continue;
+          const key = `${candidateScene.id}\u0000${asset.id}\u0000${candidateMarker.value.instanceRootId}`;
+          currentGroups.set(key, (currentGroups.get(key) ?? true) && candidateMarker.value.prefabRevision === previousRevision);
+        }
+      }
+      asset.revision = previousRevision + 1;
+      for (const { scene: targetScene, objects } of this._scopes(document)) {
+        for (const target of objects) {
+          const targetMarker = this._marker(target);
+          if (!targetMarker || targetMarker.value.prefabId !== asset.id) continue;
+          const groupKey = `${targetScene.id}\u0000${asset.id}\u0000${targetMarker.value.instanceRootId}`;
+          const groupWasCurrent = currentGroups.get(groupKey) === true;
+          let overrides = isPlainObject(targetMarker.value.overrides) ? clone(targetMarker.value.overrides) : {};
+          if (groupWasCurrent) {
+            for (const change of syncChanges) {
+              if (targetMarker.value.sourceEntityId !== change.sourceEntityId) continue;
+              const initiatingTarget = targetScene.id === change.sceneId && target.id === change.entityId &&
+                targetMarker.value.instanceRootId === change.instanceRootId;
+              overrides = this._syncPathPreservingOverrides(change.sourceAfter, target, change.path, overrides, change.operation, {
+                operationAlreadyApplied: initiatingTarget,
+                reindexPaths: initiatingTarget ? new Set(change.priorOverridePaths) : null
+              });
+            }
+          }
+          this._setMarker(target, {
+            ...targetMarker.value,
+            overrides,
+            prefabRevision: groupWasCurrent ? asset.revision : targetMarker.value.prefabRevision
+          });
+        }
+      }
+      const result = { prefabId: asset.id, instanceRootId: marker.value.instanceRootId, revision: asset.revision, changes, cleared };
+      this._commit(document, 'prefab:apply', result);
+      return clone(result);
+    }
+    unpack(entityId) {
+      const document = clone(this._document());
+      const { scene, entity } = this._findActiveEntity(document, entityId);
+      const marker = this._marker(entity);
+      if (!marker) throw prefabError('E_PREFAB_NOT_INSTANCE', `Entity is not part of a Prefab instance: ${entityId}`, { entityId });
+      const members = this._instanceMembers(scene.objects, marker.value);
+      members.forEach(item => this._removeMarker(item.entity));
+      const result = {
+        prefabId: marker.value.prefabId,
+        instanceRootId: marker.value.instanceRootId,
+        entityIds: members.map(item => item.entity.id)
+      };
+      this._commit(document, 'prefab:unpack', result);
+      return clone(result);
+    }
+  }
+
   class Engine {
     constructor(options = {}) {
       this.events = new EventBus();
@@ -2718,6 +3557,7 @@
       this.animation = new AnimationSystem(this);
       this.postProcess = new PostProcessSystem(this);
       this.tilemap = new TilemapSystem(this);
+      this.prefabs = new PrefabSystem(this);
       const physicsOptions = { ...(options.physicsOptions || {}) };
       if (options.gravity && !physicsOptions.gravity) physicsOptions.gravity = options.gravity;
       this._physicsOptions = { ...physicsOptions };
@@ -2879,6 +3719,12 @@
       }
       const source = document;
       assertDataModelCompatibility(source);
+      // ECS snapshots are intentionally definition-free and already contain
+      // concrete expanded Entities. Universal authoring projects, however,
+      // must keep every linked instance resolvable against its Prefab Asset.
+      if (Number(source.version) === 4 || source.prefabs != null) {
+        DataModel.assertPrefabDocument(source, { entityCodec: this.entityCodec });
+      }
       const scenes = Array.isArray(source.scenes) ? source.scenes : [];
       const requestedSceneId = options.sceneId || source.currentSceneId || source.meta?.currentSceneId || null;
       const activeScene = scenes.length
@@ -3159,7 +4005,7 @@
     createDefaultComponentRegistry: DataModel.createDefaultComponentRegistry,
     createDefaultEntityCodec: DataModel.createDefaultEntityCodec,
     LightingSystem, ShadowSystem, AnimationSystem, PostProcessSystem, TilemapSystem,
-    DEFAULT_POST_PROCESS_EFFECTS, createDefaultPostProcess,
+    DEFAULT_POST_PROCESS_EFFECTS, createDefaultPostProcess, PrefabSystem,
     BODY_TYPES, COLLIDER_SHAPES, PhysicsAdapter, Box2DPhysicsAdapter,
     RuntimeAdapter, PixiRuntimeAdapter, PhaserRuntimeAdapter, CustomRuntimeAdapter,
     EditorBridge

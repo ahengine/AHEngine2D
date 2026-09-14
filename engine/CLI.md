@@ -37,7 +37,7 @@ stdout is JSON by default:
 
 Errors use the same protocol on stderr and a non-zero, categorized exit code. `capabilities` is the machine-readable discovery contract. It reports `dataModel`, the three component-schema profiles, registry types, `unknownComponents: "preserve"`, and `precedence: "components"`. Human-readable output is opt-in with `--format text`.
 
-The `sceneGraph` capability declares `parentId` storage, local authoring Transform space, the derived world-matrix shape, the default Reparent mode, both preservation flags, and the tree/world inspection command. `enums.physicsBackend` and `options.physicsBackend` expose the supported Physics execution backends and the commands accepting `--backend`. Agents should discover these fields instead of assuming Editor behavior.
+The `sceneGraph` capability declares `parentId` storage, local authoring Transform space, the derived world-matrix shape, the default Reparent mode, both preservation flags, and the tree/world inspection command. `prefabs` declares canonical storage, expanded-instance behavior, RFC 6901 override paths, operations, and root-placement rules. `enums.physicsBackend` and `options.physicsBackend` expose the supported Physics execution backends and the commands accepting `--backend`. Agents should discover these fields instead of assuming Editor behavior.
 
 Exit codes:
 
@@ -125,11 +125,12 @@ Use the schema commands instead of scraping `--help` or copying assumptions from
 ```text
 npm run ah2d -- schema list --pretty
 npm run ah2d -- schema show --name project --pretty
+npm run ah2d -- schema show --name prefabAsset --pretty
 npm run ah2d -- schema show --component Transform --pretty
 npm run ah2d -- schema show component:Body --pretty
 ```
 
-`schema list` returns the document schemas (`project`, `operation`, `batch`) and all built-in component types. `schema show --component TYPE` returns the canonical type, aliases, schema version, required/removable/tag flags, defaults, `authoring`/`runtime`/`snapshot` schemas, runtime-only fields, and storage metadata. Aliases resolve to the canonical descriptor, so `component:Body` reports `component:Rigidbody`.
+`schema list` returns the document schemas (`project`, `prefabAsset`, `operation`, `batch`) and all built-in component types. `schema show --component TYPE` returns the canonical type, aliases, schema version, required/removable/tag flags, defaults, `authoring`/`runtime`/`snapshot` schemas, runtime-only fields, and storage metadata. Aliases resolve to the canonical descriptor, so `component:Body` reports `component:Rigidbody`.
 
 ## Components
 
@@ -153,6 +154,69 @@ npm run ah2d -- component delete --file game.ah2d.json --scene main player Colli
 Transform and Name are required and cannot be removed.
 
 Values must be JSON-safe objects or arrays, and component keys must be safe PascalCase names. The built-in registry is open-world: an unregistered custom type such as `Health` or `PlayerController` is accepted under `components.<Type>`, validated with the generic object/array schema, and preserved losslessly. Register its stronger schema with the Engine when runtime code needs defaults, normalization, aliases, or migrations; the standalone CLI exposes its built-in registry and does not load arbitrary game code.
+
+## Prefab Assets, Instances, and overrides
+
+Reusable definitions live in top-level `prefabs`. Each Asset owns stable source-Entity IDs and a revision:
+
+```json
+{
+  "id": "crate-prefab",
+  "name": "Crate",
+  "rootEntityId": "crate-root",
+  "revision": 1,
+  "entities": [
+    { "id": "crate-root", "name": "Crate", "x": 0, "y": 0 },
+    { "id": "crate-lid", "name": "Lid", "parentId": "crate-root", "x": 0, "y": -12 }
+  ]
+}
+```
+
+Creating an Asset from a Scene Entity captures its complete subtree, normalizes the Asset root's effective local Transform to identity, and connects the existing Scene subtree as the first expanded instance without moving it. Instantiating clones every source Entity, remaps internal `parentId` values, and gives every member a `PrefabInstance` component containing `prefabId`, `sourceEntityId`, `instanceRootId`, `prefabRevision`, and `overrides`.
+
+```text
+npm run ah2d -- prefab asset list --file game.ah2d.json --pretty
+npm run ah2d -- prefab asset get --file game.ah2d.json crate-prefab --pretty
+npm run ah2d -- prefab asset create --file game.ah2d.json --scene main --entity crate --id crate-prefab --name Crate --dry-run --include-document
+npm run ah2d -- prefab asset create --file game.ah2d.json --scene main --entity crate --id crate-prefab --write --expect-sha256 <sha256>
+npm run ah2d -- prefab instantiate --file game.ah2d.json --scene main crate-prefab --id crate-2 --parent props --x 480 --y 240 --write
+npm run ah2d -- prefab unpack --file game.ah2d.json --scene main crate-2 --write
+```
+
+The external `parentId` and complete local `Transform` are independent placement state on an instance root. `--parent`, `--x`, and `--y` initialize part of that placement during instantiation. Asset synchronization never rewrites the root's placement. Edit root position, rotation, and scale with the ordinary Entity/Transform commands, not with Prefab overrides.
+
+An override key is a canonical RFC 6901 pointer relative to one expanded Entity. Its value is an explicit JSON Patch-style record: `{ "op": "add", "value": ... }`, `{ "op": "replace", "value": ... }`, or `{ "op": "remove" }`. This keeps removal distinct from setting a real JSON `null` value. Dot paths are accepted by `override set` for convenience but are stored as canonical pointers. Entity `id`, `parentId`, the legacy `prefab` projection, and `components.PrefabInstance` cannot be overridden.
+
+Override paths within one member never overlap. Setting an exact or ancestor path replaces that record and clears covered descendants. When an existing ancestor override already owns the requested nested path, the CLI mutates and rebases that owning record so sibling differences remain tracked rather than becoming silent local state. Mutation results expose `storedPath` when it differs from the requested `path`. `--remove` stores an explicit `remove` only when the Asset owns the source path. If the path was introduced only by a local `add`, `--remove` deletes that local value and clears its overlapping record instead of persisting an invalid removal.
+
+```text
+npm run ah2d -- prefab override set --file game.ah2d.json --scene main crate-2-child --path /color --value '"#ff8844"' --write
+npm run ah2d -- prefab override set --file game.ah2d.json --scene main crate-2-child --path /components/Health/temporary --remove --write
+npm run ah2d -- prefab override inspect --file game.ah2d.json --scene main crate-2-child --pretty
+npm run ah2d -- prefab override inspect --file game.ah2d.json --scene main crate-2 --all --pretty
+npm run ah2d -- prefab override revert --file game.ah2d.json --scene main crate-2-child --path /color --write
+npm run ah2d -- prefab override apply --file game.ah2d.json --scene main crate-2-child --path /color --write
+npm run ah2d -- prefab override apply --file game.ah2d.json --scene main crate-2 --all --write
+```
+
+`override inspect` reports the Asset source state, current instance state, and stored operation for every override. `revert` restores the source value (or removes a property absent from the Asset) and clears the record. `apply` executes the stored canonical operation against the Asset, increments its revision, clears the applied record, and synchronizes other connected instances. An exact override or ancestor override owns its complete branch and blocks that Asset change. Descendant overrides retain their effective values and are rebased against the new Asset source while unaffected siblings still synchronize. If an Asset edit removes or retypes an ancestor needed by a descendant override, the CLI preserves the previous effective branch and promotes it to one valid override on that ancestor. Array insertion/removal reindexes later override pointers; an override on an element removed by the Asset is promoted to ownership of the complete array so the Instance remains reconstructable.
+
+A direct `add` at `/components/<Type>` may materialize a missing `components` map on a compact Asset source. This exception exists only for adding one complete Component. Deeper paths such as `/components/Health/current` still require their parent Component to exist, preserving strict pointer behavior.
+
+Revision synchronization is atomic per expanded Instance group. Only a group whose every member was at the Asset's previous revision is synchronized and advanced to the new revision. A stale group is neither partially mutated nor stamped current; it remains stale until a full compatible synchronization is explicitly performed.
+
+Connected instance members are lifecycle-managed. Ordinary Entity and Component mutations cannot rename, patch, clone, delete, reparent, or add children inside a connected instance, and non-placement properties must go through `prefab override set`. Unpack first when a structural edit is intended. The only direct exceptions are the complete local `Transform` and external `parentId` of the instance root; use Transform commands and `entity reparent` for those. `capabilities.prefabs.connectedMutationPolicy` exposes this rule for agents. Whole-Scene clone remains supported and remaps each copied `instanceRootId` with its copied Scene Entity IDs. Low-level `patch` and generic resource writes remain explicit raw escape hatches and are responsible for preserving a valid Prefab contract.
+
+Update can merge metadata/definition data through `--patch`, or recapture a Scene subtree with `--entity`. It increments the Asset revision and rebuilds expanded Instance groups that were current at the previous revision while preserving their recorded overrides, unknown marker extensions, and root placement. Stale groups are skipped and reported through `synchronized.staleInstanceCount`. Removing source members removes their generated instance members from synchronized groups; external children of a removed member are retained under the instance root.
+
+```text
+npm run ah2d -- prefab asset update --file game.ah2d.json crate-prefab --patch @crate-prefab.patch.json --write
+npm run ah2d -- prefab asset update --file game.ah2d.json crate-prefab --scene main --entity updated-crate --write
+npm run ah2d -- prefab asset delete --file game.ah2d.json crate-prefab --write
+npm run ah2d -- prefab asset delete --file game.ah2d.json crate-prefab --unpack-instances --write
+```
+
+Asset deletion rejects live connected instances with `E_PREFAB_IN_USE`. The explicit `--unpack-instances` mode keeps their concrete Scene Entities and removes only their Prefab markers before deleting the Asset. Legacy top-level `prefab` workspace data is preserved and remains available through raw `resource` reads, but lifecycle commands intentionally do not reinterpret it as reusable definitions. Creating the first reusable Asset adds canonical `prefabs` without deleting the legacy field. Use the domain commands for lifecycle edits rather than raw `resource put`, because the latter does not connect or synchronize instances.
 
 ## Runtime and physics
 
@@ -218,7 +282,7 @@ npm run ah2d -- patch --file game.ah2d.json --patch @changes.patch.json --dry-ru
 npm run ah2d -- project patch --file game.ah2d.json --patch '{"meta":{"name":"Renamed"}}' --write
 ```
 
-Resources are accessible with `resource list|get|put|delete` for `assets`, `folders`, `prefabs`, `animations`, and `particles`.
+Resources are accessible with `resource list|get|put|delete` for `assets`, `folders`, `prefabs`, `animations`, and `particles`. Prefer the `prefab` domain commands for reusable Prefab lifecycle changes; generic resource writes are intentionally raw.
 
 ## ECS export and migration
 

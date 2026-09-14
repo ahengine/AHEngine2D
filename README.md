@@ -124,7 +124,7 @@ Editor تعبیه‌شده عمومی است، اما در iframe با origin ا
 
 | خروجی | نسخه | محتوا | کاربرد |
 | --- | ---: | --- | --- |
-| Editor Universal JSON | 4 | تمام Sceneها، assets، prefab workspace، animationها، particleها، Post Process و تنظیمات Engine | منبع اصلی پروژه، Save/Load و ادامهٔ ویرایش |
+| Editor Universal JSON | 4 | تمام Sceneها، assets، Prefab Asset/Instance/Override، animationها، particleها، Post Process و تنظیمات Engine | منبع اصلی پروژه، Save/Load و ادامهٔ ویرایش |
 | `Engine.export()` یا `ah2d ecs export` | 3 | فقط Entity/Componentهای Scene فعال در Runtime | Debug، تست یا انتقال snapshot فعال |
 | Animation asset | 1 | مشخصات clip و eventها | مصرف توسط سیستم animation بازی |
 | Particle asset | 1 | پارامترهای emitter | مصرف توسط renderer/particle system بازی |
@@ -227,6 +227,7 @@ Registry پیش‌فرض این componentها را می‌شناسد: `Name`، `
   },
   "assets": [],
   "folders": ["Environment", "Characters", "FX", "UI", "Prefabs", "Animations"],
+  "prefabs": [],
   "prefab": [],
   "animations": [],
   "particles": []
@@ -332,10 +333,33 @@ Shortcutهای ورودی و component متناظر در Runtime:
 | `kind/w/h/color/assetId/imageSrc` | `Renderable` |
 | `visible: false` | `Hidden` |
 | `locked: true` | `Locked` |
-| `prefab: true` | `PrefabInstance` |
+| `prefab: true` | projection قدیمی و بدون lifecycle کامل برای `PrefabInstance` |
+| `components.PrefabInstance` | اتصال canonical هر member به Prefab Asset و Overrideهای همان member |
 | `rigidbody` یا `rigidBody` | `Rigidbody` |
 | `collider` | `Collider` |
 | `components.*` | component canonical یا سفارشی؛ در تداخل با shortcutهای بالا precedence دارد |
+
+## Prefab واقعی
+
+تعریف‌های قابل‌استفادهٔ مجدد در `prefabs[]` و Instanceها به‌صورت Entityهای واقعی داخل Scene ذخیره می‌شوند. هر member با `components.PrefabInstance` به `prefabId`، `sourceEntityId` و `instanceRootId` متصل است و Overrideهای path-based خود را نگه می‌دارد. در نتیجه Render، Physics و Scene Graph برای دیدن Instance به یک placeholder یا object خاص وابسته نیستند.
+
+```js
+const crate = engine.prefabs.createAsset('crate', {
+  id: 'crate-prefab',
+  name: 'Crate'
+});
+
+const copy = engine.prefabs.instantiate(crate.id, {
+  rootId: 'crate-2',
+  transform: { x: 480, y: 240 }
+});
+
+engine.prefabs.setOverride('crate-2', '/color', '#ff8844');
+engine.prefabs.apply('crate-2', { paths: ['/color'] });
+engine.prefabs.unpack(copy.instanceRootId);
+```
+
+Transform و parent خارجی root، placement مستقل Instance است؛ Apply و sync آن را بازنویسی نمی‌کنند. Revert مقدار source را برمی‌گرداند، Apply definition و Instanceهای بدون Override متعارض را sync می‌کند و Unpack فقط اتصال Prefab را حذف می‌کند؛ ظاهر و hierarchy Scene باقی می‌ماند. قرارداد JSON، قواعد deletion، API کامل Engine و workflow Editor/CLI در [راهنمای Prefab](./docs/PREFABS.md) آمده است.
 
 ## کار امن با پروژه از طریق CLI
 
@@ -1047,11 +1071,11 @@ engine.events.emit(type, payload)
 ## وضعیت فعلی Authoring Assetها
 
 - نام پروژه در خروجی مستقیم Editor فعلاً `Demo Project` است؛ CLI می‌تواند `meta.name` را بدون از دست رفتن داده تغییر دهد.
-- Loader فعلی Editor ساختار top-level را بازسازی می‌کند؛ فیلدهای ناشناختهٔ داخل Entity حفظ می‌شوند، اما فیلدهای ناشناختهٔ top-level/Scene/meta/engine تضمین‌شده نیستند. برای mutation بدون اتلاف از CLI استفاده کنید.
+- Loader فعلی Editor فیلدهای ناشناختهٔ سند، Scene، `meta`، `engine`، Asset و Entity را هنگام Load/Save حفظ می‌کند؛ بخش‌هایی که Editor واقعاً مدل می‌کند با state فعال به‌روزرسانی می‌شوند. برای mutation اتمیک و قابل‌شرط‌گذاری با hash همچنان از CLI استفاده کنید.
 - Project Load فقط `particles[0]` را بازیابی می‌کند و `animations` را هنوز به state ادیتور برنمی‌گرداند. Assetها نیز بر اساس ID merge می‌شوند.
 - standalone animation/particle JSON ورودی مستقیم Project Load نیستند.
 - layout پنل‌ها، selection، undo history، grid/snap، commentهای محلی داخل canvas و وضعیت دوربین Prefab در Universal JSON ذخیره نمی‌شوند. Commentهای مشارکتی Studio جداگانه در Project API ذخیره می‌شوند.
-- `prefab` فعلاً یک workspace سراسری و flat است، نه مجموعه‌ای کامل از definition/variant/overrideها.
+- Prefabهای canonical از Asset/Instance/Override/Apply/Revert/Unpack پشتیبانی می‌کنند؛ nested Prefab Asset و structural override هنوز پشتیبانی نمی‌شوند و برای تغییر hierarchy یک Instance متصل باید ابتدا Unpack انجام شود.
 - Animation export فعلاً metadata و eventهای hard-coded clip را ذخیره می‌کند؛ frame image، curve و hitbox serialization کامل نیست و Project Load آن را مصرف نمی‌کند.
 - Particle export پارامترهای emitter را ذخیره می‌کند؛ texture، gradient، curve keyها و live particleها صادر نمی‌شوند.
 - Editor چند fixture مستقل box/circle را روی یک Entity مدیریت می‌کند. polygon/chain/joint هنوز قرارداد Authoring داخل Universal JSON ندارند؛ در صورت نیاز بازی از handle بومی Runtime استفاده کند.

@@ -5,10 +5,11 @@ const fs = require('fs');
 const path = require('path');
 const {
   PROTOCOL, PROJECT_VERSION, PHYSICS_BACKENDS, PHYSICS_IMPLEMENTATIONS, EXIT, DomainError, clone, detectDialect, createProject,
-  DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES, componentRegistry,
+  DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES, PREFAB_ASSET_SCHEMA, componentRegistry,
   migrateDocument, syncActiveMirror, validateDocument, assertValid, resolveScene,
   resolveEntity, entityName, applyOperations, applyJsonPatch, mergePatch, getPointer,
-  listComponents, listEntities, getComponent, putComponent, resourceField, documentHash
+  listComponents, listEntities, getComponent, putComponent, resourceField, documentHash,
+  prefabAssets, resolvePrefab, inspectPrefabOverrides
 } = require('./AH2DProject.js');
 
 const CLI_VERSION = '0.3.0';
@@ -18,7 +19,7 @@ const BOOLEAN_OPTIONS = new Set([
   'activate', 'keep-ids', 'deep', 'cascade', 'reparent', 'strict', 'warnings-as-errors',
   'allow-invalid', 'fix', 'check', 'commit', 'tree', 'engine', 'backup', 'mkdir',
   'string', 'quiet', 'include-document', 'allow-future', 'include-stack', 'root',
-  'world', 'preserve-world', 'preserve-local'
+  'world', 'preserve-world', 'preserve-local', 'all', 'remove', 'unpack-instances'
 ]);
 const SHORT_OPTIONS = { f: 'file', o: 'out', j: 'json', h: 'help', w: 'write', n: 'dry-run' };
 
@@ -266,7 +267,7 @@ function inspectProject(context) {
       runtime: document.engine?.runtime || document.engine?.renderer || null,
       physics: { ...configuredPhysics(document), gravity: document.engine?.gravity || null, pixelsPerMeter: document.engine?.pixelsPerMeter || null },
       scenes: scenes.map(scene => ({ id: scene.id, name: scene.name, objectCount: scene.objects?.length || 0 })),
-      resources: { assets: document.assets?.length || 0, folders: document.folders?.length || 0, prefabs: document.prefabs?.length || document.prefab?.length || 0, animations: document.animations?.length || 0, particles: document.particles?.length || 0 }
+      resources: { assets: document.assets?.length || 0, folders: document.folders?.length || 0, prefabs: Array.isArray(document.prefabs) ? document.prefabs.length : (document.prefab?.length || 0), animations: document.animations?.length || 0, particles: document.particles?.length || 0 }
     }
   };
 }
@@ -326,6 +327,7 @@ function capabilities() {
       project: ['init', 'show', 'patch'], scene: ['list', 'get', 'create', 'clone', 'rename', 'select', 'delete', 'export', 'import'],
       entity: ['list', 'tree', 'get', 'create', 'clone', 'rename', 'set', 'patch', 'reparent', 'delete'],
       component: ['list', 'get', 'put', 'set', 'patch', 'delete'], resource: ['list', 'get', 'put', 'delete'],
+      prefab: ['asset list', 'asset get', 'asset create', 'asset update', 'asset delete', 'instantiate', 'override inspect', 'override set', 'override apply', 'override revert', 'unpack'],
       runtime: ['get', 'set'], physics: ['get', 'set'], schema: ['list', 'show'],
       topLevel: ['init', 'inspect', 'validate', 'format', 'migrate', 'query', 'patch', 'apply', 'simulate', 'ecs export', 'doctor', 'version', 'capabilities']
     },
@@ -343,6 +345,24 @@ function capabilities() {
       unparent: '--root',
       reparentTransform: { default: 'preserve-local', preserveLocal: '--preserve-local', preserveWorld: '--preserve-world' }
     },
+    prefabs: {
+      storage: 'prefabs', legacyStorage: 'prefab', instanceComponent: 'PrefabInstance', expandedInstances: true,
+      overridePath: 'RFC 6901 relative to Entity', overrideOps: ['add', 'replace', 'remove'],
+      placement: { root: ['parentId', 'Transform'], inherited: false },
+      connectedMutationPolicy: {
+        structural: 'unpack-required',
+        properties: 'prefab override set',
+        rootPlacement: ['entity set', 'component put', 'component patch', 'component set', 'entity reparent']
+      },
+      overrideSynchronization: {
+        orphanedDescendants: 'promote-to-changed-ancestor',
+        arrayIndexes: 'reindex-or-promote-array',
+        staleInstanceGroups: 'skip'
+      },
+      componentContainerSynthesis: 'direct /components/<Type> add only',
+      deleteLiveInstances: '--unpack-instances', overrideSelection: '--path or --all', overrideRemoval: '--remove',
+      operations: ['prefab.asset.create', 'prefab.asset.update', 'prefab.asset.delete', 'prefab.instantiate', 'prefab.override.set', 'prefab.override.apply', 'prefab.override.revert', 'prefab.unpack']
+    },
     mutationSafety: { explicitWrite: ['--write', '--out', '--print-document', '--dry-run'], optimisticConcurrency: '--expect-sha256', atomicReplace: true, batchRollback: true, unknownFieldsPreserved: true },
     input: { project: ['--file PATH', '--file -'], jsonValue: ['JSON', '@file.json', '-'] },
     output: { protocol: PROTOCOL, default: 'json', human: '--format text', pretty: '--pretty' }
@@ -354,8 +374,9 @@ function componentSchemaTypes() {
 }
 
 const schemas = {
-  project: { $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'AH2D Project', type: 'object', required: ['format', 'version', 'currentSceneId', 'scenes'], properties: { format: { const: 'AH2D' }, version: { type: 'integer', maximum: PROJECT_VERSION }, dataModel: { type: 'object', required: ['id', 'version', 'componentSchemaVersion'], properties: { id: { const: DATA_MODEL_DESCRIPTOR.id }, version: { const: DATA_MODEL_DESCRIPTOR.version }, componentSchemaVersion: { const: DATA_MODEL_DESCRIPTOR.componentSchemaVersion } }, additionalProperties: true }, currentSceneId: { type: 'string' }, scenes: { type: 'array', minItems: 1, items: { $ref: '#/$defs/scene' } } }, $defs: { scene: { type: 'object', required: ['id', 'name', 'objects'], properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string' }, objects: { type: 'array', items: { $ref: '#/$defs/entity' } } }, additionalProperties: true }, entity: { type: 'object', required: ['id'], properties: { id: { type: 'string', minLength: 1 }, parentId: { type: ['string', 'null'], minLength: 1, description: 'Stable ID of the parent Entity in the same Scene; Transform is local to this parent.' }, x: { type: 'number', description: 'Local X position.' }, y: { type: 'number', description: 'Local Y position.' }, rot: { type: 'number', description: 'Local rotation in degrees.' }, rotation: { type: 'number', description: 'Local rotation in degrees.' }, sx: { type: 'number', description: 'Local X scale.' }, sy: { type: 'number', description: 'Local Y scale.' }, scaleX: { type: 'number', description: 'Local X scale.' }, scaleY: { type: 'number', description: 'Local Y scale.' }, components: { type: 'object' } }, additionalProperties: true } } },
-  operation: { type: 'object', required: ['op'], properties: { op: { type: 'string', pattern: '^(scene|entity|component|resource|runtime|physics|project)\\.' } }, additionalProperties: true },
+  project: { $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'AH2D Project', type: 'object', required: ['format', 'version', 'currentSceneId', 'scenes'], properties: { format: { const: 'AH2D' }, version: { type: 'integer', maximum: PROJECT_VERSION }, dataModel: { type: 'object', required: ['id', 'version', 'componentSchemaVersion'], properties: { id: { const: DATA_MODEL_DESCRIPTOR.id }, version: { const: DATA_MODEL_DESCRIPTOR.version }, componentSchemaVersion: { const: DATA_MODEL_DESCRIPTOR.componentSchemaVersion } }, additionalProperties: true }, currentSceneId: { type: 'string' }, scenes: { type: 'array', minItems: 1, items: { $ref: '#/$defs/scene' } }, prefabs: { type: 'array', items: { $ref: '#/$defs/prefabAsset' } } }, $defs: { scene: { type: 'object', required: ['id', 'name', 'objects'], properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string' }, objects: { type: 'array', items: { $ref: '#/$defs/entity' } } }, additionalProperties: true }, entity: { type: 'object', required: ['id'], properties: { id: { type: 'string', minLength: 1 }, parentId: { type: ['string', 'null'], minLength: 1, description: 'Stable ID of the parent Entity in the same Scene; Transform is local to this parent.' }, x: { type: 'number', description: 'Local X position.' }, y: { type: 'number', description: 'Local Y position.' }, rot: { type: 'number', description: 'Local rotation in degrees.' }, rotation: { type: 'number', description: 'Local rotation in degrees.' }, sx: { type: 'number', description: 'Local X scale.' }, sy: { type: 'number', description: 'Local Y scale.' }, scaleX: { type: 'number', description: 'Local X scale.' }, scaleY: { type: 'number', description: 'Local Y scale.' }, components: { type: 'object' } }, additionalProperties: true }, prefabAsset: clone(PREFAB_ASSET_SCHEMA) } },
+  prefabAsset: clone(PREFAB_ASSET_SCHEMA),
+  operation: { type: 'object', required: ['op'], properties: { op: { type: 'string', pattern: '^(scene|entity|component|resource|runtime|physics|project|prefab)\\.' } }, additionalProperties: true },
   batch: { type: 'array', minItems: 1, items: { $ref: '#/$defs/operation' }, $defs: { operation: { type: 'object', required: ['op'], properties: { op: { type: 'string' } } } } }
 };
 
@@ -395,6 +416,9 @@ Domain commands:
   ah2d scene list|create|clone|rename|select|delete
   ah2d entity list|tree|get|create|clone|rename|set|patch|reparent|delete
   ah2d component list|get|put|set|patch|delete
+  ah2d prefab asset list|get|create|update|delete
+  ah2d prefab instantiate|unpack
+  ah2d prefab override inspect|set|apply|revert
   ah2d resource list|get|put|delete
   ah2d runtime get|set
   ah2d physics get|set [--backend box2d|builtin]
@@ -447,6 +471,7 @@ function dispatch(parsed) {
   if (command === 'scene') return sceneCommand(context, positionals, options);
   if (command === 'entity') return entityCommand(context, positionals, options);
   if (command === 'component') return componentCommand(context, positionals, options);
+  if (command === 'prefab') return prefabCommand(context, positionals, options);
   if (command === 'resource') return resourceCommand(context, positionals, options);
   if (command === 'runtime') return runtimeCommand(context, positionals, options);
   if (command === 'physics') return physicsCommand(context, positionals, options);
@@ -528,6 +553,87 @@ function componentCommand(context, positionals, options) {
   else if (action === 'delete' || action === 'remove') operation = { op: 'component.delete', ...sceneSelect, ...entitySelect, component: type };
   else throw new DomainError('E_COMMAND', `Unknown component command: ${action}`, { exitCode: EXIT.USAGE });
   return operationResult(context, [operation], options, `component.${action}`);
+}
+
+function prefabCommand(context, positionals, options) {
+  let section = (positionals.shift() || 'asset').toLowerCase();
+  if (['list', 'get', 'create', 'update', 'delete', 'remove'].includes(section)) { positionals.unshift(section);section = 'asset'; }
+  const migrated = migrateDocument(context.document), document = migrated.document;
+  if (section === 'asset' || section === 'assets') {
+    const action = (positionals.shift() || 'list').toLowerCase(), list = prefabAssets(document);
+    if (action === 'list') {
+      return {
+        command: 'prefab.asset.list',
+        data: {
+          file: context.file, sha256: context.hash,
+          prefabs: list.map(asset => typeof asset === 'object' && asset !== null
+            ? { id: asset.id || null, name: asset.name || null, rootEntityId: asset.rootEntityId || null, entityCount: Array.isArray(asset.entities) ? asset.entities.length : 0 }
+            : { id: null, name: String(asset), rootEntityId: null, entityCount: 0 })
+        }
+      };
+    }
+    const reference = options.prefab || options['prefab-id'] || (action === 'create' ? options.id : (options.id || positionals.shift()));
+    if (action === 'get') {
+      const prefab = resolvePrefab(document, requiredValue(reference, 'prefab asset get requires a Prefab ID'));
+      return { command: 'prefab.asset.get', data: { file: context.file, sha256: context.hash, prefab: clone(prefab) } };
+    }
+    if (action === 'create') {
+      const valueSource = options.value ?? options.data;
+      const entityReference = options.entity || options['entity-id'] || (options['entity-name'] == null ? positionals.shift() : null);
+      const operation = {
+        op: 'prefab.asset.create', ...sceneSelector(options),
+        prefabId: reference, name: options.name,
+        ...(options['entity-name'] != null ? { entity: options['entity-name'], entityName: true } : { entityId: entityReference }),
+        ...(valueSource !== undefined ? { value: readValue(valueSource, options) } : {})
+      };
+      if (valueSource === undefined && !entityReference && options['entity-name'] == null) throw new DomainError('E_REQUIRED_VALUE', 'prefab asset create requires --entity or --value', { exitCode: EXIT.USAGE });
+      return operationResult(context, [operation], options, 'prefab.asset.create');
+    }
+    if (action === 'update') {
+      const prefabId = requiredValue(reference, 'prefab asset update requires a Prefab ID'), patchSource = options.patch;
+      const entityReference = options.entity || options['entity-id'] || (options['entity-name'] == null ? positionals.shift() : null);
+      if (patchSource === undefined && !entityReference && options['entity-name'] == null) throw new DomainError('E_REQUIRED_VALUE', 'prefab asset update requires --entity or --patch', { exitCode: EXIT.USAGE });
+      const operation = {
+        op: 'prefab.asset.update', ...sceneSelector(options), prefabId, name: options.name,
+        ...(options['entity-name'] != null ? { entity: options['entity-name'], entityName: true } : { entityId: entityReference }),
+        ...(patchSource !== undefined ? { patch: readValue(patchSource, options) } : {})
+      };
+      return operationResult(context, [operation], options, 'prefab.asset.update');
+    }
+    if (action === 'delete' || action === 'remove') {
+      return operationResult(context, [{ op: 'prefab.asset.delete', prefabId: requiredValue(reference, 'prefab asset delete requires a Prefab ID'), unpackInstances: options['unpack-instances'] === true }], options, 'prefab.asset.delete');
+    }
+    throw new DomainError('E_COMMAND', `Unknown prefab asset command: ${action}`, { exitCode: EXIT.USAGE });
+  }
+  if (section === 'instantiate' || section === 'instance') {
+    if (section === 'instance' && (positionals[0] || '').toLowerCase() === 'create') positionals.shift();
+    const prefabId = options.prefab || options['prefab-id'] || positionals.shift();
+    return operationResult(context, [{
+      op: 'prefab.instantiate', ...sceneSelector(options), prefabId: requiredValue(prefabId, 'prefab instantiate requires a Prefab ID'),
+      rootId: options.id || options['entity-id'], parentId: options.parent || options['parent-id'], x: options.x, y: options.y
+    }], options, 'prefab.instantiate');
+  }
+  if (section === 'override' || section === 'overrides') {
+    const action = (positionals.shift() || 'inspect').toLowerCase(), sceneSelect = sceneSelector(options), scene = resolveScene(document, sceneSelect.sceneId || sceneSelect.scene, { allowName: Boolean(sceneSelect.sceneName) });
+    const entityReference = options.entity || options['entity-id'] || (options['entity-name'] == null ? positionals.shift() : null);
+    const entitySelect = options['entity-name'] != null ? { entityId: options['entity-name'], entityName: true } : { entityId: requiredValue(entityReference, `prefab override ${action} requires an Entity ID`) };
+    const entity = resolveEntity(scene, entitySelect.entityId, { allowName: Boolean(entitySelect.entityName) });
+    if (action === 'inspect' || action === 'list') return { command: 'prefab.override.inspect', data: { file: context.file, sha256: context.hash, ...inspectPrefabOverrides(document, scene, entity, { all: options.all }) } };
+    if (action === 'set') {
+      const path = requiredValue(options.path || positionals.shift(), 'prefab override set requires --path');
+      if (options.remove !== true && options.value === undefined) throw new DomainError('E_PREFAB_OVERRIDE_VALUE', 'prefab override set requires --value or --remove', { exitCode: EXIT.USAGE });
+      return operationResult(context, [{ op: 'prefab.override.set', ...sceneSelect, ...entitySelect, path, remove: options.remove === true, value: options.remove === true ? undefined : readValue(options.value, options) }], options, 'prefab.override.set');
+    }
+    if (action === 'apply' || action === 'revert') {
+      return operationResult(context, [{ op: `prefab.override.${action}`, ...sceneSelect, ...entitySelect, path: options.path || positionals.shift(), all: options.all === true }], options, `prefab.override.${action}`);
+    }
+    throw new DomainError('E_COMMAND', `Unknown prefab override command: ${action}`, { exitCode: EXIT.USAGE });
+  }
+  if (section === 'unpack') {
+    const entityReference = options.entity || options['entity-id'] || (options['entity-name'] == null ? positionals.shift() : null), selector = options['entity-name'] != null ? { entityId: options['entity-name'], entityName: true } : { entityId: requiredValue(entityReference, 'prefab unpack requires an Entity ID') };
+    return operationResult(context, [{ op: 'prefab.unpack', ...sceneSelector(options), ...selector }], options, 'prefab.unpack');
+  }
+  throw new DomainError('E_COMMAND', `Unknown prefab command: ${section}`, { exitCode: EXIT.USAGE });
 }
 
 function resourceCommand(context, positionals, options) {

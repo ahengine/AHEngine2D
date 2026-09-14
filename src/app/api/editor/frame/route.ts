@@ -51,7 +51,7 @@ const WORKSPACE_BRIDGE = String.raw`
   function mergeProject(editorDocument) {
     if (!baseProject || typeof baseProject !== "object") return clone(editorDocument);
     const merged = clone(baseProject);
-    const authoredKeys = ["format", "version", "currentSceneId", "scene", "folders", "prefab"];
+    const authoredKeys = ["format", "version", "currentSceneId", "scene", "folders", "prefab", "prefabs"];
     for (const key of authoredKeys) {
       if (editorDocument[key] !== undefined) merged[key] = clone(editorDocument[key]);
     }

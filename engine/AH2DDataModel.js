@@ -328,7 +328,20 @@
     }
     return diagnostics;
   }
-  const PREFAB_SCHEMA = object({ assetId: nullableString(), prefabId: nullableString(), overrides: object() });
+  const PREFAB_OVERRIDE_OPERATION_SCHEMA = object({
+    op: { type: 'string', enum: ['add', 'replace', 'remove'] },
+    value: {}
+  }, { required: ['op'] });
+  const PREFAB_SCHEMA = object({
+    // assetId is retained for the legacy flat `prefab: true` projection. The
+    // remaining fields identify one concrete member of an expanded instance.
+    assetId: nullableString(),
+    prefabId: nullableString(),
+    sourceEntityId: nullableString(),
+    instanceRootId: nullableString(),
+    prefabRevision: integer({ minimum: 0 }),
+    overrides: object({}, { additionalProperties: true })
+  });
   const CAMERA_SCHEMA = object({
     active: boolean(), zoom: number({ exclusiveMinimum: 0 }), viewportWidth: number({ minimum: 0 }), viewportHeight: number({ minimum: 0 }),
     near: number(), far: number(), clearColor: string()
@@ -404,11 +417,20 @@
     },
     additionalProperties: true
   };
+  const PREFAB_ASSET_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    name: string(),
+    rootEntityId: string({ minLength: 1, pattern: '\\S' }),
+    revision: integer({ minimum: 0 }),
+    entities: { type: 'array', items: ENTITY_SCHEMA, minItems: 1 }
+  }, { required: ['id', 'rootEntityId', 'entities'] });
   const JSON_SCHEMAS = {
     components: COMPONENT_SCHEMAS,
     componentProfiles: PROFILE_SCHEMAS,
     componentMap: COMPONENT_MAP_SCHEMA,
-    entity: ENTITY_SCHEMA
+    entity: ENTITY_SCHEMA,
+    prefabOverrideOperation: PREFAB_OVERRIDE_OPERATION_SCHEMA,
+    prefabAsset: PREFAB_ASSET_SCHEMA
   };
 
   function profileName(value) {
@@ -1240,6 +1262,535 @@
     return new EntityCodec(registry, options);
   }
 
+  const PREFAB_OVERRIDE_OPERATIONS = Object.freeze(['add', 'replace', 'remove']);
+  const PREFAB_OVERRIDE_OPERATION_SET = new Set(PREFAB_OVERRIDE_OPERATIONS);
+  const UNSAFE_POINTER_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
+
+  function parseJsonPointer(pointer, options = {}) {
+    if (typeof pointer !== 'string') {
+      throw new ComponentSchemaError('E_PREFAB_OVERRIDE_PATH', 'Prefab override path must be an RFC 6901 JSON Pointer', {
+        pointer: options.pointer || '', details: { path: pointer }
+      });
+    }
+    if (pointer === '') {
+      if (options.allowRoot) return [];
+      throw new ComponentSchemaError('E_PREFAB_OVERRIDE_PATH', 'Prefab override path must target a field below the Entity root', {
+        pointer: options.pointer || '', details: { path: pointer }
+      });
+    }
+    if (!pointer.startsWith('/')) {
+      throw new ComponentSchemaError('E_PREFAB_OVERRIDE_PATH', 'Prefab override path must start with /', {
+        pointer: options.pointer || '', details: { path: pointer }
+      });
+    }
+    return pointer.slice(1).split('/').map(raw => {
+      if (/~(?:[^01]|$)/.test(raw)) {
+        throw new ComponentSchemaError('E_PREFAB_OVERRIDE_PATH', 'Prefab override path contains an invalid RFC 6901 escape', {
+          pointer: options.pointer || '', details: { path: pointer }
+        });
+      }
+      const decoded = raw.replace(/~1/g, '/').replace(/~0/g, '~');
+      if (UNSAFE_POINTER_SEGMENTS.has(decoded)) {
+        throw new ComponentSchemaError('E_PREFAB_OVERRIDE_PATH', `Prefab override path contains an unsafe segment: ${decoded}`, {
+          pointer: options.pointer || '', details: { path: pointer, segment: decoded }
+        });
+      }
+      return decoded;
+    });
+  }
+
+  function prefabOverridePathAllowed(pointer, options = {}) {
+    let segments;
+    try { segments = parseJsonPointer(pointer, options); }
+    catch (error) { return false; }
+    // `-` is a normal RFC 6901 object-member name. It is only the transient
+    // RFC 6902 append cursor when its resolved parent is an Array, where it
+    // cannot provide durable identity for a stored Prefab override.
+    if (hasOwn(options, 'target')) {
+      let current = options.target;
+      for (const segment of segments) {
+        if (Array.isArray(current)) {
+          if (segment === '-') return false;
+          if (!/^(0|[1-9]\d*)$/.test(segment) || Number(segment) >= current.length || !hasOwn(current, Number(segment))) break;
+          current = current[Number(segment)];
+        } else if (current && typeof current === 'object' && hasOwn(current, segment)) current = current[segment];
+        else break;
+      }
+    }
+    const first = segments[0];
+    if (first === 'id' || first === 'parentId' || first === 'prefab') return false;
+    if (first === 'components' && (segments.length === 1 || String(segments[1]).toLowerCase() === 'prefabinstance')) return false;
+    return true;
+  }
+
+  function prefabRootPlacementPath(pointer) {
+    let segments;
+    try { segments = parseJsonPointer(pointer); }
+    catch (_) { return false; }
+    const first = String(segments[0] || '').toLowerCase();
+    if (['x', 'y', 'rot', 'rotation', 'sx', 'sy', 'scalex', 'scaley'].includes(first)) return true;
+    if (first === 'transform') return true;
+    return first === 'components' && String(segments[1] || '').toLowerCase() === 'transform';
+  }
+
+  function jsonPointerLookup(target, pointer, options = {}) {
+    const segments = Array.isArray(pointer) ? pointer : parseJsonPointer(pointer, { ...options, allowRoot: true });
+    if (!segments.length) return { found: true, value: target, parent: null, key: null };
+    let current = target;
+    for (let index = 0; index < segments.length; index += 1) {
+      const key = segments[index];
+      if (!current || typeof current !== 'object') return { found: false, value: undefined, parent: null, key };
+      if (Array.isArray(current)) {
+        if (!/^(0|[1-9]\d*)$/.test(key)) return { found: false, value: undefined, parent: current, key };
+        const position = Number(key);
+        if (position >= current.length || !hasOwn(current, position)) return { found: false, value: undefined, parent: current, key };
+        if (index === segments.length - 1) return { found: true, value: current[position], parent: current, key: position };
+        current = current[position];
+      } else {
+        if (!hasOwn(current, key)) return { found: false, value: undefined, parent: current, key };
+        if (index === segments.length - 1) return { found: true, value: current[key], parent: current, key };
+        current = current[key];
+      }
+    }
+    return { found: false, value: undefined, parent: null, key: null };
+  }
+
+  function applyJsonPointerOperation(target, pointer, operation, options = {}) {
+    if (!isPlainObject(target) && !Array.isArray(target)) {
+      throw new ComponentSchemaError('E_PREFAB_OVERRIDE_TARGET', 'Prefab override target must be a JSON object or array', {
+        pointer: options.pointer || ''
+      });
+    }
+    if (!isPlainObject(operation) || !PREFAB_OVERRIDE_OPERATION_SET.has(operation.op)) {
+      throw new ComponentSchemaError('E_PREFAB_OVERRIDE_OPERATION', 'Prefab override operation must use add, replace, or remove', {
+        pointer: options.pointer || pointer, details: { operation }
+      });
+    }
+    if (operation.op !== 'remove' && !hasOwn(operation, 'value')) {
+      throw new ComponentSchemaError('E_PREFAB_OVERRIDE_VALUE', `${operation.op} requires a value`, {
+        pointer: options.pointer || pointer, details: { operation: operation.op }
+      });
+    }
+    const safety = operation.op === 'remove' ? [] : jsonSafetyDiagnostics(operation.value, options.pointer || pointer);
+    if (safety.length) throw new ComponentSchemaError(safety[0].code, safety[0].message, { pointer: safety[0].pointer, diagnostics: safety });
+    const segments = parseJsonPointer(pointer, options);
+    if (!prefabOverridePathAllowed(pointer, { ...options, target })) {
+      throw new ComponentSchemaError('E_PREFAB_OVERRIDE_PROTECTED', 'Prefab override cannot change Entity identity, hierarchy, or its PrefabInstance marker', {
+        pointer: options.pointer || pointer, details: { path: pointer }
+      });
+    }
+    let parent = target;
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      const key = segments[index];
+      if (!parent || typeof parent !== 'object') {
+        throw new ComponentSchemaError('E_PREFAB_OVERRIDE_TARGET', `Prefab override parent does not exist: ${pointer}`, {
+          pointer: options.pointer || pointer, details: { path: pointer }
+        });
+      }
+      if (Array.isArray(parent)) {
+        if (!/^(0|[1-9]\d*)$/.test(key) || Number(key) >= parent.length || !hasOwn(parent, Number(key))) {
+          throw new ComponentSchemaError('E_PREFAB_OVERRIDE_TARGET', `Prefab override parent does not exist: ${pointer}`, {
+            pointer: options.pointer || pointer, details: { path: pointer }
+          });
+        }
+        parent = parent[Number(key)];
+      } else {
+        if (!hasOwn(parent, key)) {
+          throw new ComponentSchemaError('E_PREFAB_OVERRIDE_TARGET', `Prefab override parent does not exist: ${pointer}`, {
+            pointer: options.pointer || pointer, details: { path: pointer }
+          });
+        }
+        parent = parent[key];
+      }
+    }
+    if (!parent || typeof parent !== 'object') {
+      throw new ComponentSchemaError('E_PREFAB_OVERRIDE_TARGET', `Prefab override parent does not exist: ${pointer}`, {
+        pointer: options.pointer || pointer, details: { path: pointer }
+      });
+    }
+    const rawKey = segments[segments.length - 1];
+    if (Array.isArray(parent)) {
+      const isAppend = rawKey === '-';
+      if (!isAppend && !/^(0|[1-9]\d*)$/.test(rawKey)) {
+        throw new ComponentSchemaError('E_PREFAB_OVERRIDE_TARGET', `Invalid array index in Prefab override: ${rawKey}`, {
+          pointer: options.pointer || pointer, details: { path: pointer, index: rawKey }
+        });
+      }
+      const index = isAppend ? parent.length : Number(rawKey);
+      if (operation.op === 'add') {
+        if (index > parent.length) throw new ComponentSchemaError('E_PREFAB_OVERRIDE_TARGET', `Array index is out of range: ${rawKey}`, { pointer: options.pointer || pointer });
+        parent.splice(index, 0, cloneJson(operation.value));
+      } else {
+        if (isAppend || index >= parent.length || !hasOwn(parent, index)) {
+          throw new ComponentSchemaError('E_PREFAB_OVERRIDE_TARGET', `Prefab override target does not exist: ${pointer}`, {
+            pointer: options.pointer || pointer, details: { path: pointer }
+          });
+        }
+        if (operation.op === 'replace') parent[index] = cloneJson(operation.value);
+        else parent.splice(index, 1);
+      }
+      return target;
+    }
+    const exists = hasOwn(parent, rawKey);
+    if (operation.op !== 'add' && !exists) {
+      throw new ComponentSchemaError('E_PREFAB_OVERRIDE_TARGET', `Prefab override target does not exist: ${pointer}`, {
+        pointer: options.pointer || pointer, details: { path: pointer }
+      });
+    }
+    if (operation.op === 'remove') delete parent[rawKey];
+    else defineJsonProperty(parent, rawKey, cloneJson(operation.value));
+    return target;
+  }
+
+  function applyPrefabOverrideOperation(target, pointer, operation, options = {}) {
+    const segments = parseJsonPointer(pointer, options);
+    // A connected Instance necessarily owns a components map for its marker,
+    // while a compact Asset source may have no components at all. Allow the
+    // first whole-component add to materialize that one canonical container;
+    // every deeper missing parent keeps strict RFC 6901 behavior.
+    if (operation?.op === 'add' && segments.length === 2 && segments[0] === 'components' &&
+        isPlainObject(target) && !hasOwn(target, 'components')) {
+      // Preflight the complete operation before materializing the synthetic
+      // container so a rejected public helper call remains failure-atomic.
+      applyJsonPointerOperation({ components: {} }, pointer, operation, options);
+      defineJsonProperty(target, 'components', {});
+    }
+    return applyJsonPointerOperation(target, pointer, operation, options);
+  }
+
+  function markerPointer(base, resolved) {
+    return `${base}${pointerForStorage(resolved.storage)}`;
+  }
+
+  function lifecyclePrefabMarker(entity, codec) {
+    let resolved;
+    try { resolved = codec.resolve(entity, 'PrefabInstance'); }
+    catch (_) { return null; }
+    if (!resolved.found || !isPlainObject(resolved.value)) return null;
+    const value = resolved.value;
+    // `prefabId`-only components existed before the expanded instance
+    // contract. They remain opaque legacy authoring data; an instance enters
+    // the lifecycle contract only when it declares member/root identity.
+    const lifecycle = ['sourceEntityId', 'instanceRootId'].some(key => hasOwn(value, key) && value[key] != null);
+    return lifecycle ? { resolved, value } : null;
+  }
+
+  function comparablePrefabEntity(entity, codec, rootPlacement = false) {
+    const comparable = cloneJson(entity);
+    codec.remove(comparable, 'PrefabInstance', { allLocations: true });
+    delete comparable.id;
+    delete comparable.parentId;
+    if (rootPlacement) {
+      // Transform is required and therefore cannot be removed through the
+      // public codec API. Strip every resolved authoring location manually so
+      // aliases/case variants such as components.TRANSFORM remain placement.
+      const resolved = codec.resolve(comparable, 'Transform');
+      for (const candidate of resolved.candidates) {
+        if (candidate.storage.startsWith('components.')) {
+          if (isPlainObject(comparable.components)) delete comparable.components[candidate.storage.slice('components.'.length)];
+        } else if (candidate.storage === 'transform') delete comparable.transform;
+        else if (candidate.storage === 'flat-transform') {
+          for (const key of ['x', 'y', 'rot', 'rotation', 'sx', 'sy', 'scaleX', 'scaleY']) delete comparable[key];
+        }
+      }
+    }
+    if (isPlainObject(comparable.components) && Object.keys(comparable.components).length === 0) delete comparable.components;
+    return comparable;
+  }
+
+  function validatePrefabOverrides(overrides, pointer, options, output) {
+    if (!isPlainObject(overrides)) {
+      output.push(diagnostic('E_PREFAB_OVERRIDES_TYPE', 'PrefabInstance.overrides must be a plain object', pointer));
+      return;
+    }
+    const acceptedPaths = [];
+    for (const [path, operation] of Object.entries(overrides)) {
+      const operationPointer = joinPointer(pointer, path);
+      try { parseJsonPointer(path, { pointer: operationPointer }); }
+      catch (error) {
+        output.push(diagnostic(error.code || 'E_PREFAB_OVERRIDE_PATH', error.message, operationPointer, error.details));
+        continue;
+      }
+      if (!prefabOverridePathAllowed(path)) {
+        output.push(diagnostic('E_PREFAB_OVERRIDE_PROTECTED', 'Prefab override cannot change Entity identity, hierarchy, or its PrefabInstance marker', operationPointer, { path }));
+      } else {
+        const conflict = acceptedPaths.find(existing => existing === path || existing.startsWith(`${path}/`) || path.startsWith(`${existing}/`));
+        if (conflict) output.push(diagnostic(
+          'E_PREFAB_OVERRIDE_CONFLICT',
+          'Prefab override paths cannot overlap through an ancestor or descendant path',
+          operationPointer,
+          { path, conflictingPath: conflict }
+        ));
+        else acceptedPaths.push(path);
+      }
+      if (!isPlainObject(operation) || !PREFAB_OVERRIDE_OPERATION_SET.has(operation.op)) {
+        output.push(diagnostic(
+          options.strict ? 'E_PREFAB_OVERRIDE_OPERATION' : 'W_PREFAB_OVERRIDE_LEGACY',
+          options.strict ? 'Prefab override must use a canonical add, replace, or remove operation' : 'Legacy Prefab override value is preserved but not applied by the lifecycle API',
+          operationPointer,
+          { path },
+          options.strict ? 'error' : 'warning'
+        ));
+        continue;
+      }
+      if (operation.op !== 'remove' && !hasOwn(operation, 'value')) {
+        output.push(diagnostic('E_PREFAB_OVERRIDE_VALUE', `${operation.op} requires a value`, operationPointer, { path, operation: operation.op }));
+      } else if (operation.op !== 'remove') output.push(...jsonSafetyDiagnostics(operation.value, joinPointer(operationPointer, 'value')));
+    }
+  }
+
+  function validatePrefabDocument(document, options = {}) {
+    const output = [];
+    if (!isPlainObject(document)) return [diagnostic('E_PREFAB_DOCUMENT', 'Project document must be a plain object', '')];
+    const codec = options.entityCodec instanceof EntityCodec ? options.entityCodec : createDefaultEntityCodec();
+    // Legacy projects may still contain the old top-level `prefab` workspace.
+    // It is intentionally not interpreted as a reusable asset definition, but
+    // a complete expanded marker must still fail if no `prefabs` Asset exists.
+    const prefabs = document.prefabs == null ? [] : document.prefabs;
+    if (!Array.isArray(prefabs)) return [diagnostic('E_PREFABS_TYPE', 'prefabs must be an array', '/prefabs')];
+
+    const assetById = new Map();
+    const assetEntities = new Map();
+    prefabs.forEach((asset, assetIndex) => {
+      const base = `/prefabs/${assetIndex}`;
+      if (!isPlainObject(asset)) {
+        output.push(diagnostic('E_PREFAB_ASSET_TYPE', 'Prefab Asset must be a plain object', base));
+        return;
+      }
+      if (typeof asset.id !== 'string' || !asset.id.trim()) output.push(diagnostic('E_PREFAB_ID', 'Prefab Asset id must be a non-empty string', `${base}/id`));
+      else if (assetById.has(asset.id)) output.push(diagnostic('E_PREFAB_ID_DUPLICATE', `Duplicate Prefab Asset id: ${asset.id}`, `${base}/id`, { firstPointer: assetById.get(asset.id).pointer }));
+      else assetById.set(asset.id, { asset, pointer: base });
+      if (asset.name != null && typeof asset.name !== 'string') output.push(diagnostic('E_PREFAB_NAME', 'Prefab Asset name must be a string', `${base}/name`));
+      if (typeof asset.rootEntityId !== 'string' || !asset.rootEntityId.trim()) output.push(diagnostic('E_PREFAB_ROOT_ID', 'Prefab Asset rootEntityId must be a non-empty string', `${base}/rootEntityId`));
+      if (asset.revision != null && (!Number.isInteger(asset.revision) || asset.revision < 0)) output.push(diagnostic('E_PREFAB_REVISION', 'Prefab Asset revision must be a non-negative integer', `${base}/revision`));
+      if (!Array.isArray(asset.entities) || asset.entities.length === 0) {
+        output.push(diagnostic('E_PREFAB_ENTITIES', 'Prefab Asset entities must be a non-empty array', `${base}/entities`));
+        return;
+      }
+      const byId = new Map();
+      const idPointers = new Map();
+      asset.entities.forEach((entity, entityIndex) => {
+        const pointer = `${base}/entities/${entityIndex}`;
+        if (!isPlainObject(entity)) {
+          output.push(diagnostic('E_PREFAB_ENTITY_TYPE', 'Prefab Entity must be a plain object', pointer));
+          return;
+        }
+        output.push(...codec.validate(entity, { pointer, profile: PROFILES.AUTHORING, mode: options.strict ? 'strict' : 'compat', strict: Boolean(options.strict) }));
+        if (typeof entity.id !== 'string' || !entity.id.trim()) return;
+        if (byId.has(entity.id)) output.push(diagnostic('E_PREFAB_ENTITY_ID_DUPLICATE', `Duplicate Prefab Entity id: ${entity.id}`, `${pointer}/id`, { firstPointer: idPointers.get(entity.id) }));
+        else { byId.set(entity.id, entity); idPointers.set(entity.id, `${pointer}/id`); }
+        const nested = lifecyclePrefabMarker(entity, codec);
+        if (nested) output.push(diagnostic('E_PREFAB_NESTED_INSTANCE', 'Nested Prefab instances inside a Prefab Asset are not supported by this contract', markerPointer(pointer, nested.resolved)));
+      });
+      assetEntities.set(asset.id, byId);
+      const root = byId.get(asset.rootEntityId);
+      if (!root) {
+        output.push(diagnostic('E_PREFAB_ROOT_MISSING', `Prefab root Entity does not exist: ${asset.rootEntityId || '(missing)'}`, `${base}/rootEntityId`));
+        return;
+      }
+      if (root.parentId != null) output.push(diagnostic('E_PREFAB_ROOT_PARENT', 'Prefab root Entity must not have a parent inside its Asset', `${base}/entities/${asset.entities.indexOf(root)}/parentId`));
+      for (const entity of byId.values()) {
+        if (entity.id !== asset.rootEntityId && (typeof entity.parentId !== 'string' || !entity.parentId.trim())) {
+          output.push(diagnostic('E_PREFAB_DISCONNECTED', `Prefab Entity must descend from root ${asset.rootEntityId}`, idPointers.get(entity.id), { entityId: entity.id }));
+          continue;
+        }
+        if (entity.parentId != null && !byId.has(entity.parentId)) {
+          output.push(diagnostic('E_PREFAB_DANGLING_PARENT', `Prefab parent does not exist: ${entity.parentId}`, `${base}/entities/${asset.entities.indexOf(entity)}/parentId`, { entityId: entity.id, parentId: entity.parentId }));
+          continue;
+        }
+        const seen = new Set([entity.id]);
+        let cursor = entity;
+        let cycle = false;
+        while (cursor && cursor.parentId != null) {
+          const parentId = cursor.parentId;
+          if (seen.has(parentId)) {
+            output.push(diagnostic('E_PREFAB_PARENT_CYCLE', `Prefab parent cycle contains ${parentId}`, `${base}/entities/${asset.entities.indexOf(cursor)}/parentId`, { entityId: entity.id }));
+            cycle = true;
+            break;
+          }
+          seen.add(parentId);
+          cursor = byId.get(parentId);
+          if (!cursor) break;
+        }
+        if (!cycle && entity.id !== asset.rootEntityId && cursor && cursor.id !== asset.rootEntityId) {
+          output.push(diagnostic('E_PREFAB_DISCONNECTED', `Prefab Entity must descend from root ${asset.rootEntityId}`, idPointers.get(entity.id), { entityId: entity.id }));
+        }
+      }
+    });
+
+    const scopes = [];
+    if (Array.isArray(document.scenes)) {
+      document.scenes.forEach((scene, sceneIndex) => {
+        if (isPlainObject(scene) && Array.isArray(scene.objects)) scopes.push({ entities: scene.objects, pointer: `/scenes/${sceneIndex}/objects`, sceneId: scene.id });
+      });
+    } else {
+      const entities = Array.isArray(document.scene) ? document.scene : (Array.isArray(document.entities) ? document.entities : null);
+      if (entities) scopes.push({ entities, pointer: Array.isArray(document.scene) ? '/scene' : '/entities', sceneId: null });
+    }
+
+    for (const scope of scopes) {
+      const sceneById = new Map(scope.entities.filter(isPlainObject).map(entity => [entity.id, entity]));
+      const groups = new Map();
+      scope.entities.forEach((entity, entityIndex) => {
+        if (!isPlainObject(entity)) return;
+        const memberBase = `${scope.pointer}/${entityIndex}`;
+        const marker = lifecyclePrefabMarker(entity, codec);
+        if (!marker) return;
+        const value = marker.value;
+        const base = markerPointer(memberBase, marker.resolved);
+        for (const key of ['prefabId', 'sourceEntityId', 'instanceRootId']) {
+          if (typeof value[key] !== 'string' || !value[key].trim()) output.push(diagnostic('E_PREFAB_INSTANCE_ID', `PrefabInstance.${key} must be a non-empty string`, `${base}/${key}`, { field: key }));
+        }
+        if (!Number.isInteger(value.prefabRevision) || value.prefabRevision < 0) output.push(diagnostic('E_PREFAB_INSTANCE_REVISION', 'PrefabInstance.prefabRevision must be a non-negative integer', `${base}/prefabRevision`));
+        validatePrefabOverrides(value.overrides == null ? {} : value.overrides, `${base}/overrides`, options, output);
+        if (entity.id === value.instanceRootId && isPlainObject(value.overrides)) {
+          for (const path of Object.keys(value.overrides)) {
+            if (prefabRootPlacementPath(path)) output.push(diagnostic(
+              'E_PREFAB_PLACEMENT_PATH',
+              'Transform fields on an instance root are placement and cannot be stored as Prefab overrides',
+              joinPointer(`${base}/overrides`, path),
+              { path }
+            ));
+          }
+        }
+        if (typeof value.prefabId !== 'string' || typeof value.sourceEntityId !== 'string' || typeof value.instanceRootId !== 'string') return;
+        const assetRecord = assetById.get(value.prefabId);
+        if (!assetRecord) {
+          output.push(diagnostic('E_PREFAB_INSTANCE_ASSET_MISSING', `Prefab Asset does not exist: ${value.prefabId}`, `${base}/prefabId`, { prefabId: value.prefabId }));
+          return;
+        }
+        const sourceById = assetEntities.get(value.prefabId) || new Map();
+        const assetRevision = assetRecord.asset.revision;
+        const staleRevision = Number.isInteger(assetRevision) && Number.isInteger(value.prefabRevision) && value.prefabRevision !== assetRevision;
+        if (!sourceById.has(value.sourceEntityId)) output.push(diagnostic('E_PREFAB_INSTANCE_SOURCE_MISSING', `Prefab source Entity does not exist: ${value.sourceEntityId}`, `${base}/sourceEntityId`, { prefabId: value.prefabId, sourceEntityId: value.sourceEntityId }));
+        else if (isPlainObject(value.overrides)) {
+          const source = sourceById.get(value.sourceEntityId);
+          const projected = cloneJson(source);
+          for (const [path, operation] of Object.entries(value.overrides)) {
+            if (!isPlainObject(operation) || !PREFAB_OVERRIDE_OPERATION_SET.has(operation.op) || !prefabOverridePathAllowed(path)) continue;
+            // A stale marker was authored against an unavailable historical
+            // Asset revision. Canonical shape is still validated above, but
+            // add/replace/remove compatibility cannot be inferred safely from
+            // the current Asset source.
+            if (staleRevision) continue;
+            let sourceValue;
+            try { sourceValue = jsonPointerLookup(source, path); } catch (_) { continue; }
+            const expected = sourceValue.found ? ['replace', 'remove'] : ['add'];
+            if (!expected.includes(operation.op)) output.push(diagnostic(
+              'E_PREFAB_OVERRIDE_SOURCE',
+              `Prefab override ${operation.op} is incompatible with the Asset source path`,
+              joinPointer(`${base}/overrides`, path),
+              { path, operation: operation.op, sourceExists: sourceValue.found, allowed: expected }
+            ));
+            else {
+              try { applyPrefabOverrideOperation(projected, path, operation); }
+              catch (error) {
+                output.push(diagnostic(
+                  error.code || 'E_PREFAB_OVERRIDE_TARGET',
+                  error.message,
+                  joinPointer(`${base}/overrides`, path),
+                  { path, ...(error.details || {}) }
+                ));
+              }
+            }
+          }
+        }
+        if (!sceneById.has(value.instanceRootId)) output.push(diagnostic('E_PREFAB_INSTANCE_ROOT_MISSING', `Prefab instance root does not exist: ${value.instanceRootId}`, `${base}/instanceRootId`, { instanceRootId: value.instanceRootId }));
+        if (staleRevision) {
+          output.push(diagnostic('W_PREFAB_INSTANCE_STALE', `Prefab instance revision ${value.prefabRevision} differs from Asset revision ${assetRevision}`, `${base}/prefabRevision`, { prefabId: value.prefabId, assetRevision, instanceRevision: value.prefabRevision }, 'warning'));
+        }
+        const groupKey = `${value.prefabId}\u0000${value.instanceRootId}`;
+        const group = groups.get(groupKey) || { prefabId: value.prefabId, rootId: value.instanceRootId, asset: assetRecord.asset, sourceById, members: [], bySource: new Map(), revision: value.prefabRevision };
+        if (group.members.length && group.revision !== value.prefabRevision) output.push(diagnostic(
+          'E_PREFAB_INSTANCE_REVISION_MISMATCH',
+          'Every member of an expanded Prefab instance must use the same prefabRevision',
+          `${base}/prefabRevision`,
+          { prefabId: value.prefabId, instanceRootId: value.instanceRootId, expectedRevision: group.revision, actualRevision: value.prefabRevision }
+        ));
+        if (group.bySource.has(value.sourceEntityId)) output.push(diagnostic('E_PREFAB_INSTANCE_SOURCE_DUPLICATE', `Prefab source Entity is mapped more than once in the same instance: ${value.sourceEntityId}`, `${base}/sourceEntityId`, { firstEntityId: group.bySource.get(value.sourceEntityId).entity.id }));
+        else group.bySource.set(value.sourceEntityId, { entity, marker: value, pointer: base });
+        group.members.push({ entity, marker: value, pointer: base });
+        groups.set(groupKey, group);
+      });
+      for (let entityIndex = 0; entityIndex < scope.entities.length; entityIndex += 1) {
+        const entity = scope.entities[entityIndex];
+        if (!isPlainObject(entity) || entity.parentId == null) continue;
+        const parent = sceneById.get(entity.parentId);
+        const parentMarker = parent && lifecyclePrefabMarker(parent, codec);
+        if (!parentMarker) continue;
+        const childMarker = lifecyclePrefabMarker(entity, codec);
+        const belongsToParentInstance = childMarker &&
+          childMarker.value.prefabId === parentMarker.value.prefabId &&
+          childMarker.value.instanceRootId === parentMarker.value.instanceRootId;
+        if (!belongsToParentInstance) output.push(diagnostic(
+          'E_PREFAB_STRUCTURAL_EDIT',
+          'A connected Prefab member cannot own an authored child outside its expanded instance',
+          `${scope.pointer}/${entityIndex}/parentId`,
+          {
+            entityId: entity.id,
+            parentId: entity.parentId,
+            prefabId: parentMarker.value.prefabId,
+            instanceRootId: parentMarker.value.instanceRootId
+          }
+        ));
+      }
+      for (const group of groups.values()) {
+        const rootMember = group.members.find(member => member.entity.id === group.rootId);
+        if (!rootMember || rootMember.marker.sourceEntityId !== group.asset.rootEntityId) {
+          output.push(diagnostic('E_PREFAB_INSTANCE_ROOT_MAPPING', `Instance root must map Prefab source root ${group.asset.rootEntityId}`, rootMember ? `${rootMember.pointer}/sourceEntityId` : scope.pointer, { prefabId: group.prefabId, instanceRootId: group.rootId }));
+        }
+        for (const source of group.sourceById.values()) {
+          const member = group.bySource.get(source.id);
+          if (!member) {
+            output.push(diagnostic('E_PREFAB_INSTANCE_MEMBER_MISSING', `Expanded Prefab instance is missing source Entity ${source.id}`, scope.pointer, { prefabId: group.prefabId, instanceRootId: group.rootId, sourceEntityId: source.id }));
+            continue;
+          }
+          if (source.id === group.asset.rootEntityId) continue;
+          const parentMember = group.bySource.get(source.parentId);
+          if (parentMember && member.entity.parentId !== parentMember.entity.id) {
+            output.push(diagnostic('E_PREFAB_INSTANCE_HIERARCHY', `Expanded Prefab member ${member.entity.id} has the wrong parent`, `${member.pointer.replace(/\/components\/PrefabInstance$/, '')}/parentId`, { expectedParentId: parentMember.entity.id, actualParentId: member.entity.parentId ?? null }));
+          }
+        }
+        const assetRevision = Number.isInteger(group.asset.revision) ? group.asset.revision : 0;
+        for (const source of group.sourceById.values()) {
+          const member = group.bySource.get(source.id);
+          if (!member || member.marker.prefabRevision !== assetRevision || !isPlainObject(member.marker.overrides)) continue;
+          let expected = cloneJson(source);
+          let comparable = true;
+          for (const [path, operation] of Object.entries(member.marker.overrides)) {
+            if (!isPlainObject(operation) || !PREFAB_OVERRIDE_OPERATION_SET.has(operation.op) || !prefabOverridePathAllowed(path)) {
+              comparable = false;
+              break;
+            }
+            try { applyPrefabOverrideOperation(expected, path, operation); }
+            catch (_) { comparable = false; break; }
+          }
+          if (!comparable) continue;
+          const rootPlacement = source.id === group.asset.rootEntityId;
+          expected = comparablePrefabEntity(expected, codec, rootPlacement);
+          const actual = comparablePrefabEntity(member.entity, codec, rootPlacement);
+          if (!sameValue(expected, actual)) output.push(diagnostic(
+            'E_PREFAB_INSTANCE_STATE',
+            'Expanded Prefab member does not match its Asset source plus recorded overrides',
+            member.pointer.replace(/\/components\/PrefabInstance$/, ''),
+            { prefabId: group.prefabId, instanceRootId: group.rootId, entityId: member.entity.id, sourceEntityId: source.id }
+          ));
+        }
+      }
+    }
+    return output;
+  }
+
+  function assertPrefabDocument(document, options = {}) {
+    const diagnostics = validatePrefabDocument(document, options);
+    const errors = diagnostics.filter(item => item.severity === 'error');
+    if (errors.length) {
+      const first = errors[0];
+      throw new ComponentSchemaError(first.code, first.message, { pointer: first.pointer, details: first.details, diagnostics });
+    }
+    return diagnostics;
+  }
+
   const BUILTIN_COMPONENT_DEFINITIONS = deepFreeze(BUILTIN_DEFINITIONS.map(definition => {
     const registry = new ComponentSchemaRegistry();
     registry.register(definition);
@@ -1248,6 +1799,7 @@
   deepFreeze(COMPONENT_SCHEMAS);
   deepFreeze(PROFILE_SCHEMAS);
   deepFreeze(ENTITY_SCHEMA);
+  deepFreeze(PREFAB_ASSET_SCHEMA);
   deepFreeze(JSON_SCHEMAS);
 
   return Object.freeze({
@@ -1266,8 +1818,18 @@
     PROFILE_SCHEMAS,
     COMPONENT_MAP_SCHEMA,
     ENTITY_SCHEMA,
+    PREFAB_ASSET_SCHEMA,
     JSON_SCHEMAS,
+    PREFAB_OVERRIDE_OPERATIONS,
     isSafeComponentName,
+    parseJsonPointer,
+    prefabOverridePathAllowed,
+    prefabRootPlacementPath,
+    jsonPointerLookup,
+    applyJsonPointerOperation,
+    applyPrefabOverrideOperation,
+    validatePrefabDocument,
+    assertPrefabDocument,
     createDefaultComponentRegistry,
     createDefaultEntityCodec
   });

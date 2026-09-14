@@ -17,7 +17,17 @@ const {
   COMPONENT_SCHEMAS,
   COMPONENT_MAP_SCHEMA,
   ENTITY_SCHEMA,
-  JSON_SCHEMAS
+  JSON_SCHEMAS,
+  PREFAB_ASSET_SCHEMA,
+  PREFAB_OVERRIDE_OPERATIONS,
+  parseJsonPointer,
+  prefabOverridePathAllowed,
+  prefabRootPlacementPath,
+  jsonPointerLookup,
+  applyJsonPointerOperation,
+  applyPrefabOverrideOperation,
+  validatePrefabDocument,
+  assertPrefabDocument
 } = DataModel;
 
 const tests = [];
@@ -33,12 +43,188 @@ test('exports stable constants, schemas, and a browser global', () => {
   assert.deepStrictEqual(COMPONENT_MAP_SCHEMA.properties.Body, COMPONENT_MAP_SCHEMA.properties.Rigidbody);
   assert.strictEqual(ENTITY_SCHEMA.properties.id.pattern, '\\S');
   assert.strictEqual(JSON_SCHEMAS.components, COMPONENT_SCHEMAS);
+  assert.strictEqual(JSON_SCHEMAS.prefabAsset, PREFAB_ASSET_SCHEMA);
+  assert.deepStrictEqual(PREFAB_OVERRIDE_OPERATIONS, ['add', 'replace', 'remove']);
 
   const source = fs.readFileSync(path.join(__dirname, 'AH2DDataModel.js'), 'utf8');
   const browser = {};
   vm.runInNewContext(source, browser, { filename: 'AH2DDataModel.js' });
   assert.strictEqual(browser.AH2DDataModel.DATA_MODEL_ID, 'ah2d.ecs');
   assert.strictEqual(typeof browser.AH2DDataModel.createDefaultEntityCodec, 'function');
+  assert.strictEqual(typeof browser.AH2DDataModel.validatePrefabDocument, 'function');
+});
+
+test('applies canonical Prefab override pointers safely and protects instance identity', () => {
+  const value = { name: 'Knight', metadata: { 'a/b': { '~key': 1 } }, tags: ['player'] };
+  assert.deepStrictEqual(parseJsonPointer('/metadata/a~1b/~0key'), ['metadata', 'a/b', '~key']);
+  assert.deepStrictEqual(jsonPointerLookup(value, '/metadata/a~1b/~0key'), {
+    found: true, value: 1, parent: value.metadata['a/b'], key: '~key'
+  });
+  applyJsonPointerOperation(value, '/metadata/a~1b/~0key', { op: 'replace', value: 2 });
+  applyJsonPointerOperation(value, '/tags/1', { op: 'add', value: 'hero' });
+  applyJsonPointerOperation(value, '/name', { op: 'remove' });
+  assert.deepStrictEqual(value, { metadata: { 'a/b': { '~key': 2 } }, tags: ['player', 'hero'] });
+  assert.strictEqual(prefabOverridePathAllowed('/components/Renderable/color'), true);
+  assert.strictEqual(prefabOverridePathAllowed('/parentId'), false);
+  assert.strictEqual(prefabOverridePathAllowed('/components/PrefabInstance/prefabId'), false);
+  assert.strictEqual(prefabOverridePathAllowed('/tags/-', { target: value }), false);
+  assert.strictEqual(prefabOverridePathAllowed('/metadata/-', { target: value }), true);
+  applyJsonPointerOperation(value, '/metadata/-', { op: 'add', value: 3 });
+  assert.strictEqual(value.metadata['-'], 3, '`-` is a durable object-member name under RFC 6901');
+  assert.throws(() => applyJsonPointerOperation(value, '/tags/-', { op: 'add', value: 'mage' }), error => error.code === 'E_PREFAB_OVERRIDE_PROTECTED');
+  assert.strictEqual(prefabRootPlacementPath('/components/Transform/x'), true);
+  assert.strictEqual(prefabRootPlacementPath('/components/Renderable/color'), false);
+  assert.throws(() => applyJsonPointerOperation(value, '/id', { op: 'add', value: 'other' }), error => error.code === 'E_PREFAB_OVERRIDE_PROTECTED');
+  assert.throws(() => parseJsonPointer('/unsafe/~2'), error => error.code === 'E_PREFAB_OVERRIDE_PATH');
+  assert.throws(() => applyJsonPointerOperation(value, '/metadata/missing/value', { op: 'add', value: 1 }), error => error.code === 'E_PREFAB_OVERRIDE_TARGET');
+  const compactSource = { id: 'compact' };
+  applyPrefabOverrideOperation(compactSource, '/components/Health', { op: 'add', value: { current: 5 } });
+  assert.deepStrictEqual(compactSource.components.Health, { current: 5 });
+  const invalidCompactSource = { id: 'invalid-compact' };
+  assert.throws(() => applyPrefabOverrideOperation(invalidCompactSource, '/components/Health', { op: 'add' }), error => error.code === 'E_PREFAB_OVERRIDE_VALUE');
+  assert.deepStrictEqual(invalidCompactSource, { id: 'invalid-compact' }, 'a rejected whole-Component add must not synthesize partial state');
+  assert.throws(() => applyPrefabOverrideOperation({ id: 'compact' }, '/components/Health/current', { op: 'add', value: 5 }), error => error.code === 'E_PREFAB_OVERRIDE_TARGET');
+});
+
+test('validates Prefab Assets and complete expanded instance membership without mutating unknown data', () => {
+  const project = {
+    format: 'AH2D', version: 4,
+    prefabs: [{
+      id: 'knight', name: 'Knight', rootEntityId: 'body', revision: 3, futureAsset: { keep: true },
+      entities: [
+        { id: 'body', name: 'Body', parentId: null, x: 0, y: 0, futureEntity: 1 },
+        { id: 'weapon', name: 'Weapon', parentId: 'body', x: 10, y: 0, components: { Renderable: { color: '#fff', futureRender: true } } }
+      ]
+    }],
+    currentSceneId: 'main',
+    scenes: [{ id: 'main', objects: [
+      { id: 'holder', name: 'Holder' },
+      { id: 'knight-1', name: 'Body', parentId: 'holder', x: 40, y: 50, futureEntity: 1, components: { PrefabInstance: {
+        prefabId: 'knight', sourceEntityId: 'body', instanceRootId: 'knight-1', prefabRevision: 3, overrides: {}, futureMarker: true
+      } } },
+      { id: 'weapon-1', name: 'Sword', parentId: 'knight-1', x: 10, y: 0, components: {
+        Renderable: { color: '#f00', futureRender: true },
+        PrefabInstance: {
+          prefabId: 'knight', sourceEntityId: 'weapon', instanceRootId: 'knight-1', prefabRevision: 3,
+          overrides: { '/name': { op: 'replace', value: 'Sword' }, '/components/Renderable/color': { op: 'replace', value: '#f00' } }
+        }
+      } }
+    ] }]
+  };
+  project.scene = JSON.parse(JSON.stringify(project.scenes[0].objects));
+  const before = JSON.stringify(project);
+  assert.deepStrictEqual(validatePrefabDocument(project), []);
+  assert.deepStrictEqual(assertPrefabDocument(project), []);
+  assert.strictEqual(JSON.stringify(project), before, 'Prefab validation must be non-mutating');
+  assert.strictEqual(project.prefabs[0].futureAsset.keep, true);
+  assert.strictEqual(project.scenes[0].objects[1].components.PrefabInstance.futureMarker, true);
+
+  const caseVariantPlacement = JSON.parse(JSON.stringify(project));
+  for (const entity of [caseVariantPlacement.prefabs[0].entities[0], caseVariantPlacement.scenes[0].objects[1]]) {
+    for (const key of ['x', 'y', 'rot', 'rotation', 'sx', 'sy', 'scaleX', 'scaleY']) delete entity[key];
+  }
+  caseVariantPlacement.prefabs[0].entities[0].components = { TRANSFORM: { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 } };
+  caseVariantPlacement.scenes[0].objects[1].components.TRANSFORM = { x: 90, y: 40, rotation: 12, scaleX: 2, scaleY: 2 };
+  assert.strictEqual(validatePrefabDocument(caseVariantPlacement).some(item => item.code === 'E_PREFAB_INSTANCE_STATE'), false, 'root placement must ignore every valid Transform storage spelling');
+
+  const mixedRevision = JSON.parse(JSON.stringify(project));
+  mixedRevision.scenes[0].objects[2].components.PrefabInstance.prefabRevision = 0;
+  assert(validatePrefabDocument(mixedRevision).some(item => item.code === 'E_PREFAB_INSTANCE_REVISION_MISMATCH'));
+
+  const missingRevision = JSON.parse(JSON.stringify(project));
+  delete missingRevision.scenes[0].objects[1].components.PrefabInstance.prefabRevision;
+  delete missingRevision.scenes[0].objects[2].components.PrefabInstance.prefabRevision;
+  assert(validatePrefabDocument(missingRevision).some(item => item.code === 'E_PREFAB_INSTANCE_REVISION'));
+
+  const stale = JSON.parse(JSON.stringify(project));
+  stale.scenes[0].objects[1].components.PrefabInstance.prefabRevision = 2;
+  assert(validatePrefabDocument(stale).some(item => item.code === 'W_PREFAB_INSTANCE_STALE' && item.severity === 'warning'));
+
+  const staleRemovedSource = JSON.parse(JSON.stringify(project));
+  staleRemovedSource.prefabs[0].revision = 4;
+  delete staleRemovedSource.prefabs[0].entities[1].components.Renderable.color;
+  for (const entity of staleRemovedSource.scenes[0].objects) {
+    if (entity.components?.PrefabInstance) entity.components.PrefabInstance.prefabRevision = 3;
+  }
+  assert.strictEqual(validatePrefabDocument(staleRemovedSource).some(item => item.code === 'E_PREFAB_OVERRIDE_SOURCE'), false, 'stale replace/remove records cannot be judged against a newer Asset source');
+
+  const staleAddedSource = JSON.parse(JSON.stringify(project));
+  staleAddedSource.prefabs[0].revision = 4;
+  staleAddedSource.prefabs[0].entities[1].futureAdded = 'asset-now-owns-path';
+  staleAddedSource.scenes[0].objects[2].futureAdded = 'local-value';
+  staleAddedSource.scenes[0].objects[2].components.PrefabInstance.overrides['/futureAdded'] = { op: 'add', value: 'local-value' };
+  for (const entity of staleAddedSource.scenes[0].objects) {
+    if (entity.components?.PrefabInstance) entity.components.PrefabInstance.prefabRevision = 3;
+  }
+  assert.strictEqual(validatePrefabDocument(staleAddedSource).some(item => item.code === 'E_PREFAB_OVERRIDE_SOURCE'), false, 'stale add records must remain loadable after the Asset starts owning their path');
+
+  const overlapping = JSON.parse(JSON.stringify(project));
+  overlapping.scenes[0].objects[2].components.PrefabInstance.overrides['/components/Renderable'] = {
+    op: 'replace', value: { color: '#f00' }
+  };
+  assert(validatePrefabDocument(overlapping).some(item => item.code === 'E_PREFAB_OVERRIDE_CONFLICT'));
+
+  const missingParent = JSON.parse(JSON.stringify(project));
+  missingParent.scenes[0].objects[2].components.PrefabInstance.overrides['/components/Missing/value'] = { op: 'add', value: 1 };
+  assert(validatePrefabDocument(missingParent).some(item => item.code === 'E_PREFAB_OVERRIDE_TARGET'));
+
+  const sequentialArrayAdds = JSON.parse(JSON.stringify(project));
+  sequentialArrayAdds.prefabs[0].entities[1].values = ['a', 'b'];
+  sequentialArrayAdds.scenes[0].objects[2].values = ['a', 'b', 'c', 'd'];
+  sequentialArrayAdds.scenes[0].objects[2].components.PrefabInstance.overrides = {
+    '/values/2': { op: 'add', value: 'c' },
+    '/values/3': { op: 'add', value: 'd' }
+  };
+  assert.strictEqual(validatePrefabDocument(sequentialArrayAdds).some(item => item.code === 'E_PREFAB_OVERRIDE_TARGET'), false, 'ordered array appends must validate against one projected instance state');
+
+  const untracked = JSON.parse(JSON.stringify(project));
+  untracked.scenes[0].objects[2].components.Renderable.color = '#123456';
+  assert(validatePrefabDocument(untracked).some(item => item.code === 'E_PREFAB_INSTANCE_STATE'));
+
+  const structuralChild = JSON.parse(JSON.stringify(project));
+  structuralChild.scenes[0].objects.push({ id: 'extra-child', name: 'Extra', parentId: 'weapon-1' });
+  assert(validatePrefabDocument(structuralChild).some(item => item.code === 'E_PREFAB_STRUCTURAL_EDIT'));
+
+  const legacy = JSON.parse(JSON.stringify(project));
+  legacy.scenes[0].objects.push({ id: 'legacy-prefab', components: { PrefabInstance: { prefabId: 'old-workspace', overrides: { tint: 'blue' } } } });
+  assert.strictEqual(validatePrefabDocument(legacy).some(item => item.severity === 'error'), false, 'prefabId-only legacy markers remain opaque');
+});
+
+test('reports malformed Prefab graphs, dangling instance links, invalid operations, and root placement overrides', () => {
+  const base = {
+    format: 'AH2D', version: 4,
+    prefabs: [{ id: 'p', rootEntityId: 'root', revision: 1, entities: [
+      { id: 'root', name: 'Root', parentId: null },
+      { id: 'child', name: 'Child', parentId: 'root' }
+    ] }],
+    currentSceneId: 'main',
+    scenes: [{ id: 'main', objects: [
+      { id: 'instance', parentId: null, components: { PrefabInstance: {
+        prefabId: 'p', sourceEntityId: 'root', instanceRootId: 'instance', prefabRevision: 1,
+        overrides: { '/x': { op: 'replace', value: 4 } }
+      } } },
+      { id: 'instance-child', parentId: 'wrong-parent', components: { PrefabInstance: {
+        prefabId: 'p', sourceEntityId: 'missing-source', instanceRootId: 'instance', prefabRevision: 1,
+        overrides: { '/parentId': { op: 'replace', value: null }, 'not-a-pointer': { op: 'replace', value: 1 } }
+      } } }
+    ] }]
+  };
+  const codes = new Set(validatePrefabDocument(base).map(item => item.code));
+  for (const code of ['E_PREFAB_PLACEMENT_PATH', 'E_PREFAB_INSTANCE_SOURCE_MISSING', 'E_PREFAB_INSTANCE_MEMBER_MISSING', 'E_PREFAB_OVERRIDE_PROTECTED', 'E_PREFAB_OVERRIDE_PATH']) {
+    assert(codes.has(code), `${code} was not reported`);
+  }
+
+  const brokenAsset = JSON.parse(JSON.stringify(base));
+  brokenAsset.scenes[0].objects = [];
+  brokenAsset.prefabs[0].entities[0].parentId = 'child';
+  assert(validatePrefabDocument(brokenAsset).some(item => item.code === 'E_PREFAB_ROOT_PARENT'));
+  assert(validatePrefabDocument(brokenAsset).some(item => item.code === 'E_PREFAB_PARENT_CYCLE'));
+
+  const duplicate = JSON.parse(JSON.stringify(base));
+  duplicate.scenes[0].objects = [];
+  duplicate.prefabs.push(JSON.parse(JSON.stringify(duplicate.prefabs[0])));
+  assert(validatePrefabDocument(duplicate).some(item => item.code === 'E_PREFAB_ID_DUPLICATE'));
+  assert.throws(() => assertPrefabDocument(base), error => error instanceof ComponentSchemaError && error.diagnostics.some(item => item.code === 'E_PREFAB_PLACEMENT_PATH'));
 });
 
 test('registers every built-in with independent collider types and only Rigidbody aliases', () => {

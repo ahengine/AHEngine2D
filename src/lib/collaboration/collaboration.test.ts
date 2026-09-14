@@ -172,7 +172,7 @@ async function main(): Promise<void> {
     const defaults = await service.createProject(owner, { name: "Default Contract" });
     const defaultSnapshot = await service.getDocument(owner, defaults.project.id);
     const defaultDocument = defaultSnapshot.document as Record<string, unknown>;
-    assert.deepEqual(defaultDocument.prefab, []);
+    assert.deepEqual(defaultDocument.prefabs, []);
     assert.deepEqual(defaultDocument.animations, []);
     assert.deepEqual(defaultDocument.particles, []);
     assert.equal((defaultDocument.meta as { name?: string }).name, "Default Contract");
@@ -417,6 +417,7 @@ async function main(): Promise<void> {
     assert.equal(frameSource.includes('<script src="./node_modules/planck/dist/planck.min.js"></script>'), false);
     assert.equal(frameSource.includes('<script src="./engine/AH2DEngine.js"></script>'), false);
     assert.equal(frameSource.includes('<script src="./engine/AH2DDataModel.js"></script>'), false);
+    assert.match(frameSource, /const authoredKeys\s*=\s*\[[^\]]*"prefabs"/);
 
     const routeProjectResponse = await createProjectRoute(new Request("http://localhost/api/projects", {
       method: "POST",

@@ -2239,6 +2239,496 @@ const testFrameErrorStopsPixiRuntime = () => {
   assert.deepStrictEqual(host.children, []);
 };
 
+const testPrefabAssetInstanceOverrideApplyRevertAndUnpack = () => {
+  const sourceObjects = [
+    { id: 'holder', name: 'Holder', x: 5, y: 6 },
+    { id: 'source-root', name: 'Crate', parentId: 'holder', x: 120, y: 80, rot: 15, sx: 2, sy: 2, futureScene: { keep: true } },
+    { id: 'source-child', name: 'Gem', parentId: 'source-root', x: 12, y: 4, values: ['a', 'b'], shiftValues: ['a', 'b', 'c'], futureBranch: { a: 1, b: 2 }, components: {
+      Renderable: { kind: 'sprite', width: 16, height: 16, color: '#00aaff', futureRender: { keep: true } }
+    } },
+    { id: 'source-grandchild', name: 'Spark', parentId: 'source-child', x: 3, y: 2 }
+  ];
+  const project = {
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    engine: { physics: 'builtin' },
+    currentSceneId: 'main', meta: { currentSceneId: 'main' },
+    prefabs: [],
+    scenes: [{ id: 'main', name: 'Main', objects: sourceObjects }, { id: 'secondary', name: 'Secondary', objects: [] }],
+    scene: JSON.parse(JSON.stringify(sourceObjects)),
+    futureProject: { keep: true }
+  };
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  const events = [];
+  for (const type of ['prefab:assetCreate', 'prefab:instantiate', 'prefab:override', 'prefab:apply', 'prefab:revert', 'prefab:unpack', 'prefab:assetDelete']) {
+    engine.events.on(type, payload => events.push({ type, payload }));
+  }
+  engine.load(project);
+  assert.ok(engine.prefabs instanceof AH2D.PrefabSystem);
+
+  const asset = engine.prefabs.createAsset('source-root', {
+    id: 'crate', name: 'Crate', extensions: { futureAsset: { keep: true } }
+  });
+  assert.strictEqual(asset.id, 'crate');
+  assert.strictEqual(asset.rootEntityId, 'source-root');
+  assert.strictEqual(asset.revision, 1);
+  assert.deepStrictEqual(asset.futureAsset, { keep: true });
+  const assetRoot = asset.entities.find(entity => entity.id === 'source-root');
+  assert.deepStrictEqual(
+    { x: assetRoot.x, y: assetRoot.y, rot: assetRoot.rot, sx: assetRoot.sx, sy: assetRoot.sy },
+    { x: 0, y: 0, rot: 0, sx: 1, sy: 1 },
+    'a newly-authored Prefab root Transform must be normalized while the linked instance keeps placement'
+  );
+  let scene = engine.document.scenes[0];
+  let firstRoot = scene.objects.find(entity => entity.id === 'source-root');
+  let firstChild = scene.objects.find(entity => entity.id === 'source-child');
+  assert.deepStrictEqual({ x: firstRoot.x, y: firstRoot.y, rot: firstRoot.rot, sx: firstRoot.sx, sy: firstRoot.sy }, { x: 120, y: 80, rot: 15, sx: 2, sy: 2 });
+  assert.deepStrictEqual(firstRoot.futureScene, { keep: true });
+  assert.deepStrictEqual(firstRoot.components.PrefabInstance, {
+    prefabId: 'crate', sourceEntityId: 'source-root', instanceRootId: 'source-root', prefabRevision: 1, overrides: {}
+  });
+  assert.strictEqual(firstChild.components.PrefabInstance.sourceEntityId, 'source-child');
+  assert.deepStrictEqual(engine.document.scene, scene.objects, 'Prefab mutations must keep the active Scene mirror synchronized');
+  assert.throws(
+    () => engine.prefabs.createAsset('holder', { id: 'nested' }),
+    error => error.code === 'E_PREFAB_NESTED_INSTANCE',
+    'a subtree containing a connected Prefab instance must be unpacked before it can become an Asset'
+  );
+
+  engine.loadScene('secondary');
+  engine.prefabs.instantiate('crate', {
+    idMap: { 'source-root': 'source-root', 'source-child': 'source-child', 'source-grandchild': 'source-grandchild' }
+  });
+  engine.loadScene('main');
+
+  const created = engine.prefabs.instantiate('crate', {
+    parentId: 'holder',
+    idMap: { 'source-root': 'crate-2', 'source-child': 'gem-2', 'source-grandchild': 'spark-2' },
+    transform: { x: 300, y: 220, rotation: 30, scaleX: 1.5, scaleY: 1.5 }
+  });
+  assert.deepStrictEqual(created.idMap, { 'source-root': 'crate-2', 'source-child': 'gem-2', 'source-grandchild': 'spark-2' });
+  assert.strictEqual(engine.graph.getParent('crate-2'), 'holder');
+  assert.strictEqual(engine.graph.getParent('gem-2'), 'crate-2');
+  assert.strictEqual(engine.graph.getParent('spark-2'), 'gem-2');
+  assert.throws(
+    () => engine.prefabs.instantiate('crate', { parentId: 'source-child' }),
+    error => error.code === 'E_PREFAB_STRUCTURAL_EDIT',
+    'instantiation must not add a structural child below a connected Prefab member'
+  );
+  assert.deepStrictEqual(
+    (({ x, y, rotation, scaleX, scaleY }) => ({ x, y, rotation, scaleX, scaleY }))(engine.transform.getLocal('crate-2')),
+    { x: 300, y: 220, rotation: 30, scaleX: 1.5, scaleY: 1.5 }
+  );
+  const instance = engine.prefabs.getInstance('gem-2');
+  assert.strictEqual(instance.instanceRootId, 'crate-2');
+  assert.deepStrictEqual(instance.members.map(member => member.sourceEntityId).sort(), ['source-child', 'source-grandchild', 'source-root']);
+  assert.throws(() => engine.prefabs.setOverride('crate-2', '/x', 1), error => error.code === 'E_PREFAB_PLACEMENT_PATH');
+  assert.throws(() => engine.prefabs.setOverride('gem-2', '/parentId', 'holder'), error => error.code === 'E_PREFAB_OVERRIDE_PROTECTED');
+
+  engine.prefabs.removeOverride('gem-2', '/values/0');
+  assert.deepStrictEqual(engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2').values, ['b']);
+  engine.prefabs.revert('gem-2', '/values/0');
+  assert.deepStrictEqual(engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2').values, ['a', 'b'], 'reverting an array removal must reinsert instead of replacing the shifted element');
+  engine.prefabs.removeOverride('source-child', '/values/0');
+  engine.prefabs.apply('source-child', { paths: '/values/0' });
+  assert.deepStrictEqual(engine.prefabs.get('crate').entities.find(entity => entity.id === 'source-child').values, ['b']);
+  assert.deepStrictEqual(engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2').values, ['b'], 'applying an array removal must remove from unoverridden instances');
+  assert.deepStrictEqual(
+    engine.document.scenes[1].objects.find(entity => entity.id === 'source-child').values,
+    ['b'],
+    'Apply must synchronize a same-ID instance member in another Scene instead of mistaking it for the authoring member'
+  );
+
+  engine.prefabs.setOverride('source-child', '/components/Renderable/color', '#ff0000');
+  engine.prefabs.setOverride('gem-2', '/components/Renderable/color', '#00ff00');
+  let applyResult = engine.prefabs.apply('source-child', { paths: ['/components/Renderable/color'] });
+  assert.strictEqual(applyResult.revision, 3);
+  assert.strictEqual(engine.prefabs.get('crate').entities.find(entity => entity.id === 'source-child').components.Renderable.color, '#ff0000');
+  scene = engine.document.scenes[0];
+  firstChild = scene.objects.find(entity => entity.id === 'source-child');
+  let secondChild = scene.objects.find(entity => entity.id === 'gem-2');
+  assert.strictEqual(firstChild.components.Renderable.color, '#ff0000');
+  assert.strictEqual(secondChild.components.Renderable.color, '#00ff00', 'another instance with its own override must not be overwritten by Apply');
+  assert.strictEqual(firstChild.components.PrefabInstance.prefabRevision, 3);
+  assert.strictEqual(secondChild.components.PrefabInstance.prefabRevision, 3);
+
+  engine.prefabs.setOverride('source-child', '/components/Renderable', {
+    ...firstChild.components.Renderable,
+    width: 32,
+    color: '#aa0000'
+  });
+  engine.prefabs.apply('source-child', { paths: '/components/Renderable' });
+  secondChild = engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2');
+  assert.strictEqual(secondChild.components.Renderable.width, 32, 'unoverridden descendants must sync when an Asset ancestor object changes');
+  assert.strictEqual(secondChild.components.Renderable.color, '#00ff00', 'a descendant override must survive an Asset ancestor object change');
+  assert.strictEqual(secondChild.components.PrefabInstance.overrides['/components/Renderable/color'].op, 'replace');
+
+  engine.prefabs.revert('gem-2', '/components/Renderable/color');
+  secondChild = engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2');
+  assert.strictEqual(secondChild.components.Renderable.color, '#aa0000');
+  assert.deepStrictEqual(secondChild.components.PrefabInstance.overrides, {});
+
+  engine.prefabs.setOverride('gem-2', '/components/Renderable', {
+    ...secondChild.components.Renderable,
+    width: 48,
+    height: 24,
+    color: '#123456'
+  });
+  engine.prefabs.setOverride('gem-2', '/components/Renderable/color', '#654321');
+  secondChild = engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2');
+  let nestedOverrides = secondChild.components.PrefabInstance.overrides;
+  assert.deepStrictEqual(Object.keys(nestedOverrides), ['/components/Renderable'], 'a descendant edit must stay represented by its owning ancestor override');
+  assert.strictEqual(nestedOverrides['/components/Renderable'].value.width, 48, 'rebasing a descendant edit must preserve an overridden sibling');
+  assert.strictEqual(nestedOverrides['/components/Renderable'].value.color, '#654321');
+  engine.prefabs.removeOverride('gem-2', '/components/Renderable/height');
+  secondChild = engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2');
+  nestedOverrides = secondChild.components.PrefabInstance.overrides;
+  assert.deepStrictEqual(Object.keys(nestedOverrides), ['/components/Renderable']);
+  assert.strictEqual(nestedOverrides['/components/Renderable'].value.width, 48, 'nested removal must not discard sibling state owned by the ancestor');
+  assert.strictEqual(nestedOverrides['/components/Renderable'].value.color, '#654321');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(nestedOverrides['/components/Renderable'].value, 'height'), false);
+  engine.prefabs.revert('gem-2', '/components/Renderable');
+
+  engine.prefabs.setOverride('gem-2', '/localBundle', { first: 1, second: 2 });
+  engine.prefabs.removeOverride('gem-2', '/localBundle/first');
+  engine.prefabs.setOverride('gem-2', '/localBundle/third', 3);
+  secondChild = engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2');
+  nestedOverrides = secondChild.components.PrefabInstance.overrides;
+  assert.deepStrictEqual(Object.keys(nestedOverrides), ['/localBundle'], 'nested edits of an Asset-relative add must remain one non-overlapping add record');
+  assert.deepStrictEqual(nestedOverrides['/localBundle'], { op: 'add', value: { second: 2, third: 3 } });
+  engine.prefabs.revert('gem-2', '/localBundle');
+
+  engine.prefabs.setOverride('gem-2', '/futureAdded', { pass: 1 });
+  engine.prefabs.setOverride('gem-2', '/futureAdded', { pass: 2 });
+  secondChild = engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2');
+  assert.strictEqual(secondChild.components.PrefabInstance.overrides['/futureAdded'].op, 'add', 'replacing a locally-added value must remain an Asset-relative add');
+  engine.prefabs.apply('gem-2', { paths: '/futureAdded' });
+  assert.deepStrictEqual(engine.prefabs.get('crate').entities.find(entity => entity.id === 'source-child').futureAdded, { pass: 2 });
+
+  engine.prefabs.removeOverride('gem-2', '/futureAdded');
+  secondChild = engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2');
+  assert.strictEqual(secondChild.futureAdded, undefined);
+  assert.strictEqual(secondChild.components.PrefabInstance.overrides['/futureAdded'].op, 'remove');
+  engine.prefabs.apply('gem-2', { paths: '/futureAdded' });
+  assert.strictEqual(engine.prefabs.get('crate').entities.find(entity => entity.id === 'source-child').futureAdded, undefined);
+
+  engine.prefabs.setOverride('gem-2', '/temporary', 1);
+  engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2').components.PrefabInstance.overrides['/temporary'].futureRecord = { keep: true };
+  engine.prefabs.setOverride('gem-2', '/temporary', 2);
+  assert.deepStrictEqual(
+    engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2').components.PrefabInstance.overrides['/temporary'].futureRecord,
+    { keep: true },
+    'editing the same override path must preserve unknown operation fields'
+  );
+  const cleared = engine.prefabs.removeOverride('gem-2', '/temporary');
+  assert.strictEqual(cleared.reverted, true, 'removing an add whose source is absent must clear the override instead of recording an invalid remove');
+  secondChild = engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2');
+  assert.strictEqual(secondChild.temporary, undefined);
+  assert.strictEqual(secondChild.components.PrefabInstance.overrides['/temporary'], undefined);
+
+  engine.prefabs.setOverride('spark-2', '/components/Health', { current: 5, max: 5 });
+  engine.prefabs.apply('spark-2', { paths: '/components/Health' });
+  assert.deepStrictEqual(engine.prefabs.get('crate').entities.find(entity => entity.id === 'source-grandchild').components.Health, { current: 5, max: 5 }, 'a whole Component may be added to a compact Asset Entity');
+
+  engine.prefabs.setOverride('gem-2', '/futureBranch/a', 9);
+  engine.prefabs.removeOverride('source-child', '/futureBranch');
+  engine.prefabs.apply('source-child', { paths: '/futureBranch' });
+  secondChild = engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2');
+  assert.deepStrictEqual(secondChild.futureBranch, { a: 9, b: 2 }, 'an orphaned descendant override must preserve its effective branch');
+  assert.deepStrictEqual(secondChild.components.PrefabInstance.overrides['/futureBranch'], {
+    op: 'add', value: { a: 9, b: 2 }
+  }, 'an orphaned descendant override must be promoted to a valid ancestor add');
+  engine.prefabs.revert('gem-2', '/futureBranch');
+
+  engine.prefabs.setOverride('gem-2', '/shiftValues/2', 'X');
+  engine.prefabs.removeOverride('source-child', '/shiftValues/0');
+  engine.prefabs.apply('source-child', { paths: '/shiftValues/0' });
+  secondChild = engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2');
+  assert.deepStrictEqual(secondChild.shiftValues, ['b', 'X'], 'an array removal must preserve a later overridden element');
+  assert.strictEqual(secondChild.components.PrefabInstance.overrides['/shiftValues/2'], undefined);
+  assert.deepStrictEqual(secondChild.components.PrefabInstance.overrides['/shiftValues/1'], { op: 'replace', value: 'X' });
+  engine.prefabs.revert('gem-2', '/shiftValues/1');
+
+  engine.prefabs.setOverride('gem-2', '/shiftValues/0', 'Local B');
+  engine.prefabs.removeOverride('source-child', '/shiftValues/0');
+  engine.prefabs.apply('source-child', { paths: '/shiftValues/0' });
+  secondChild = engine.document.scenes[0].objects.find(entity => entity.id === 'gem-2');
+  assert.deepStrictEqual(secondChild.shiftValues, ['Local B', 'c'], 'an override of a removed array element must retain a reconstructable effective array');
+  assert.deepStrictEqual(secondChild.components.PrefabInstance.overrides['/shiftValues'], {
+    op: 'replace', value: ['Local B', 'c']
+  });
+  engine.prefabs.revert('gem-2', '/shiftValues');
+
+  const unpacked = engine.prefabs.unpack('gem-2');
+  assert.deepStrictEqual(unpacked.entityIds.sort(), ['crate-2', 'gem-2', 'spark-2']);
+  scene = engine.document.scenes[0];
+  assert.strictEqual(scene.objects.find(entity => entity.id === 'crate-2').components.PrefabInstance, undefined);
+  assert.strictEqual(scene.objects.find(entity => entity.id === 'gem-2').components.PrefabInstance, undefined);
+  assert.strictEqual(scene.objects.find(entity => entity.id === 'spark-2').components.PrefabInstance, undefined);
+  assert.strictEqual(engine.graph.getParent('gem-2'), 'crate-2', 'Unpack must preserve hierarchy');
+  assert.deepStrictEqual(
+    (({ x, y, rotation, scaleX, scaleY }) => ({ x, y, rotation, scaleX, scaleY }))(engine.transform.getLocal('crate-2')),
+    { x: 300, y: 220, rotation: 30, scaleX: 1.5, scaleY: 1.5 },
+    'Unpack must preserve placement'
+  );
+
+  assert.throws(() => engine.prefabs.deleteAsset('crate'), error => error.code === 'E_PREFAB_ASSET_IN_USE');
+  assert.strictEqual(engine.prefabs.deleteAsset('crate', { unpackInstances: true }), true);
+  assert.strictEqual(engine.prefabs.get('crate'), null);
+  assert.strictEqual(engine.document.scenes[0].objects.find(entity => entity.id === 'source-root').components.PrefabInstance, undefined);
+  assert.strictEqual(engine.document.scenes[1].objects.find(entity => entity.id === 'source-root').components.PrefabInstance, undefined);
+  assert.deepStrictEqual(engine.document.futureProject, { keep: true });
+  const eventTypes = events.map(event => event.type);
+  for (const type of ['prefab:assetCreate', 'prefab:instantiate', 'prefab:override', 'prefab:apply', 'prefab:revert', 'prefab:unpack', 'prefab:assetDelete']) {
+    assert(eventTypes.includes(type), `${type} must be emitted`);
+  }
+  assert(events.every(event => event.payload.engine === engine), 'Prefab events must identify their Engine');
+};
+
+const testPrefabValidationIsAtomicAndSnapshotsRemainDefinitionFree = () => {
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  const valid = {
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main',
+    prefabs: [{ id: 'p', rootEntityId: 'source', revision: 1, entities: [{ id: 'source', name: 'Source', parentId: null }] }],
+    scenes: [{ id: 'main', objects: [{ id: 'instance', name: 'Source', components: { PrefabInstance: {
+      prefabId: 'p', sourceEntityId: 'source', instanceRootId: 'instance', prefabRevision: 1, overrides: {}
+    } } }] }]
+  };
+  valid.scene = JSON.parse(JSON.stringify(valid.scenes[0].objects));
+  engine.load(valid);
+  const before = JSON.stringify(engine.document);
+  const invalid = JSON.parse(JSON.stringify(valid));
+  invalid.scenes[0].objects[0].components.PrefabInstance.sourceEntityId = 'missing';
+  assert.throws(() => engine.load(invalid), error => error.code === 'E_PREFAB_INSTANCE_SOURCE_MISSING');
+  assert.strictEqual(JSON.stringify(engine.document), before, 'invalid Prefab documents must fail before replacing live Engine state');
+  const structural = JSON.parse(JSON.stringify(valid));
+  structural.scenes[0].objects.push({ id: 'extra', parentId: 'instance' });
+  assert.throws(() => engine.load(structural), error => error.code === 'E_PREFAB_STRUCTURAL_EDIT');
+  assert.strictEqual(JSON.stringify(engine.document), before, 'a structural child outside the expanded instance must fail atomically');
+
+  const snapshot = engine.captureSnapshot();
+  assert.strictEqual(snapshot.runtime.version, 3);
+  assert.strictEqual(snapshot.runtime.prefabs, undefined, 'active ECS snapshots intentionally omit reusable authoring definitions');
+  assert.doesNotThrow(() => engine.restoreSnapshot(snapshot), 'definition-free expanded ECS snapshots must remain loadable');
+  assert.strictEqual(engine.document.prefabs[0].id, 'p', 'snapshot restore must return the Universal authoring document');
+
+  const staleEngine = new AH2D.Engine({ physics: 'builtin' });
+  const stale = {
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main',
+    prefabs: [{ id: 'stale-prefab', rootEntityId: 'source', revision: 2, entities: [{ id: 'source', name: 'Asset Name', foo: 'new', parentId: null }] }],
+    scenes: [{ id: 'main', objects: [
+      { id: 'stale-instance', name: 'Local Name', components: { PrefabInstance: {
+        prefabId: 'stale-prefab', sourceEntityId: 'source', instanceRootId: 'stale-instance', prefabRevision: 1,
+        overrides: { '/name': { op: 'replace', value: 'Local Name' } }
+      } } },
+      { id: 'current-instance', name: 'Asset Name', foo: 'new', components: { PrefabInstance: {
+        prefabId: 'stale-prefab', sourceEntityId: 'source', instanceRootId: 'current-instance', prefabRevision: 2, overrides: {}
+      } } }
+    ] }]
+  };
+  stale.scene = JSON.parse(JSON.stringify(stale.scenes[0].objects));
+  staleEngine.load(stale);
+  assert.doesNotThrow(() => staleEngine.prefabs.apply('stale-instance', { paths: '/name' }));
+  assert.strictEqual(staleEngine.prefabs.get('stale-prefab').revision, 3);
+  assert.strictEqual(staleEngine.document.scenes[0].objects.find(item => item.id === 'stale-instance').components.PrefabInstance.prefabRevision, 1, 'an initiating stale member must remain marked stale');
+  assert.strictEqual(staleEngine.document.scenes[0].objects.find(item => item.id === 'current-instance').components.PrefabInstance.prefabRevision, 3, 'a previously-current member may advance after path sync');
+  staleEngine.prefabs.setOverride('current-instance', '/foo', 'applied');
+  assert.doesNotThrow(() => staleEngine.prefabs.apply('current-instance', { paths: '/foo' }));
+  const staleEntity = staleEngine.document.scenes[0].objects.find(item => item.id === 'stale-instance');
+  assert.strictEqual(staleEntity.foo, undefined, 'path sync must not partially mutate a stale instance group');
+  assert.strictEqual(staleEntity.components.PrefabInstance.prefabRevision, 1);
+
+  const staleAddEngine = new AH2D.Engine({ physics: 'builtin' });
+  const staleAdd = {
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main',
+    prefabs: [{ id: 'p', rootEntityId: 'source', revision: 2, entities: [{ id: 'source', foo: 'asset' }] }],
+    scenes: [{ id: 'main', objects: [
+      { id: 'stale', foo: 'local', components: { PrefabInstance: {
+        prefabId: 'p', sourceEntityId: 'source', instanceRootId: 'stale', prefabRevision: 1,
+        overrides: { '/foo': { op: 'add', value: 'local', futureRecord: { keep: true } } }
+      } } },
+      { id: 'current', foo: 'asset', components: { PrefabInstance: {
+        prefabId: 'p', sourceEntityId: 'source', instanceRootId: 'current', prefabRevision: 2, overrides: {}
+      } } }
+    ] }]
+  };
+  staleAdd.scene = JSON.parse(JSON.stringify(staleAdd.scenes[0].objects));
+  staleAddEngine.load(staleAdd);
+  assert.doesNotThrow(() => staleAddEngine.prefabs.apply('stale', { paths: '/foo' }));
+  assert.strictEqual(staleAddEngine.prefabs.get('p').entities[0].foo, 'local', 'stale add must rebase to replace when the current Asset owns the path');
+  assert.strictEqual(staleAddEngine.document.scenes[0].objects.find(item => item.id === 'current').foo, 'local');
+  assert.strictEqual(staleAddEngine.document.scenes[0].objects.find(item => item.id === 'stale').components.PrefabInstance.prefabRevision, 1);
+
+  const redundantEngine = new AH2D.Engine({ physics: 'builtin' });
+  const redundant = {
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main',
+    prefabs: [{ id: 'p', rootEntityId: 'source', revision: 2, entities: [{ id: 'source' }] }],
+    scenes: [{ id: 'main', objects: [{ id: 'stale', components: { PrefabInstance: {
+      prefabId: 'p', sourceEntityId: 'source', instanceRootId: 'stale', prefabRevision: 1,
+      overrides: { '/foo': { op: 'remove' } }
+    } } }] }]
+  };
+  redundant.scene = JSON.parse(JSON.stringify(redundant.scenes[0].objects));
+  redundantEngine.load(redundant);
+  const redundantApply = redundantEngine.prefabs.apply('stale', { paths: '/foo' });
+  assert.strictEqual(redundantApply.revision, 2, 'clearing a stale override already represented by the Asset must not invent a revision');
+  assert.deepStrictEqual(redundantEngine.document.scenes[0].objects[0].components.PrefabInstance.overrides, {});
+};
+
+const testPrefabArrayOverrideCoordinatesAndStalePromotion = () => {
+  const createArrayEngine = values => {
+    const engine = new AH2D.Engine({ physics: 'builtin' });
+    const marker = instanceRootId => ({
+      prefabId: 'p', sourceEntityId: 'source', instanceRootId, prefabRevision: 1, overrides: {}
+    });
+    const project = {
+      format: 'AH2D', version: 4,
+      dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+      currentSceneId: 'main',
+      prefabs: [{ id: 'p', rootEntityId: 'source', revision: 1, entities: [{ id: 'source', values: [...values] }] }],
+      scenes: [{ id: 'main', objects: [
+        { id: 'a', values: [...values], components: { PrefabInstance: marker('a') } },
+        { id: 'b', values: [...values], components: { PrefabInstance: marker('b') } }
+      ] }]
+    };
+    project.scene = JSON.parse(JSON.stringify(project.scenes[0].objects));
+    engine.load(project);
+    return engine;
+  };
+  const entity = (engine, id) => engine.document.scenes[0].objects.find(item => item.id === id);
+
+  const appended = createArrayEngine(['a', 'b']);
+  appended.prefabs.removeOverride('b', '/values/0');
+  appended.prefabs.setOverride('a', '/values/2', 'c');
+  assert.doesNotThrow(() => appended.prefabs.apply('a', { paths: '/values/2' }));
+  assert.deepStrictEqual(entity(appended, 'b').values, ['b', 'c'], 'Asset append coordinates must be rebuilt around a sibling instance removal');
+  assert.deepStrictEqual(entity(appended, 'b').components.PrefabInstance.overrides, { '/values/0': { op: 'remove' } });
+
+  const removed = createArrayEngine(['a', 'b', 'c']);
+  removed.prefabs.removeOverride('b', '/values/0');
+  removed.prefabs.removeOverride('a', '/values/2');
+  assert.doesNotThrow(() => removed.prefabs.apply('a', { paths: '/values/2' }));
+  assert.deepStrictEqual(entity(removed, 'b').values, ['b'], 'Asset removal coordinates must be rebuilt around a sibling instance removal');
+
+  const redundantRemoval = createArrayEngine(['a', 'b', 'c']);
+  redundantRemoval.prefabs.removeOverride('b', '/values/0');
+  redundantRemoval.prefabs.setOverride('b', '/values/1', 'X');
+  redundantRemoval.prefabs.removeOverride('a', '/values/0');
+  redundantRemoval.prefabs.apply('a', { paths: '/values/0' });
+  assert.deepStrictEqual(entity(redundantRemoval, 'b').values, ['b', 'X']);
+  assert.deepStrictEqual(entity(redundantRemoval, 'b').components.PrefabInstance.overrides, {
+    '/values/1': { op: 'replace', value: 'X' }
+  }, 'a local removal matching the Asset removal must clear without claiming the whole array');
+
+  const replaced = createArrayEngine(['a', 'b', 'c']);
+  replaced.prefabs.removeOverride('b', '/values/0');
+  replaced.prefabs.setOverride('a', '/values/2', 'X');
+  assert.doesNotThrow(() => replaced.prefabs.apply('a', { paths: '/values/2' }));
+  assert.deepStrictEqual(entity(replaced, 'b').values, ['b', 'X'], 'Asset replacement coordinates must be rebuilt around structural sibling overrides');
+
+  const nestedValues = [{ value: 'a' }, { value: 'b' }, { value: 'c' }];
+  const nested = createArrayEngine(nestedValues);
+  nested.prefabs.removeOverride('b', '/values/0');
+  nested.prefabs.setOverride('a', '/values/2/value', 'X');
+  nested.prefabs.apply('a', { paths: '/values/2/value' });
+  assert.deepStrictEqual(entity(nested, 'b').values, [{ value: 'b' }, { value: 'X' }], 'nested fields inside shifted array elements must use Asset coordinates');
+
+  const partial = createArrayEngine(['a', 'b', 'c']);
+  partial.prefabs.setOverride('a', '/values/2', 'X');
+  partial.prefabs.removeOverride('a', '/values/0');
+  partial.prefabs.apply('a', { paths: '/values/0' });
+  assert.deepStrictEqual(entity(partial, 'a').values, ['b', 'X']);
+  assert.deepStrictEqual(entity(partial, 'a').components.PrefabInstance.overrides, {
+    '/values/1': { op: 'replace', value: 'X' }
+  }, 'partial Apply must rebase earlier sibling indexes on the initiating instance');
+
+  const staged = createArrayEngine(['a', 'b']);
+  staged.prefabs.setOverride('b', '/values/2', 'x');
+  staged.prefabs.setOverride('b', '/values/3', 'y');
+  staged.prefabs.setOverride('a', '/values/2', 'c');
+  staged.prefabs.apply('a', { paths: '/values/2' });
+  assert.deepStrictEqual(entity(staged, 'b').values, ['a', 'b', 'c', 'x', 'y']);
+  assert.deepStrictEqual(entity(staged, 'b').components.PrefabInstance.overrides, {
+    '/values/3': { op: 'add', value: 'x' },
+    '/values/4': { op: 'add', value: 'y' }
+  }, 'array pointer shifts must be staged so adjacent records cannot overwrite one another');
+
+  const incremental = createArrayEngine(['a', 'b', 'c', 'd']);
+  incremental.prefabs.setOverride('b', '/values/2', 'd');
+  incremental.prefabs.removeOverride('a', '/values/0');
+  incremental.prefabs.removeOverride('a', '/values/1');
+  incremental.prefabs.apply('a');
+  assert.deepStrictEqual(incremental.prefabs.get('p').entities[0].values, ['b', 'd']);
+  assert.deepStrictEqual(entity(incremental, 'b').values, ['b', 'd', 'd']);
+  assert.deepStrictEqual(entity(incremental, 'b').components.PrefabInstance.overrides, {
+    '/values': { op: 'replace', value: ['b', 'd', 'd'] }
+  }, 'each array change must sync against its own intermediate Asset source');
+
+  const revertRemove = createArrayEngine(['a', 'b', 'c']);
+  revertRemove.prefabs.removeOverride('a', '/values/0');
+  revertRemove.prefabs.removeOverride('a', '/values/1');
+  revertRemove.prefabs.revert('a', '/values/0');
+  assert.deepStrictEqual(entity(revertRemove, 'a').values, ['a', 'b']);
+  assert.deepStrictEqual(entity(revertRemove, 'a').components.PrefabInstance.overrides, {
+    '/values/2': { op: 'remove' }
+  });
+
+  const revertAdd = createArrayEngine(['a', 'b']);
+  revertAdd.prefabs.setOverride('a', '/values/2', 'x');
+  revertAdd.prefabs.setOverride('a', '/values/3', 'y');
+  revertAdd.prefabs.revert('a', '/values/2');
+  assert.deepStrictEqual(entity(revertAdd, 'a').values, ['a', 'b', 'y']);
+  assert.deepStrictEqual(entity(revertAdd, 'a').components.PrefabInstance.overrides, {
+    '/values/2': { op: 'add', value: 'y' }
+  });
+
+  const reordered = createArrayEngine(['a', 'b']);
+  reordered.prefabs.setOverride('a', '/values/2', 'x');
+  reordered.prefabs.setOverride('a', '/values/3', 'y');
+  assert.doesNotThrow(() => reordered.prefabs.setOverride('a', '/values/2', 'X'));
+  assert.deepStrictEqual(entity(reordered, 'a').values, ['a', 'b', 'X', 'y']);
+  assert.deepStrictEqual(Object.keys(entity(reordered, 'a').components.PrefabInstance.overrides), ['/values/2', '/values/3'], 'editing a record must retain its semantic insertion slot');
+
+  const promotedLocal = createArrayEngine(['a', 'b', 'c']);
+  promotedLocal.prefabs.removeOverride('a', '/values/0');
+  assert.doesNotThrow(() => promotedLocal.prefabs.setOverride('a', '/values/0', 'B'));
+  assert.deepStrictEqual(entity(promotedLocal, 'a').values, ['B', 'c']);
+  assert.deepStrictEqual(entity(promotedLocal, 'a').components.PrefabInstance.overrides, {
+    '/values': { op: 'replace', value: ['B', 'c'] }
+  }, 'an ambiguous repeated array index must promote to a reconstructable branch override');
+
+  const staleEngine = new AH2D.Engine({ physics: 'builtin' });
+  const staleProject = {
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main',
+    prefabs: [{ id: 'p', rootEntityId: 'source', revision: 2, entities: [{ id: 'source' }] }],
+    scenes: [{ id: 'main', objects: [
+      { id: 'stale', branch: { x: 9, sibling: 2 }, components: { PrefabInstance: {
+        prefabId: 'p', sourceEntityId: 'source', instanceRootId: 'stale', prefabRevision: 1,
+        overrides: { '/branch/x': { op: 'replace', value: 9 } }
+      } } },
+      { id: 'current', components: { PrefabInstance: {
+        prefabId: 'p', sourceEntityId: 'source', instanceRootId: 'current', prefabRevision: 2, overrides: {}
+      } } }
+    ] }]
+  };
+  staleProject.scene = JSON.parse(JSON.stringify(staleProject.scenes[0].objects));
+  staleEngine.load(staleProject);
+  assert.doesNotThrow(() => staleEngine.prefabs.apply('stale', { paths: '/branch/x' }));
+  assert.deepStrictEqual(staleEngine.prefabs.get('p').entities[0].branch, { x: 9, sibling: 2 }, 'a stale descendant with a removed parent must promote to its nearest applicable ancestor');
+  assert.strictEqual(entity(staleEngine, 'stale').components.PrefabInstance.prefabRevision, 1);
+  assert.strictEqual(entity(staleEngine, 'current').components.PrefabInstance.prefabRevision, 3);
+};
+
 const testEditorRuntimeContract = () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'AH2DEdtior.html'), 'utf8');
   const inlineScripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)].map(match => match[1]);
@@ -2250,7 +2740,7 @@ const testEditorRuntimeContract = () => {
   for (const id of ['runtimeSelect', 'editorPlay', 'editorPause', 'editorStop', 'runtimeBackend', 'addComponentBtn', 'sceneSelect', 'newSceneBtn', 'saveSceneBtn', 'sceneModal', 'postProcessBtn', 'postProcessPanel', 'postProcessList', 'postProcessReset']) {
     assert.ok(html.includes(`id="${id}"`), `editor runtime control #${id} is missing`);
   }
-  for (const token of ['data-add-component="rigidbody"', 'data-add-component="box-collider"', 'data-add-component="circle-collider"', 'ah2dEngine.pause()', 'ah2dEngine.resume()', 'pullSceneTransformsFromEngine()', 'function switchScene(', 'function createScene(', 'function saveCurrentScene()', 'currentSceneId:state.currentSceneId', 'scenes,scene:', 'dataModel:{...dataModelDescriptor}', "componentSchemas.create('Rigidbody'", 'writeEditorComponent(', 'postProcess:cloneData(state.postProcess)', 'function applyScenePostProcess(', "requestedPhysics:'box2d'", 'physics:state.requestedPhysics', 'state.requestedPhysics=next.requestedPhysics', 'requireConfiguredPhysics()']) {
+  for (const token of ['data-add-component="rigidbody"', 'data-add-component="box-collider"', 'data-add-component="circle-collider"', 'ah2dEngine.pause()', 'ah2dEngine.resume()', 'pullSceneTransformsFromEngine()', 'function switchScene(', 'function createScene(', 'function saveCurrentScene()', 'currentSceneId:state.currentSceneId', 'scenes,scene:', '...dataModelDescriptor', "componentSchemas.create('Rigidbody'", 'writeEditorComponent(', 'postProcess:cloneData(state.postProcess)', 'function applyScenePostProcess(', "requestedPhysics:'box2d'", 'physics:state.requestedPhysics', 'state.requestedPhysics=next.requestedPhysics', 'requireConfiguredPhysics()']) {
     assert.ok(html.includes(token), `editor integration token is missing: ${token}`);
   }
   const pixiScript = html.indexOf('./node_modules/pixi.js/dist/pixi.min.js'), pixiCspScript = html.indexOf('./node_modules/pixi.js/dist/packages/unsafe-eval.min.js'), planckScript = html.indexOf('./node_modules/planck/dist/planck.min.js'), dataModelScript = html.indexOf('./engine/AH2DDataModel.js'), engineScript = html.indexOf('./engine/AH2DEngine.js');
@@ -2308,6 +2798,9 @@ const run = async () => {
   await testPixiStopWhileInitializationPending();
   await testMultiScenePlaySnapshotRestoreWithPixi();
   testFrameErrorStopsPixiRuntime();
+  testPrefabAssetInstanceOverrideApplyRevertAndUnpack();
+  testPrefabValidationIsAtomicAndSnapshotsRemainDefinitionFree();
+  testPrefabArrayOverrideCoordinatesAndStalePromotion();
   testEditorRuntimeContract();
   console.log('AH2D Engine tests passed');
 };

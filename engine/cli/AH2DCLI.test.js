@@ -71,10 +71,23 @@ try {
   assert.strictEqual(capabilities.options.physicsBackend.flag, '--backend');
   assert.deepStrictEqual(capabilities.options.physicsBackend.values, ['box2d', 'builtin']);
   assert.deepStrictEqual(capabilities.options.physicsBackend.commands, ['physics set', 'validate --engine', 'simulate', 'ecs export']);
+  assert.ok(capabilities.commands.prefab.includes('asset create'));
+  assert.ok(capabilities.commands.prefab.includes('override apply'));
+  assert.deepStrictEqual(capabilities.prefabs.overrideOps, ['add', 'replace', 'remove']);
+  assert.deepStrictEqual(capabilities.prefabs.placement.root, ['parentId', 'Transform']);
+  assert.strictEqual(capabilities.prefabs.expandedInstances, true);
+  assert.strictEqual(capabilities.prefabs.connectedMutationPolicy.structural, 'unpack-required');
+  assert.strictEqual(capabilities.prefabs.connectedMutationPolicy.properties, 'prefab override set');
+  assert.ok(capabilities.prefabs.connectedMutationPolicy.rootPlacement.includes('entity reparent'));
+  assert.strictEqual(capabilities.prefabs.overrideSynchronization.orphanedDescendants, 'promote-to-changed-ancestor');
+  assert.strictEqual(capabilities.prefabs.overrideSynchronization.arrayIndexes, 'reindex-or-promote-array');
+  assert.strictEqual(capabilities.prefabs.overrideSynchronization.staleInstanceGroups, 'skip');
+  assert.strictEqual(capabilities.prefabs.componentContainerSynthesis, 'direct /components/<Type> add only');
+  assert.ok(capabilities.prefabs.operations.includes('prefab.unpack'));
 
 
   const schemaIndex = success(['schema', 'list']).data;
-  assert.deepStrictEqual(schemaIndex.schemas, ['project', 'operation', 'batch']);
+  assert.deepStrictEqual(schemaIndex.schemas, ['project', 'prefabAsset', 'operation', 'batch']);
   assert.ok(schemaIndex.components.includes('Collider'));
   const transformSchema = success(['schema', 'show', '--component', 'Transform']).data;
   assert.strictEqual(transformSchema.name, 'component:Transform');
@@ -87,6 +100,9 @@ try {
   assert.strictEqual(projectSchema.title, 'AH2D Project');
   assert.deepStrictEqual(projectSchema.$defs.entity.properties.parentId.type, ['string', 'null']);
   assert.ok(projectSchema.$defs.entity.properties.x.description.includes('Local'));
+  assert.strictEqual(projectSchema.properties.prefabs.items.$ref, '#/$defs/prefabAsset');
+  const prefabAssetSchema = success(['schema', 'show', '--name', 'prefabAsset']).data.schema;
+  assert.deepStrictEqual(prefabAssetSchema.required, ['id', 'rootEntityId', 'entities']);
 
 
   const initialized = success(['init', '--file', projectFile, '--name', 'Agent Test']).data;
@@ -442,6 +458,317 @@ try {
   assert.deepStrictEqual(promotedPrefab.components.PrefabInstance, {
     assetId: 'prefab-asset', prefabId: 'prefab-source', overrides: { tint: 'blue' }, futurePrefab: { keep: true }
   });
+
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--data', JSON.stringify({ id: 'prefab-root', name: 'Crate Rig', x: 12, y: 34, color: '#886633', futureEntity: { keep: true } }), '--write']);
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--data', JSON.stringify({ id: 'prefab-child', name: 'Crate Lid', parentId: 'prefab-root', x: 4, y: -8, color: '#aa8844', removable: { keep: true }, futureBranch: { a: 1, b: 2 }, shiftValues: ['a', 'b', 'c'], components: { FuturePrefab: { x: 0, sibling: 'source' } } }), '--write']);
+  const prefabHash = success(['inspect', '--file', projectFile]).data.sha256;
+  const prefabDryRun = success(['prefab', 'asset', 'create', '--file', projectFile, '--scene', 'arena', '--entity', 'prefab-root', '--id', 'crate-prefab', '--name', 'Crate', '--dry-run', '--include-document', '--expect-sha256', prefabHash]).data;
+  assert.strictEqual(prefabDryRun.document.prefabs[0].rootEntityId, 'prefab-root');
+  assert.strictEqual(JSON.parse(fs.readFileSync(projectFile, 'utf8')).prefabs.length, 0, 'Prefab dry-run must not write');
+  failure(['prefab', 'asset', 'create', '--file', projectFile, '--scene', 'arena', '--entity', 'prefab-root', '--id', 'crate-prefab', '--write', '--expect-sha256', '0'.repeat(64)], 'E_HASH_MISMATCH');
+  success(['prefab', 'asset', 'create', '--file', projectFile, '--scene', 'arena', '--entity', 'prefab-root', '--id', 'crate-prefab', '--name', 'Crate', '--write', '--expect-sha256', prefabHash]);
+  const prefabList = success(['prefab', 'asset', 'list', '--file', projectFile]).data.prefabs;
+  assert.deepStrictEqual(prefabList.find(item => item.id === 'crate-prefab'), { id: 'crate-prefab', name: 'Crate', rootEntityId: 'prefab-root', entityCount: 2 });
+  let crateAsset = success(['prefab', 'asset', 'get', '--file', projectFile, 'crate-prefab']).data.prefab;
+  assert.strictEqual(crateAsset.revision, 1);
+  assert.strictEqual(crateAsset.entities.find(entity => entity.id === 'prefab-root').futureEntity.keep, true);
+  assert.deepStrictEqual(
+    { x: crateAsset.entities.find(entity => entity.id === 'prefab-root').x, y: crateAsset.entities.find(entity => entity.id === 'prefab-root').y, rot: crateAsset.entities.find(entity => entity.id === 'prefab-root').rot, sx: crateAsset.entities.find(entity => entity.id === 'prefab-root').sx, sy: crateAsset.entities.find(entity => entity.id === 'prefab-root').sy },
+    { x: 0, y: 0, rot: 0, sx: 1, sy: 1 },
+    'captured Prefab Asset root must use identity local Transform'
+  );
+  project = JSON.parse(fs.readFileSync(projectFile, 'utf8'));
+  let arenaObjects = project.scenes.find(scene => scene.id === 'arena').objects;
+  assert.deepStrictEqual(arenaObjects.find(entity => entity.id === 'prefab-root').components.PrefabInstance, {
+    prefabId: 'crate-prefab', sourceEntityId: 'prefab-root', instanceRootId: 'prefab-root', prefabRevision: 1, overrides: {}
+  });
+  assert.deepStrictEqual(
+    { x: arenaObjects.find(entity => entity.id === 'prefab-root').x, y: arenaObjects.find(entity => entity.id === 'prefab-root').y },
+    { x: 12, y: 34 },
+    'linking the captured source must preserve its Scene placement'
+  );
+
+  const firstInstance = success(['prefab', 'instantiate', '--file', projectFile, '--scene', 'arena', 'crate-prefab', '--id', 'crate-instance-a', '--x', '500', '--y', '600', '--write']).data.results[0];
+  const secondInstance = success(['prefab', 'instance', 'create', '--file', projectFile, '--scene', 'arena', 'crate-prefab', '--id', 'crate-instance-b', '--x', '700', '--y', '800', '--write']).data.results[0];
+  const firstChild = firstInstance.idMap['prefab-child'], secondChild = secondInstance.idMap['prefab-child'];
+  success(['prefab', 'instantiate', '--file', projectFile, '--scene', 'main', 'crate-prefab', '--id', 'crate-instance-a', '--write']);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', '--path', '/color', '--value', '"#335577"', '--write']);
+  success(['prefab', 'override', 'apply', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', '--path', '/color', '--write']);
+  assert.strictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'main', 'crate-instance-a']).data.entity.color, '#335577', 'Apply must synchronize a same-ID instance in another Scene');
+  failure(['component', 'patch', '--file', projectFile, '--scene', 'arena', firstChild, 'PrefabInstance', '{"futureMarker":{"keep":true}}', '--dry-run'], 'E_PREFAB_INSTANCE_EDIT');
+  project = JSON.parse(fs.readFileSync(projectFile, 'utf8'));
+  const prefabSceneIndex = project.scenes.findIndex(scene => scene.id === 'arena');
+  const firstChildIndex = project.scenes[prefabSceneIndex].objects.findIndex(entity => entity.id === firstChild);
+  success(['patch', '--file', projectFile, '--patch', JSON.stringify([{
+    op: 'add', path: `/scenes/${prefabSceneIndex}/objects/${firstChildIndex}/components/PrefabInstance/futureMarker`, value: { keep: true }
+  }]), '--write']);
+  failure(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--id', 'illegal-prefab-child', '--parent', firstChild, '--dry-run'], 'E_PREFAB_STRUCTURAL_EDIT');
+  failure(['prefab', 'instantiate', '--file', projectFile, '--scene', 'arena', 'crate-prefab', '--parent', firstChild, '--dry-run'], 'E_PREFAB_STRUCTURAL_EDIT');
+  failure(['entity', 'clone', '--file', projectFile, '--scene', 'arena', firstChild, '--dry-run'], 'E_PREFAB_STRUCTURAL_EDIT');
+  failure(['entity', 'rename', '--file', projectFile, '--scene', 'arena', firstChild, 'Illegal Rename', '--dry-run'], 'E_PREFAB_INSTANCE_EDIT');
+  failure(['entity', 'set', '--file', projectFile, '--scene', 'arena', firstChild, 'color', '"#ffffff"', '--dry-run'], 'E_PREFAB_INSTANCE_EDIT');
+  failure(['component', 'patch', '--file', projectFile, '--scene', 'arena', firstChild, 'Name', '{"value":"Illegal Rename"}', '--dry-run'], 'E_PREFAB_INSTANCE_EDIT');
+  failure(['entity', 'reparent', '--file', projectFile, '--scene', 'arena', firstChild, '--root', '--dry-run'], 'E_PREFAB_STRUCTURAL_EDIT');
+  failure(['entity', 'delete', '--file', projectFile, '--scene', 'arena', firstChild, '--cascade', '--dry-run'], 'E_PREFAB_STRUCTURAL_EDIT');
+  const sceneClone = success(['scene', 'clone', '--file', projectFile, '--scene', 'arena', '--id', 'arena-prefab-clone', '--dry-run', '--include-document']).data.document.scenes.find(scene => scene.id === 'arena-prefab-clone');
+  const clonedFirstRoot = sceneClone.objects.find(entity => entity.components?.PrefabInstance?.prefabId === 'crate-prefab' && entity.components.PrefabInstance.sourceEntityId === 'prefab-root' && entity.x === 500);
+  assert.ok(clonedFirstRoot, 'Scene clone must retain connected Prefab instances');
+  assert.strictEqual(clonedFirstRoot.components.PrefabInstance.instanceRootId, clonedFirstRoot.id, 'Scene clone must remap Prefab instanceRootId');
+  const firstOverride = success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/color', '--value', '"#ff0000"', '--write']).data.results[0];
+  assert.deepStrictEqual(firstOverride.override, { op: 'replace', value: '#ff0000' });
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', secondChild, '--path', 'color', '--value', '"#0000ff"', '--write']);
+  const inspectedOverride = success(['prefab', 'overrides', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides[0];
+  assert.deepStrictEqual(inspectedOverride.source, { exists: true, value: '#aa8844' });
+  assert.deepStrictEqual(inspectedOverride.current, { exists: true, value: '#ff0000' });
+  assert.deepStrictEqual(inspectedOverride.override, { op: 'replace', value: '#ff0000' });
+  const appliedOverride = success(['prefab', 'override', 'apply', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/color', '--write']).data.results[0];
+  assert.strictEqual(appliedOverride.appliedCount, 1);
+  crateAsset = success(['prefab', 'asset', 'get', '--file', projectFile, 'crate-prefab']).data.prefab;
+  assert.strictEqual(crateAsset.entities.find(entity => entity.id === 'prefab-child').color, '#ff0000');
+  assert.strictEqual(crateAsset.revision, 3);
+  const independentOverride = success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', secondChild]).data.overrides[0];
+  assert.deepStrictEqual(independentOverride.source, { exists: true, value: '#ff0000' });
+  assert.deepStrictEqual(independentOverride.current, { exists: true, value: '#0000ff' });
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', secondChild, '--path', '/color', '--write']);
+  assert.deepStrictEqual(success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', secondChild]).data.overrides, []);
+  assert.strictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'arena', secondChild]).data.entity.color, '#ff0000');
+
+  crateAsset = success(['prefab', 'asset', 'get', '--file', projectFile, 'crate-prefab']).data.prefab;
+  assert.strictEqual(crateAsset.entities.find(entity => entity.id === 'prefab-root').components, undefined, 'fixture must exercise a compact Asset source without a components map');
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', '--path', '/components/Health', '--value', '{"current":5}', '--write']);
+  success(['prefab', 'override', 'apply', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', '--path', '/components/Health', '--write']);
+  crateAsset = success(['prefab', 'asset', 'get', '--file', projectFile, 'crate-prefab']).data.prefab;
+  assert.deepStrictEqual(crateAsset.entities.find(entity => entity.id === 'prefab-root').components.Health, { current: 5 }, 'applying a whole-component add must synthesize the missing Asset components map');
+  assert.deepStrictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'arena', 'crate-instance-b']).data.entity.components.Health, { current: 5 });
+
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/removable/keep', '--remove', '--write']);
+  const removalOverride = success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides[0];
+  assert.deepStrictEqual(removalOverride.override, { op: 'remove' });
+  assert.deepStrictEqual(removalOverride.current, { exists: false });
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', firstChild, '--write']);
+  assert.strictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'arena', firstChild]).data.entity.removable.keep, true);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/color', '--value', '"#00ff00"', '--write']);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/removable/keep', '--value', 'false', '--write']);
+  assert.strictEqual(success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', '--all']).data.overrides.length, 2);
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', firstChild, '--all', '--write']);
+  assert.deepStrictEqual(success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides, [], 'multi-path revert must not reintroduce a previously cleared record');
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/addedByInstance', '--value', '{"keep":true}', '--write']);
+  assert.deepStrictEqual(success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides[0].override, { op: 'add', value: { keep: true } });
+  success(['prefab', 'override', 'apply', '--file', projectFile, '--scene', 'arena', firstChild, '--write']);
+  assert.deepStrictEqual(success(['prefab', 'asset', 'get', '--file', projectFile, 'crate-prefab']).data.prefab.entities.find(entity => entity.id === 'prefab-child').addedByInstance, { keep: true });
+
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/temporaryLocal', '--value', '{"keep":true}', '--write']);
+  const clearedLocalAdd = success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/temporaryLocal', '--remove', '--write']).data.results[0];
+  assert.strictEqual(clearedLocalAdd.override, null, 'removing a source-absent local add must not store an invalid remove operation');
+  assert.strictEqual(clearedLocalAdd.reverted, true);
+  assert.strictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'arena', firstChild]).data.entity.temporaryLocal, undefined);
+  assert.strictEqual(success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides.some(item => item.path === '/temporaryLocal'), false);
+
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/components/FuturePrefab', '--value', '{"x":1,"sibling":"keep"}', '--write']);
+  const nestedSet = success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/components/FuturePrefab/x', '--value', '2', '--write']).data.results[0];
+  assert.strictEqual(nestedSet.storedPath, '/components/FuturePrefab');
+  let owningOverride = success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides.find(item => item.path === '/components/FuturePrefab');
+  assert.deepStrictEqual(owningOverride.override, { op: 'replace', value: { x: 2, sibling: 'keep' } }, 'nested set must rebase the owning ancestor without losing siblings');
+  const nestedRemove = success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/components/FuturePrefab/x', '--remove', '--write']).data.results[0];
+  assert.strictEqual(nestedRemove.storedPath, '/components/FuturePrefab');
+  owningOverride = success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides.find(item => item.path === '/components/FuturePrefab');
+  assert.deepStrictEqual(owningOverride.override, { op: 'replace', value: { sibling: 'keep' } }, 'nested remove must preserve sibling values in the owning override');
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/components/FuturePrefab', '--write']);
+
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/removable', '--value', '{"keep":false}', '--write']);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/removable/keep', '--value', 'false', '--write']);
+  let overlapOverrides = success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides.filter(item => item.path.startsWith('/removable'));
+  assert.deepStrictEqual(overlapOverrides.map(item => item.path), ['/removable'], 'nested edits must remain represented by one owning ancestor record');
+  assert.deepStrictEqual(overlapOverrides[0].override, { op: 'replace', value: { keep: false } });
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/removable', '--write']);
+
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/removable/keep', '--value', 'false', '--write']);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', secondChild, '--path', '/removable', '--value', '{"keep":true,"synced":42}', '--write']);
+  success(['prefab', 'override', 'apply', '--file', projectFile, '--scene', 'arena', secondChild, '--path', '/removable', '--write']);
+  let firstNested = success(['entity', 'get', '--file', projectFile, '--scene', 'arena', firstChild]).data.entity.removable;
+  assert.deepStrictEqual(firstNested, { keep: false, synced: 42 }, 'Asset parent changes must sync siblings while preserving descendant overrides');
+  let nestedOverride = success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides.find(item => item.path === '/removable/keep');
+  assert.deepStrictEqual(nestedOverride.source, { exists: true, value: true });
+  assert.deepStrictEqual(nestedOverride.current, { exists: true, value: false });
+  assert.deepStrictEqual(nestedOverride.override, { op: 'replace', value: false });
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/removable/keep', '--write']);
+
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/removable', '--value', '{"keep":false,"local":true}', '--write']);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', secondChild, '--path', '/removable/keep', '--value', 'false', '--write']);
+  success(['prefab', 'override', 'apply', '--file', projectFile, '--scene', 'arena', secondChild, '--path', '/removable/keep', '--write']);
+  firstNested = success(['entity', 'get', '--file', projectFile, '--scene', 'arena', firstChild]).data.entity.removable;
+  assert.deepStrictEqual(firstNested, { keep: false, local: true }, 'an ancestor override must own its complete branch during Asset synchronization');
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/removable', '--write']);
+
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/futureBranch/a', '--value', '9', '--write']);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', 'prefab-child', '--path', '/futureBranch', '--remove', '--write']);
+  success(['prefab', 'override', 'apply', '--file', projectFile, '--scene', 'arena', 'prefab-child', '--path', '/futureBranch', '--write']);
+  let promotedBranch = success(['entity', 'get', '--file', projectFile, '--scene', 'arena', firstChild]).data.entity.futureBranch;
+  assert.deepStrictEqual(promotedBranch, { a: 9, b: 2 }, 'removing an Asset ancestor must preserve the effective branch owned by a descendant override');
+  let promotedOverride = success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides.find(item => item.path === '/futureBranch');
+  assert.deepStrictEqual(promotedOverride.override, { op: 'add', value: { a: 9, b: 2 } }, 'an orphaned descendant must promote to a reconstructable ancestor add');
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/futureBranch', '--write']);
+
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', 'prefab-child', '--path', '/futureBranch', '--value', '{"a":1,"b":2}', '--write']);
+  success(['prefab', 'override', 'apply', '--file', projectFile, '--scene', 'arena', 'prefab-child', '--path', '/futureBranch', '--write']);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/futureBranch/a', '--value', '9', '--write']);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', 'prefab-child', '--path', '/futureBranch', '--value', '"retyped"', '--write']);
+  success(['prefab', 'override', 'apply', '--file', projectFile, '--scene', 'arena', 'prefab-child', '--path', '/futureBranch', '--write']);
+  promotedBranch = success(['entity', 'get', '--file', projectFile, '--scene', 'arena', firstChild]).data.entity.futureBranch;
+  assert.deepStrictEqual(promotedBranch, { a: 9, b: 2 }, 'retyping an Asset ancestor must preserve an incompatible descendant override branch');
+  promotedOverride = success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides.find(item => item.path === '/futureBranch');
+  assert.deepStrictEqual(promotedOverride.override, { op: 'replace', value: { a: 9, b: 2 } }, 'a descendant orphaned by retyping must promote to an ancestor replace');
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/futureBranch', '--write']);
+  assert.strictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'arena', firstChild]).data.entity.futureBranch, 'retyped');
+
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/shiftValues/2', '--value', '"X"', '--write']);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', 'prefab-child', '--path', '/shiftValues/0', '--remove', '--write']);
+  success(['prefab', 'override', 'apply', '--file', projectFile, '--scene', 'arena', 'prefab-child', '--path', '/shiftValues/0', '--write']);
+  assert.deepStrictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'arena', firstChild]).data.entity.shiftValues, ['b', 'X'], 'array removal must preserve a later overridden element');
+  let shiftedOverrides = success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides.filter(item => item.path.startsWith('/shiftValues'));
+  assert.strictEqual(shiftedOverrides.some(item => item.path === '/shiftValues/2'), false, 'array removal must clear the obsolete index pointer');
+  assert.deepStrictEqual(shiftedOverrides.find(item => item.path === '/shiftValues/1').override, { op: 'replace', value: 'X' }, 'array removal must reindex a later override pointer');
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/shiftValues/1', '--write']);
+
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/shiftValues/0', '--value', '"Local B"', '--write']);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', 'prefab-child', '--path', '/shiftValues/0', '--remove', '--write']);
+  success(['prefab', 'override', 'apply', '--file', projectFile, '--scene', 'arena', 'prefab-child', '--path', '/shiftValues/0', '--write']);
+  assert.deepStrictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'arena', firstChild]).data.entity.shiftValues, ['Local B', 'c'], 'an override on a removed array element must retain a reconstructable array');
+  shiftedOverrides = success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides.filter(item => item.path.startsWith('/shiftValues'));
+  assert.deepStrictEqual(shiftedOverrides.map(item => item.path), ['/shiftValues']);
+  assert.deepStrictEqual(shiftedOverrides[0].override, { op: 'replace', value: ['Local B', 'c'] }, 'a removed overridden index must promote to ownership of the complete array');
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/shiftValues', '--write']);
+  assert.deepStrictEqual(success(['entity', 'get', '--file', projectFile, '--scene', 'arena', firstChild]).data.entity.shiftValues, ['c']);
+
+  failure(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', '--path', '/x', '--value', '1', '--dry-run'], 'E_PREFAB_PLACEMENT_PATH');
+  failure(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', '--path', '/rot', '--value', '45', '--dry-run'], 'E_PREFAB_PLACEMENT_PATH');
+
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--id', 'prefab-placement-parent', '--name', 'Prefab Placement Parent', '--write']);
+  success(['entity', 'reparent', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', 'prefab-placement-parent', '--write']);
+  success(['entity', 'set', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', 'rot', '25', '--write']);
+  success(['entity', 'set', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', 'sx', '1.5', '--write']);
+  success(['component', 'patch', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', 'Transform', '{"placementExtension":{"keep":true}}', '--write']);
+  project = JSON.parse(fs.readFileSync(projectFile, 'utf8'));
+  const caseVariantRootIndex = project.scenes[prefabSceneIndex].objects.findIndex(entity => entity.id === 'crate-instance-a');
+  const canonicalRootPlacement = project.scenes[prefabSceneIndex].objects[caseVariantRootIndex].components.Transform;
+  success(['patch', '--file', projectFile, '--patch', JSON.stringify([
+    { op: 'add', path: `/scenes/${prefabSceneIndex}/objects/${caseVariantRootIndex}/components/TRANSFORM`, value: canonicalRootPlacement },
+    { op: 'remove', path: `/scenes/${prefabSceneIndex}/objects/${caseVariantRootIndex}/components/Transform` }
+  ]), '--write']);
+  success(['prefab', 'override', 'set', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/components/FuturePrefab/x', '--value', '9', '--write']);
+  crateAsset = success(['prefab', 'asset', 'get', '--file', projectFile, 'crate-prefab']).data.prefab;
+  const rebuiltSources = JSON.parse(JSON.stringify(crateAsset.entities));
+  rebuiltSources.find(entity => entity.id === 'prefab-root').x = 123;
+  rebuiltSources.find(entity => entity.id === 'prefab-root').y = 456;
+  rebuiltSources.find(entity => entity.id === 'prefab-child').components.FuturePrefab.x = 5;
+  success(['prefab', 'asset', 'update', '--file', projectFile, 'crate-prefab', '--patch', JSON.stringify({ futureAsset: { keep: true }, entities: rebuiltSources }), '--write']);
+  failure(['prefab', 'asset', 'update', '--file', projectFile, 'crate-prefab', '--scene', 'arena', '--entity', 'crate-instance-a', '--dry-run'], 'E_PREFAB_UPDATE_SOURCE_INSTANCE');
+  project = JSON.parse(fs.readFileSync(projectFile, 'utf8'));
+  arenaObjects = project.scenes.find(scene => scene.id === 'arena').objects;
+  const placedRoot = arenaObjects.find(entity => entity.id === 'crate-instance-a');
+  const placedTransform = placedRoot.components.TRANSFORM;
+  assert.strictEqual(placedRoot.components.Transform, undefined, 'Asset sync must preserve the explicit case-variant Transform provenance');
+  assert.strictEqual(placedRoot.parentId, 'prefab-placement-parent', 'Asset sync must preserve root placement parent');
+  assert.strictEqual(placedTransform.x, 500, 'Asset sync must preserve root placement X');
+  assert.strictEqual(placedTransform.y, 600, 'Asset sync must preserve root placement Y');
+  assert.strictEqual(placedTransform.rotation, 25, 'Asset sync must preserve root placement rotation');
+  assert.strictEqual(placedTransform.scaleX, 1.5, 'Asset sync must preserve root placement scale');
+  assert.strictEqual(placedTransform.placementExtension.keep, true, 'Asset sync must preserve the complete root Transform placement representation');
+  assert.strictEqual(arenaObjects.find(entity => entity.id === firstChild).components.PrefabInstance.futureMarker.keep, true, 'Prefab sync must preserve marker extensions');
+  assert.strictEqual(arenaObjects.find(entity => entity.id === firstChild).components.FuturePrefab.x, 9, 'Asset rebuild must preserve and rebase an independent override');
+  assert.strictEqual(arenaObjects.find(entity => entity.id === secondChild).components.FuturePrefab.x, 5, 'Asset rebuild must synchronize members without that override');
+  const rebuiltOverride = success(['prefab', 'override', 'inspect', '--file', projectFile, '--scene', 'arena', firstChild]).data.overrides.find(item => item.path === '/components/FuturePrefab/x');
+  assert.deepStrictEqual(rebuiltOverride.source, { exists: true, value: 5 });
+  assert.deepStrictEqual(rebuiltOverride.current, { exists: true, value: 9 });
+  assert.deepStrictEqual(rebuiltOverride.override, { op: 'replace', value: 9 });
+  success(['prefab', 'override', 'revert', '--file', projectFile, '--scene', 'arena', firstChild, '--path', '/components/FuturePrefab/x', '--write']);
+  assert.strictEqual(project.prefabs.find(prefab => prefab.id === 'crate-prefab').futureAsset.keep, true);
+  assert.deepStrictEqual(
+    { x: project.prefabs.find(prefab => prefab.id === 'crate-prefab').entities.find(entity => entity.id === 'prefab-root').x, y: project.prefabs.find(prefab => prefab.id === 'crate-prefab').entities.find(entity => entity.id === 'prefab-root').y },
+    { x: 0, y: 0 },
+    'Prefab Asset update must retain root identity Transform'
+  );
+  failure(['prefab', 'asset', 'delete', '--file', projectFile, 'crate-prefab', '--write'], 'E_PREFAB_IN_USE');
+  success(['prefab', 'unpack', '--file', projectFile, '--scene', 'arena', 'crate-instance-a', '--write']);
+  assert.strictEqual(success(['component', 'list', '--file', projectFile, '--scene', 'arena', 'crate-instance-a']).data.components.some(component => component.type === 'PrefabInstance'), false);
+  success(['entity', 'rename', '--file', projectFile, '--scene', 'arena', firstChild, 'Unpacked Crate Lid', '--write']);
+  success(['entity', 'create', '--file', projectFile, '--scene', 'arena', '--id', 'unpacked-prefab-child', '--parent', firstChild, '--write']);
+  success(['prefab', 'asset', 'delete', '--file', projectFile, 'crate-prefab', '--unpack-instances', '--write']);
+  assert.strictEqual(success(['prefab', 'asset', 'list', '--file', projectFile]).data.prefabs.some(prefab => prefab.id === 'crate-prefab'), false);
+  project = JSON.parse(fs.readFileSync(projectFile, 'utf8'));
+  assert.strictEqual(project.scenes.find(scene => scene.id === 'arena').objects.filter(entity => entity.components?.PrefabInstance?.prefabId === 'crate-prefab').length, 0);
+  assert.strictEqual(project.scenes.find(scene => scene.id === 'main').objects.filter(entity => entity.components?.PrefabInstance?.prefabId === 'crate-prefab').length, 0);
+
+  const stalePrefabFile = path.join(tempRoot, 'stale-prefab.ah2d.json');
+  const stalePrefabProject = createProject({ name: 'Stale Prefab Lifecycle' });
+  stalePrefabProject.prefabs = [{
+    id: 'stale-prefab', name: 'Stale Prefab', rootEntityId: 'stale-source-root', revision: 2,
+    entities: [
+      { id: 'stale-source-root', name: 'Asset Root' },
+      { id: 'stale-source-child', name: 'Asset Child', parentId: 'stale-source-root', foo: 'new' }
+    ]
+  }];
+  stalePrefabProject.scenes[0].objects = [
+    { id: 'stale-root', name: 'Asset Root', components: { PrefabInstance: {
+      prefabId: 'stale-prefab', sourceEntityId: 'stale-source-root', instanceRootId: 'stale-root', prefabRevision: 1, overrides: {}
+    } } },
+    { id: 'stale-child', name: 'Local Child', parentId: 'stale-root', foo: 'old', components: { PrefabInstance: {
+      prefabId: 'stale-prefab', sourceEntityId: 'stale-source-child', instanceRootId: 'stale-root', prefabRevision: 1,
+      overrides: { '/name': { op: 'replace', value: 'Local Child' } }
+    } } },
+    { id: 'current-root', name: 'Asset Root', components: { PrefabInstance: {
+      prefabId: 'stale-prefab', sourceEntityId: 'stale-source-root', instanceRootId: 'current-root', prefabRevision: 2, overrides: {}
+    } } },
+    { id: 'current-child', name: 'Asset Child', parentId: 'current-root', foo: 'new', components: { PrefabInstance: {
+      prefabId: 'stale-prefab', sourceEntityId: 'stale-source-child', instanceRootId: 'current-root', prefabRevision: 2, overrides: {}
+    } } }
+  ];
+  stalePrefabProject.scene = JSON.parse(JSON.stringify(stalePrefabProject.scenes[0].objects));
+  fs.writeFileSync(stalePrefabFile, JSON.stringify(stalePrefabProject));
+  const mixedPrefabFile = path.join(tempRoot, 'mixed-prefab-revision.ah2d.json');
+  const mixedPrefabProject = JSON.parse(JSON.stringify(stalePrefabProject));
+  mixedPrefabProject.scenes[0].objects.find(entity => entity.id === 'stale-child').components.PrefabInstance.prefabRevision = 2;
+  mixedPrefabProject.scene = JSON.parse(JSON.stringify(mixedPrefabProject.scenes[0].objects));
+  fs.writeFileSync(mixedPrefabFile, JSON.stringify(mixedPrefabProject));
+  const mixedRevisionValidation = failure(['validate', '--file', mixedPrefabFile], 'E_PROJECT_INVALID').payload;
+  assert.ok(mixedRevisionValidation.diagnostics.some(item => item.code === 'E_PREFAB_INSTANCE_REVISION_MISMATCH'), 'CLI validation must reject mixed revisions within one expanded Instance');
+  success(['prefab', 'override', 'apply', '--file', stalePrefabFile, '--scene', 'main', 'stale-child', '--path', '/name', '--write']);
+  let staleResult = JSON.parse(fs.readFileSync(stalePrefabFile, 'utf8'));
+  let staleObjects = staleResult.scenes[0].objects;
+  assert.strictEqual(staleResult.prefabs[0].revision, 3);
+  assert.deepStrictEqual(
+    staleObjects.filter(entity => entity.id.startsWith('stale-')).map(entity => entity.components.PrefabInstance.prefabRevision),
+    [1, 1],
+    'every member of the initiating stale group must remain at its old revision'
+  );
+  assert.deepStrictEqual(
+    staleObjects.filter(entity => entity.id.startsWith('current-')).map(entity => entity.components.PrefabInstance.prefabRevision),
+    [3, 3],
+    'every member of a previously-current group may advance together'
+  );
+  assert.strictEqual(staleObjects.find(entity => entity.id === 'current-child').name, 'Local Child');
+
+  success(['prefab', 'override', 'set', '--file', stalePrefabFile, '--scene', 'main', 'current-child', '--path', '/foo', '--value', '"applied"', '--write']);
+  success(['prefab', 'override', 'apply', '--file', stalePrefabFile, '--scene', 'main', 'current-child', '--path', '/foo', '--write']);
+  staleResult = JSON.parse(fs.readFileSync(stalePrefabFile, 'utf8'));
+  staleObjects = staleResult.scenes[0].objects;
+  assert.strictEqual(staleObjects.find(entity => entity.id === 'stale-child').foo, 'old', 'Asset path sync must not partially mutate a stale group');
+  assert.deepStrictEqual(staleObjects.filter(entity => entity.id.startsWith('stale-')).map(entity => entity.components.PrefabInstance.prefabRevision), [1, 1]);
+  assert.deepStrictEqual(staleObjects.filter(entity => entity.id.startsWith('current-')).map(entity => entity.components.PrefabInstance.prefabRevision), [4, 4]);
+
+  const staleUpdate = success(['prefab', 'asset', 'update', '--file', stalePrefabFile, 'stale-prefab', '--patch', '{"name":"Updated Prefab"}', '--write']).data.results[0];
+  assert.deepStrictEqual(
+    { synchronized: staleUpdate.synchronized.instanceCount, stale: staleUpdate.synchronized.staleInstanceCount },
+    { synchronized: 1, stale: 1 },
+    'Asset update must rebuild only groups that were current at the previous revision'
+  );
+  staleResult = JSON.parse(fs.readFileSync(stalePrefabFile, 'utf8'));
+  staleObjects = staleResult.scenes[0].objects;
+  assert.deepStrictEqual(staleObjects.filter(entity => entity.id.startsWith('stale-')).map(entity => entity.components.PrefabInstance.prefabRevision), [1, 1]);
+  assert.deepStrictEqual(staleObjects.filter(entity => entity.id.startsWith('current-')).map(entity => entity.components.PrefabInstance.prefabRevision), [5, 5]);
+  const staleValidation = success(['validate', '--file', stalePrefabFile]);
+  assert.ok(staleValidation.diagnostics.some(item => item.code === 'W_PREFAB_INSTANCE_STALE'));
+  assert.strictEqual(staleValidation.diagnostics.some(item => item.code === 'E_PREFAB_INSTANCE_REVISION_MISMATCH' || item.code === 'E_PREFAB_INSTANCE_STATE'), false);
 
   success(['scene', 'rename', '--file', projectFile, '--scene', 'arena', 'Arena Renamed', '--write']);
   assert.strictEqual(success(['entity', 'list', '--file', projectFile, '--scene-name', 'Arena Renamed']).data.sceneId, 'arena');
