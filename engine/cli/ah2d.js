@@ -331,7 +331,7 @@ function capabilities() {
       runtime: ['get', 'set'], physics: ['get', 'set'], schema: ['list', 'show'],
       topLevel: ['init', 'inspect', 'validate', 'format', 'migrate', 'query', 'patch', 'apply', 'simulate', 'ecs export', 'doctor', 'version', 'capabilities']
     },
-    enums: { runtime: ['pixijs', 'phaserjs', 'custom'], physicsBackend: [...PHYSICS_BACKENDS], rigidbodyType: ['static', 'dynamic', 'kinematic'], colliderShape: ['rectangle', 'box', 'circle'], animationTrackType: ['sprite', 'position', 'rotation', 'event', 'hitbox'] },
+    enums: { runtime: ['pixijs', 'phaserjs', 'custom'], physicsBackend: [...PHYSICS_BACKENDS], rigidbodyType: ['static', 'dynamic', 'kinematic'], colliderShape: ['rectangle', 'box', 'circle'], animationTrackType: ['sprite', 'position', 'rotation', 'event', 'hitbox', 'bone', 'ik'], bendDirection: [-1, 1] },
     options: {
       physicsBackend: {
         flag: '--backend', values: [...PHYSICS_BACKENDS],
@@ -365,9 +365,20 @@ function capabilities() {
     },
     animations: {
       storage: 'animations', schema: 'animationClip', component: 'Animation', stableReference: 'clipId',
-      legacyReference: 'clip', trackTypes: ['sprite', 'position', 'rotation', 'event', 'hitbox'],
+      legacyReference: 'clip', trackTypes: ['sprite', 'position', 'rotation', 'event', 'hitbox', 'bone', 'ik'],
       timebase: { authoring: 'frame', duration: 'frameCount / fps' },
       mutation: 'resource put|delete or project patch/apply'
+    },
+    skeletons: {
+      components: ['Skeleton', 'Bone', 'IK', 'Skin'],
+      referenceScope: 'same Scene or Prefab Asset',
+      hierarchy: { root: 'Skeleton.rootBoneId', parent: 'Entity.parentId', ikChainOrder: 'ancestor-to-descendant' },
+      skinning: {
+        vertices: 'Skin.vertices', weights: 'vertices[].weights[]', positiveWeightTotal: true,
+        topology: { uvsPerVertex: 2, indexPrimitive: 'triangles', indicesMustReferenceVertices: true, emptyMesh: true }
+      },
+      runtimeOnly: ['Skeleton.pose', 'Skeleton.boneMatrices', 'Skin.deformedVertices'],
+      animationTrackTypes: ['bone', 'ik']
     },
     mutationSafety: { explicitWrite: ['--write', '--out', '--print-document', '--dry-run'], optimisticConcurrency: '--expect-sha256', atomicReplace: true, batchRollback: true, unknownFieldsPreserved: true },
     input: { project: ['--file PATH', '--file -'], jsonValue: ['JSON', '@file.json', '-'] },

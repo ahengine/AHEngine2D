@@ -33,7 +33,9 @@ const {
   normalizeAnimationClips,
   sampleAnimationClip,
   validateAnimationDocument,
-  assertAnimationDocument
+  assertAnimationDocument,
+  validateSkeletonDocument,
+  assertSkeletonDocument
 } = DataModel;
 
 const tests = [];
@@ -58,6 +60,7 @@ test('exports stable constants, schemas, and a browser global', () => {
   assert.strictEqual(browser.AH2DDataModel.DATA_MODEL_ID, 'ah2d.ecs');
   assert.strictEqual(typeof browser.AH2DDataModel.createDefaultEntityCodec, 'function');
   assert.strictEqual(typeof browser.AH2DDataModel.validatePrefabDocument, 'function');
+  assert.strictEqual(typeof browser.AH2DDataModel.validateSkeletonDocument, 'function');
 });
 
 test('applies canonical Prefab override pointers safely and protects instance identity', () => {
@@ -238,7 +241,7 @@ test('registers every built-in with independent collider types and only Rigidbod
   const types = registry.list().map(item => item.type);
   for (const type of [
     'Name', 'Transform', 'Renderable', 'Rigidbody', 'Collider', 'Hidden', 'Locked', 'PrefabInstance',
-    'Camera', 'Light', 'ShadowCaster', 'Animation', 'Tilemap', 'ParticleEmitter',
+    'Camera', 'Light', 'ShadowCaster', 'Animation', 'Skeleton', 'Bone', 'IK', 'Skin', 'Tilemap', 'ParticleEmitter',
     'BoxCollider', 'BoxCollider2D', 'CircleCollider', 'CircleCollider2D'
   ]) assert(types.includes(type), `missing ${type}`);
 
@@ -984,6 +987,337 @@ test('accepts definition-free v3 Animation snapshots without weakening authoring
       'only a v3 entities snapshot with no animations field may omit Clip definitions'
     );
   }
+});
+
+test('registers canonical Skeleton components and strips only derived pose data from authoring', () => {
+  const registry = createDefaultComponentRegistry();
+  assert.deepStrictEqual(registry.create('Skeleton'), { enabled: true, solveIK: true, debug: false });
+  assert.deepStrictEqual(registry.create('Bone'), { length: 32, inheritRotation: true, inheritScale: true });
+  const skeleton = {
+    rootBoneId: 'hip', enabled: true, solveIK: true, debug: false,
+    pose: { hip: { rotation: 10 } }, boneMatrices: { hip: [1, 0, 0, 1, 4, 8] },
+    extension: { keep: true }
+  };
+  assert.deepStrictEqual(registry.normalize('Skeleton', skeleton, { profile: 'authoring' }), {
+    rootBoneId: 'hip', enabled: true, solveIK: true, debug: false, extension: { keep: true }
+  });
+  assert.deepStrictEqual(registry.normalize('Skeleton', skeleton, { profile: 'runtime' }).boneMatrices.hip, [1, 0, 0, 1, 4, 8]);
+  const skin = {
+    skeletonRootId: 'rig', vertices: [], deformedVertices: [{ x: 2, y: 3 }], extension: true
+  };
+  assert.strictEqual(registry.normalize('Skin', skin, { profile: 'authoring' }).deformedVertices, undefined);
+  assert.deepStrictEqual(registry.normalize('Skin', skin, { profile: 'runtime' }).deformedVertices, [{ x: 2, y: 3 }]);
+  assert.strictEqual(registry.normalize('Skin', skin, { profile: 'authoring' }).extension, true);
+  assert.strictEqual(registry.describe('IK').schemas.authoring.required.includes('skeletonRootId'), true);
+  assert.strictEqual(registry.describe('Skin').schemas.authoring.required.includes('vertices'), true);
+});
+
+test('validates Skeleton, Bone, IK, and Skin references independently in every Scene and Prefab scope', () => {
+  const rigEntities = prefix => [
+    { id: `${prefix}-rig`, components: { Skeleton: { rootBoneId: `${prefix}-hip`, enabled: true, futureSkeleton: true } } },
+    { id: `${prefix}-hip`, parentId: `${prefix}-rig`, components: { Bone: { length: 40, color: '#fff', futureBone: 1 } } },
+    { id: `${prefix}-knee`, parentId: `${prefix}-hip`, components: { Bone: { length: 32 } } },
+    { id: `${prefix}-target`, components: { IK: {
+      id: `${prefix}-leg-ik`, skeletonRootId: `${prefix}-rig`, bones: [`${prefix}-hip`, `${prefix}-knee`],
+      mix: 1, iterations: 12, tolerance: 0.01, enabled: true, bendDirection: 1, futureIK: true
+    } } },
+    { id: `${prefix}-mesh`, components: { Skin: {
+      skeletonRootId: `${prefix}-rig`, assetId: `${prefix}-texture`,
+      vertices: [
+        { x: 0, y: 0, weights: [{ boneId: `${prefix}-hip`, weight: 0.25 }, { boneId: `${prefix}-knee`, weight: 0.75 }] },
+        { x: 10, y: 0, weights: [{ boneId: `${prefix}-knee`, weight: 1 }] }
+      ],
+      uvs: [0, 0, 1, 0], indices: [0, 1, 0], futureSkin: { keep: true }
+    } } }
+  ];
+  const document = {
+    scenes: [{ id: 'main', objects: rigEntities('scene') }],
+    prefabs: [{ id: 'knight', rootEntityId: 'prefab-rig', entities: rigEntities('prefab') }]
+  };
+  assert.deepStrictEqual(validateSkeletonDocument(document), []);
+  assert.doesNotThrow(() => assertSkeletonDocument(document));
+  assert.deepStrictEqual(validateSkeletonDocument({ entities: [
+    { id: 'combined-root', components: { Skeleton: {}, Bone: { length: 12 } } },
+    { id: 'combined-child', parentId: 'combined-root', components: { Bone: { length: 8 } } }
+  ] }), [], 'a Skeleton Entity may also be its root Bone, matching Runtime composition');
+
+  const crossScope = JSON.parse(JSON.stringify(document));
+  crossScope.scenes[0].objects[3].components.IK.bones[1] = 'prefab-knee';
+  const crossDiagnostics = validateSkeletonDocument(crossScope);
+  assert(crossDiagnostics.some(item => item.code === 'E_IK_BONE_REFERENCE' && item.pointer === '/scenes/0/objects/3/components/IK/bones/1'));
+
+  const invalid = JSON.parse(JSON.stringify(document));
+  invalid.scenes[0].objects[0].components.Skeleton.rootBoneId = 'missing-root';
+  invalid.scenes[0].objects.push({ id: 'orphan', components: { Bone: { length: 1 } } });
+  invalid.scenes[0].objects[3].components.IK.bones = ['scene-hip', 'scene-hip'];
+  invalid.scenes[0].objects[4].components.Skin.vertices[0].weights = [
+    { boneId: 'scene-knee', weight: 0 },
+    { boneId: 'scene-knee', weight: 0 },
+    { boneId: 'missing-bone', weight: 0 }
+  ];
+  const diagnostics = validateSkeletonDocument(invalid);
+  for (const code of [
+    'E_SKELETON_ROOT_BONE_REFERENCE', 'E_BONE_SKELETON_ANCESTRY', 'E_IK_BONE_DUPLICATE',
+    'E_IK_CHAIN', 'E_SKIN_BONE_DUPLICATE', 'E_SKIN_BONE_REFERENCE', 'E_SKIN_WEIGHT_TOTAL'
+  ]) assert(diagnostics.some(item => item.code === code), `${code} not reported`);
+  assert.throws(
+    () => assertSkeletonDocument(invalid),
+    error => error instanceof ComponentSchemaError && error.diagnostics.some(item => item.code === 'E_SKIN_WEIGHT_TOTAL')
+  );
+});
+
+test('accepts definition-free v3 Skeleton snapshots without weakening authoring references', () => {
+  const runtimeEntities = [
+    { id: 'instance-rig', components: { Skeleton: {
+      rootBoneId: 'source-hip', pose: { 'source-hip': { rotation: 15 } },
+      boneMatrices: { 'source-hip': [1, 0, 0, 1, 5, 6] }
+    } } },
+    { id: 'instance-target', components: { IK: { skeletonRootId: 'source-rig', bones: ['source-hip'] } } },
+    { id: 'instance-mesh', components: { Skin: {
+      skeletonRootId: 'source-rig', vertices: [{ x: 0, y: 0, weights: [{ boneId: 'source-hip', weight: 1 }] }],
+      deformedVertices: [{ x: 5, y: 6 }]
+    } } }
+  ];
+  const snapshot = { format: 'AH2D', version: 3, entities: runtimeEntities };
+  assert.deepStrictEqual(validateSkeletonDocument(snapshot, { strict: true }), []);
+  assert.doesNotThrow(() => assertSkeletonDocument(snapshot, { strict: true }));
+
+  for (const authoringLike of [
+    { format: 'AH2D', version: 4, entities: runtimeEntities },
+    { format: 'AH2D', version: 3, entities: runtimeEntities, prefabs: [] },
+    { format: 'AH2D', version: 3, scenes: [{ id: 'main', objects: runtimeEntities }] }
+  ]) {
+    assert(
+      validateSkeletonDocument(authoringLike, { strict: true }).some(item => item.code === 'E_IK_SKELETON_REFERENCE'),
+      'only a definition-free v3 entities snapshot may omit authoring Skeleton references'
+    );
+  }
+});
+
+test('resolves Skeleton references independently inside multiple expanded Prefab instances', () => {
+  const marker = (instanceRootId, sourceEntityId) => ({
+    prefabId: 'rig-prefab', sourceEntityId, instanceRootId, prefabRevision: 1, overrides: {}
+  });
+  const instance = prefix => [
+    { id: `${prefix}-rig`, components: {
+      PrefabInstance: marker(`${prefix}-rig`, 'source-rig'),
+      Skeleton: { rootBoneId: 'source-hip' }
+    } },
+    { id: `${prefix}-hip`, parentId: `${prefix}-rig`, components: {
+      PrefabInstance: marker(`${prefix}-rig`, 'source-hip'), Bone: { length: 20 }
+    } },
+    { id: `${prefix}-knee`, parentId: `${prefix}-hip`, components: {
+      PrefabInstance: marker(`${prefix}-rig`, 'source-knee'), Bone: { length: 16 }
+    } },
+    { id: `${prefix}-target`, components: {
+      PrefabInstance: marker(`${prefix}-rig`, 'source-target'),
+      IK: { skeletonRootId: 'source-rig', bones: ['source-hip', 'source-knee'] }
+    } },
+    { id: `${prefix}-mesh`, components: {
+      PrefabInstance: marker(`${prefix}-rig`, 'source-mesh'),
+      Skin: { skeletonRootId: 'source-rig', vertices: [{
+        x: 0, y: 0, weights: [{ boneId: 'source-knee', weight: 1 }]
+      }] }
+    } }
+  ];
+  const document = { scenes: [{ id: 'main', objects: [...instance('a'), ...instance('b')] }] };
+  assert.deepStrictEqual(validateSkeletonDocument(document), []);
+
+  const broken = JSON.parse(JSON.stringify(document));
+  broken.scenes[0].objects.find(entity => entity.id === 'b-knee').components.PrefabInstance.sourceEntityId = 'different-source';
+  const diagnostics = validateSkeletonDocument(broken);
+  assert(diagnostics.some(item => item.code === 'E_IK_BONE_REFERENCE' && item.pointer === '/scenes/0/objects/8/components/IK/bones/1'));
+  assert(diagnostics.some(item => item.code === 'E_SKIN_BONE_REFERENCE' && item.pointer === '/scenes/0/objects/9/components/Skin/vertices/0/weights/0/boneId'));
+  assert.strictEqual(
+    diagnostics.some(item => item.pointer.startsWith('/scenes/0/objects/3/') || item.pointer.startsWith('/scenes/0/objects/4/')),
+    false,
+    'a broken second instance must not poison the first instance group'
+  );
+
+  const crossInstance = JSON.parse(JSON.stringify(document));
+  crossInstance.scenes[0].objects[5].components.Skeleton.rootBoneId = 'a-hip';
+  crossInstance.scenes[0].objects[8].components.IK.bones[1] = 'a-knee';
+  crossInstance.scenes[0].objects[9].components.Skin.vertices[0].weights[0].boneId = 'a-knee';
+  const crossInstanceDiagnostics = validateSkeletonDocument(crossInstance);
+  assert(crossInstanceDiagnostics.some(item => item.code === 'E_SKELETON_ROOT_BONE_REFERENCE' && item.pointer === '/scenes/0/objects/5/components/Skeleton/rootBoneId'));
+  assert(crossInstanceDiagnostics.some(item => item.code === 'E_IK_BONE_REFERENCE' && item.pointer === '/scenes/0/objects/8/components/IK/bones/1'));
+  assert(crossInstanceDiagnostics.some(item => item.code === 'E_SKIN_BONE_REFERENCE' && item.pointer === '/scenes/0/objects/9/components/Skin/vertices/0/weights/0/boneId'));
+});
+
+test('rejects malformed Skin topology while allowing an explicitly empty mesh', () => {
+  const base = {
+    entities: [
+      { id: 'rig', components: { Skeleton: { rootBoneId: 'bone' } } },
+      { id: 'bone', parentId: 'rig', components: { Bone: { length: 10 } } },
+      { id: 'mesh', components: { Skin: { skeletonRootId: 'rig', vertices: [], uvs: [], indices: [] } } }
+    ]
+  };
+  assert.deepStrictEqual(validateSkeletonDocument(base), [], 'empty vertices, uvs, and indices form a valid empty mesh');
+
+  const malformed = JSON.parse(JSON.stringify(base));
+  malformed.entities[2].components.Skin.vertices = [
+    { x: 0, y: 0, weights: [{ boneId: 'bone', weight: 1 }] },
+    { x: 10, y: 0, weights: [{ boneId: 'bone', weight: 1 }] }
+  ];
+  malformed.entities[2].components.Skin.uvs = [0, 0];
+  malformed.entities[2].components.Skin.indices = [0, 2, 1, 0];
+  const diagnostics = validateSkeletonDocument(malformed);
+  assert(diagnostics.some(item => item.code === 'E_SKIN_UV_COUNT' && item.pointer === '/entities/2/components/Skin/uvs'));
+  assert(diagnostics.some(item => item.code === 'E_SKIN_INDEX_COUNT' && item.pointer === '/entities/2/components/Skin/indices'));
+  assert(diagnostics.some(item => item.code === 'E_SKIN_INDEX_RANGE' && item.pointer === '/entities/2/components/Skin/indices/1'));
+});
+
+test('keeps nested Skeleton ownership as a hard IK and Skin boundary', () => {
+  const document = { entities: [
+    { id: 'outer-rig', components: { Skeleton: { rootBoneId: 'outer-bone' } } },
+    { id: 'outer-bone', parentId: 'outer-rig', components: { Bone: { length: 20 } } },
+    { id: 'inner-rig', parentId: 'outer-bone', components: { Skeleton: { rootBoneId: 'inner-bone' } } },
+    { id: 'inner-bone', parentId: 'inner-rig', components: { Bone: { length: 10 } } },
+    { id: 'outer-target', components: { IK: { skeletonRootId: 'outer-rig', bones: ['inner-bone'] } } },
+    { id: 'outer-mesh', components: { Skin: {
+      skeletonRootId: 'outer-rig', vertices: [{ x: 0, y: 0, weights: [{ boneId: 'inner-bone', weight: 1 }] }]
+    } } }
+  ] };
+  const diagnostics = validateSkeletonDocument(document);
+  assert(diagnostics.some(item => item.code === 'E_IK_BONE_ANCESTRY' && item.pointer === '/entities/4/components/IK/bones/0'));
+  assert(diagnostics.some(item => item.code === 'E_SKIN_BONE_ANCESTRY' && item.pointer === '/entities/5/components/Skin/vertices/0/weights/0/boneId'));
+});
+
+test('treats a nested co-located Skeleton and Bone as its own root boundary', () => {
+  const document = { entities: [
+    { id: 'outer-rig', components: { Skeleton: { rootBoneId: 'outer-bone' } } },
+    { id: 'outer-bone', parentId: 'outer-rig', components: { Bone: { length: 20 } } },
+    { id: 'inner-root', parentId: 'outer-rig', components: {
+      Skeleton: { rootBoneId: 'inner-root' }, Bone: { length: 10 }
+    } },
+    { id: 'inner-child', parentId: 'inner-root', components: { Bone: { length: 8 } } },
+    { id: 'inner-target', components: { IK: { skeletonRootId: 'inner-root', bones: ['inner-root', 'inner-child'] } } },
+    { id: 'inner-mesh', components: { Skin: {
+      skeletonRootId: 'inner-root', vertices: [{ x: 0, y: 0, weights: [{ boneId: 'inner-root', weight: 1 }] }]
+    } } }
+  ] };
+  assert.deepStrictEqual(validateSkeletonDocument(document), [], 'the nested root Bone belongs to its co-located Skeleton, not the outer rig');
+
+  const claimedByOuter = JSON.parse(JSON.stringify(document));
+  claimedByOuter.entities[0].components.Skeleton.rootBoneId = 'inner-root';
+  const diagnostics = validateSkeletonDocument(claimedByOuter);
+  assert(diagnostics.some(item => item.code === 'E_SKELETON_ROOT_BONE_ANCESTRY' && item.pointer === '/entities/0/components/Skeleton/rootBoneId'));
+});
+
+test('normalizes, validates, and interpolates Bone and IK Animation tracks', () => {
+  const clip = normalizeAnimationClip({
+    id: 'rig-motion', name: 'Rig Motion', fps: 12, frameCount: 3, loop: false, futureClip: true,
+    tracks: [
+      { id: 'hip', type: 'BONE', targetEntityId: 'hip', futureTrack: true, keyframes: [
+        { id: 'hip-0', frame: 0, value: { x: '0', rotation: 0, scaleX: 1, futureValue: 4 } },
+        { id: 'hip-2', frame: 2, value: { x: 10, rotation: 90, scaleX: 2 } }
+      ] },
+      { id: 'leg-ik', type: 'IK', targetEntityId: 'target', keyframes: [
+        { id: 'ik-0', frame: 0, value: { x: 0, y: 5, mix: '0', enabled: true, bendDirection: 1 } },
+        { id: 'ik-2', frame: 2, value: { x: 20, y: 15, mix: 1, enabled: false, bendDirection: -1 } }
+      ] }
+    ]
+  });
+  assert.deepStrictEqual(clip.tracks.map(track => track.type), ['bone', 'ik']);
+  assert.deepStrictEqual(clip.tracks.map(track => track.interpolation), ['linear', 'linear']);
+  assert.strictEqual(clip.tracks[0].keyframes[0].value.x, 0);
+  assert.strictEqual(clip.tracks[1].keyframes[0].value.mix, 0);
+  assert.strictEqual(clip.tracks[0].futureTrack, true);
+  assert.deepStrictEqual(validateAnimationDocument({
+    animations: [clip], scenes: [{ objects: [
+      { id: 'hip', components: { Bone: { length: 10 } } },
+      { id: 'target', components: { IK: {} } }
+    ] }]
+  }, { strict: true }), []);
+  const sample = sampleAnimationClip(clip, 1, { unit: 'frame', loop: false });
+  assert.strictEqual(sample.values.hip.x, 5);
+  assert.strictEqual(sample.values.hip.rotation, 45);
+  assert.strictEqual(sample.values.hip.scaleX, 1.5);
+  assert.strictEqual(sample.values.hip.futureValue, 4);
+  assert.strictEqual(sample.values['leg-ik'].x, 10);
+  assert.strictEqual(sample.values['leg-ik'].y, 10);
+  assert.strictEqual(sample.values['leg-ik'].mix, 0.5);
+  assert.strictEqual(sample.values['leg-ik'].enabled, true, 'discrete IK values remain on the left key');
+
+  const invalidValue = (type, value) => ({
+    id: `${type}-invalid`, name: 'Invalid', fps: 12, frameCount: 1, loop: false,
+    tracks: [{ id: type, type, keyframes: [{ id: `${type}-0`, frame: 0, value }] }]
+  });
+  assert(validateAnimationDocument([invalidValue('bone', { extensionOnly: true })]).some(item => item.code === 'E_ANIMATION_BONE_VALUE'));
+  assert(validateAnimationDocument([invalidValue('bone', { rotation: 'bad' })]).some(item => item.code === 'E_ANIMATION_BONE_VALUE'));
+  assert(validateAnimationDocument([invalidValue('ik', { mix: 2 })]).some(item => item.code === 'E_ANIMATION_IK_VALUE'));
+  assert(validateAnimationDocument([invalidValue('ik', { enabled: 'yes' })]).some(item => item.code === 'E_ANIMATION_IK_VALUE'));
+  assert(validateAnimationDocument([invalidValue('ik', { iterations: 0 })]).some(item => item.code === 'E_ANIMATION_IK_VALUE'));
+});
+
+test('requires Bone and IK Animation targets to own their matching ECS components', () => {
+  const clip = {
+    id: 'typed-targets', name: 'Typed Targets', fps: 12, frameCount: 1, loop: false,
+    tracks: [
+      { id: 'bone', type: 'bone', targetEntityId: 'ordinary-bone-target', keyframes: [{ id: 'bone-0', frame: 0, value: { rotation: 10 } }] },
+      { id: 'ik', type: 'ik', targetEntityId: 'ordinary-ik-target', keyframes: [{ id: 'ik-0', frame: 0, value: { mix: 1 } }] },
+      { id: 'missing', type: 'bone', targetEntityId: 'missing-target', keyframes: [{ id: 'missing-0', frame: 0, value: { x: 0 } }] }
+    ]
+  };
+  const document = { animations: [clip], scenes: [{ objects: [
+    { id: 'ordinary-bone-target' }, { id: 'ordinary-ik-target' }
+  ] }] };
+  const diagnostics = validateAnimationDocument(document);
+  assert(diagnostics.some(item => item.code === 'E_ANIMATION_BONE_TARGET' && item.pointer === '/animations/0/tracks/0/targetEntityId'));
+  assert(diagnostics.some(item => item.code === 'E_ANIMATION_IK_TARGET' && item.pointer === '/animations/0/tracks/1/targetEntityId'));
+  assert(diagnostics.some(item => item.code === 'E_ANIMATION_TARGET_MISSING' && item.pointer === '/animations/0/tracks/2/targetEntityId'));
+  assert.strictEqual(diagnostics.some(item => item.code === 'E_ANIMATION_BONE_TARGET' && item.pointer === '/animations/0/tracks/2/targetEntityId'), false);
+
+  const sourceTarget = JSON.parse(JSON.stringify(clip));
+  sourceTarget.tracks = [
+    { id: 'source-bone-track', type: 'bone', targetEntityId: 'source-bone', keyframes: [{ id: 'source-bone-0', frame: 0, value: { rotation: 5 } }] },
+    { id: 'source-ik-track', type: 'ik', targetEntityId: 'source-target', keyframes: [{ id: 'source-ik-0', frame: 0, value: { x: 5 } }] }
+  ];
+  const marker = sourceEntityId => ({ prefabId: 'rig', instanceRootId: 'instance-root', sourceEntityId });
+  assert.deepStrictEqual(validateAnimationDocument({ animations: [sourceTarget], scenes: [{ objects: [
+    { id: 'instance-bone', components: { PrefabInstance: marker('source-bone'), Bone: { length: 10 } } },
+    { id: 'instance-target', components: { PrefabInstance: marker('source-target'), IK: {} } }
+  ] }] }), []);
+});
+
+test('resolves bound Animation targets only inside the exact Prefab instance group', () => {
+  const marker = (instanceRootId, sourceEntityId) => ({ prefabId: 'rig', instanceRootId, sourceEntityId });
+  const clip = {
+    id: 'rig-pose', name: 'Rig Pose', fps: 12, frameCount: 1, loop: true,
+    tracks: [
+      { id: 'bone', type: 'bone', targetEntityId: 'source-bone', keyframes: [{ id: 'bone-0', frame: 0, value: { rotation: 5 } }] },
+      { id: 'ik', type: 'ik', targetEntityId: 'source-target', keyframes: [{ id: 'ik-0', frame: 0, value: { mix: 1 } }] }
+    ]
+  };
+  const validInstance = prefix => [
+    { id: `${prefix}-root`, components: {
+      PrefabInstance: marker(`${prefix}-root`, 'source-root'), Animation: { clipId: 'rig-pose' }
+    } },
+    { id: `${prefix}-bone`, components: {
+      PrefabInstance: marker(`${prefix}-root`, 'source-bone'), Bone: { length: 10 }
+    } },
+    { id: `${prefix}-target`, components: {
+      PrefabInstance: marker(`${prefix}-root`, 'source-target'), IK: {}
+    } }
+  ];
+  const document = { animations: [clip], scenes: [{ objects: [...validInstance('a'), ...validInstance('b')] }] };
+  assert.deepStrictEqual(validateAnimationDocument(document), []);
+
+  const missingInSecondInstance = JSON.parse(JSON.stringify(document));
+  missingInSecondInstance.scenes[0].objects[4].components.PrefabInstance.sourceEntityId = 'other-bone';
+  const missingDiagnostics = validateAnimationDocument(missingInSecondInstance);
+  assert(missingDiagnostics.some(item => item.code === 'E_ANIMATION_TARGET_MISSING' &&
+    item.pointer === '/animations/0/tracks/0/targetEntityId' && item.details.animationEntityId === 'b-root'));
+  assert.strictEqual(missingDiagnostics.some(item => item.code === 'E_ANIMATION_TARGET_MISSING' &&
+    item.details?.animationEntityId === 'a-root'), false, 'the valid first instance remains independently resolvable');
+
+  const wrongTypeInSecondInstance = JSON.parse(JSON.stringify(document));
+  delete wrongTypeInSecondInstance.scenes[0].objects[4].components.Bone;
+  const wrongTypeDiagnostics = validateAnimationDocument(wrongTypeInSecondInstance);
+  assert(wrongTypeDiagnostics.some(item => item.code === 'E_ANIMATION_BONE_TARGET' &&
+    item.pointer === '/animations/0/tracks/0/targetEntityId' && item.details.animationEntityId === 'b-root'));
+  assert.strictEqual(wrongTypeDiagnostics.some(item => item.code === 'E_ANIMATION_BONE_TARGET' &&
+    item.details?.animationEntityId === 'a-root'), false);
 });
 
 test('open-world behavior can be disabled and component names remain safe', () => {

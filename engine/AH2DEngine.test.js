@@ -1865,6 +1865,30 @@ const createFakePixi = ({ asyncInit = false, initDeferred = null, assetDeferred 
     fill(color) { this.commands.push({ ...this.pendingRect, color }); return this; }
     destroy() { this.destroyed = true; }
   }
+  class MeshGeometry {
+    constructor({ positions, uvs, indices } = {}) {
+      this.positions = positions;
+      this.uvs = uvs;
+      this.indices = indices;
+      this.destroyCount = 0;
+    }
+    destroy() { this.destroyed = true; this.destroyCount += 1; }
+  }
+  class Mesh {
+    constructor(options = {}, legacyTexture = null) {
+      if (options instanceof MeshGeometry) {
+        this.geometry = options;
+        this.texture = legacyTexture;
+      } else {
+        this.geometry = options.geometry;
+        this.texture = options.texture;
+      }
+      this.parent = null;
+      this.alpha = 1;
+      this.tint = 0xffffff;
+    }
+    destroy() { this.destroyed = true; this.geometry?.destroy?.(); }
+  }
   const setupApplication = (app, options = {}) => {
     app.stage = new Container();
     app.canvas = { nodeName: 'CANVAS', parentNode: null };
@@ -1914,7 +1938,7 @@ const createFakePixi = ({ asyncInit = false, initDeferred = null, assetDeferred 
       return assetDeferred ? assetDeferred.promise : Promise.resolve({ id: String(source) });
     }
   };
-  return { Application, Container, Sprite, Graphics, Matrix, Rectangle, Texture, Assets, applications, assetLoads };
+  return { Application, Container, Sprite, Graphics, Mesh, MeshGeometry, Matrix, Rectangle, Texture, Assets, applications, assetLoads };
 };
 
 const fakeHost = (width = 960, height = 600) => ({
@@ -2532,6 +2556,98 @@ const testPrefabAssetInstanceOverrideApplyRevertAndUnpack = () => {
   assert(events.every(event => event.payload.engine === engine), 'Prefab events must identify their Engine');
 };
 
+const testSkeletalPrefabUnpackRemapsRigAndAnimationReferences = () => {
+  const rigEntities = () => [
+    { id: 'rig', components: { Skeleton: { rootBoneId: 'hip', futureSkeleton: { keep: true } }, Animation: { clipId: 'pose', futureBinding: true } } },
+    { id: 'hip', parentId: 'rig', components: { Bone: { length: 40 } } },
+    { id: 'knee', parentId: 'hip', components: { Bone: { length: 30 } } },
+    { id: 'target', parentId: 'rig', components: { IK: { skeletonRootId: 'rig', bones: ['hip', 'knee'], mix: 1, iterations: 8, tolerance: 0.01, bendDirection: 1 } } },
+    { id: 'mesh', parentId: 'rig', components: { Skin: {
+      skeletonRootId: 'rig',
+      vertices: [{ x: 0, y: 0, weights: [{ boneId: 'hip', weight: 0.25 }, { boneId: 'knee', weight: 0.75 }] }],
+      uvs: [0, 0], indices: [0, 0, 0], futureSkin: { keep: true }
+    } } }
+  ];
+  const clips = () => [
+    {
+      id: 'pose', name: 'Pose', fps: 12, frameCount: 2, loop: true, targetEntityId: 'hip', futureClip: { keep: true },
+      tracks: [
+        { id: 'bone', type: 'bone', keyframes: [{ id: 'bone-0', frame: 0, value: { rotation: 0, futureKey: true } }] },
+        { id: 'ik', type: 'ik', targetEntityId: 'target', keyframes: [{ id: 'ik-0', frame: 0, value: { mix: 1 } }] },
+        { id: 'mesh-position', type: 'position', targetEntityId: 'mesh', keyframes: [{ id: 'mesh-0', frame: 0, value: { x: 0, y: 0 } }] }
+      ]
+    },
+    {
+      id: 'ambient', name: 'Ambient', fps: 12, frameCount: 1, loop: true, targetEntityId: 'bystander', futureAmbient: { keep: true },
+      tracks: [{ id: 'ambient-position', type: 'position', keyframes: [{ id: 'ambient-0', frame: 0, value: { x: 0, y: 0 } }] }]
+    }
+  ];
+  const document = () => ({
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main',
+    scenes: [{ id: 'main', objects: [{ id: 'bystander' }] }],
+    scene: [{ id: 'bystander' }],
+    prefabs: [{ id: 'rig-prefab', name: 'Rig Prefab', rootEntityId: 'rig', revision: 1, entities: rigEntities() }],
+    animations: clips()
+  });
+  const assertRig = (objects, ids) => {
+    const byId = new Map(objects.map(entity => [entity.id, entity]));
+    const get = sourceId => ids[sourceId];
+    const root = byId.get(get('rig')), ik = byId.get(get('target')).components.IK, skin = byId.get(get('mesh')).components.Skin;
+    assert.strictEqual(root.components.Skeleton.rootBoneId, get('hip'));
+    assert.strictEqual(root.components.Skeleton.futureSkeleton.keep, true);
+    assert.strictEqual(ik.skeletonRootId, get('rig'));
+    assert.deepStrictEqual(ik.bones, [get('hip'), get('knee')]);
+    assert.strictEqual(skin.skeletonRootId, get('rig'));
+    assert.deepStrictEqual(skin.vertices[0].weights.map(weight => weight.boneId), [get('hip'), get('knee')]);
+    assert.strictEqual(skin.futureSkin.keep, true);
+    return root;
+  };
+  const assertClip = (clip, ids) => {
+    assert.strictEqual(clip.targetEntityId, ids.hip);
+    assert.strictEqual(clip.tracks.find(track => track.id === 'bone').targetEntityId, undefined);
+    assert.strictEqual(clip.tracks.find(track => track.id === 'ik').targetEntityId, ids.target);
+    assert.strictEqual(clip.tracks.find(track => track.id === 'mesh-position').targetEntityId, ids.mesh);
+    assert.strictEqual(clip.futureClip.keep, true);
+    assert.strictEqual(clip.tracks[0].keyframes[0].value.futureKey, true);
+  };
+
+  const source = document(), sourcePrefab = JSON.parse(JSON.stringify(source.prefabs[0])), sourcePose = JSON.parse(JSON.stringify(source.animations[0])), sourceAmbient = JSON.parse(JSON.stringify(source.animations[1]));
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  engine.load(source);
+  const ids = { rig: 'rig-instance', hip: 'hip-instance', knee: 'knee-instance', target: 'target-instance', mesh: 'mesh-instance' };
+  engine.prefabs.instantiate('rig-prefab', { idMap: ids });
+  engine.prefabs.unpack(ids.knee);
+  const objects = engine.document.scenes[0].objects;
+  const root = assertRig(objects, ids);
+  assert.ok(Object.values(ids).every(id => !objects.find(entity => entity.id === id).components?.PrefabInstance));
+  assert.notStrictEqual(root.components.Animation.clipId, 'pose');
+  assertClip(engine.document.animations.find(clip => clip.id === root.components.Animation.clipId), ids);
+  assert.deepStrictEqual(engine.document.prefabs[0], sourcePrefab, 'unpack must preserve the Prefab Asset');
+  assert.deepStrictEqual(engine.document.animations.find(clip => clip.id === 'pose'), sourcePose, 'unpack must preserve the source Clip');
+  assert.deepStrictEqual(engine.document.animations.find(clip => clip.id === 'ambient'), sourceAmbient, 'unpack must preserve unrelated Clips');
+  assert.deepStrictEqual(engine.skeleton.listBones(ids.rig), [ids.hip, ids.knee]);
+
+  const linkedSource = document();
+  linkedSource.prefabs = [];
+  linkedSource.scenes[0].objects = [...rigEntities(), { id: 'bystander' }];
+  linkedSource.scene = JSON.parse(JSON.stringify(linkedSource.scenes[0].objects));
+  const linked = new AH2D.Engine({ physics: 'builtin' });
+  linked.load(linkedSource);
+  linked.prefabs.createAsset('rig', { id: 'linked-rig', name: 'Linked Rig' });
+  const second = { rig: 'rig-two', hip: 'hip-two', knee: 'knee-two', target: 'target-two', mesh: 'mesh-two' };
+  linked.prefabs.instantiate('linked-rig', { idMap: second });
+  assert.strictEqual(linked.prefabs.deleteAsset('linked-rig', { unpackInstances: true }), true);
+  const linkedObjects = linked.document.scenes[0].objects;
+  assertRig(linkedObjects, { rig: 'rig', hip: 'hip', knee: 'knee', target: 'target', mesh: 'mesh' });
+  const secondRoot = assertRig(linkedObjects, second);
+  assertClip(linked.document.animations.find(clip => clip.id === secondRoot.components.Animation.clipId), second);
+  assert.deepStrictEqual(linked.document.animations.find(clip => clip.id === 'pose'), sourcePose);
+  assert.deepStrictEqual(linked.document.animations.find(clip => clip.id === 'ambient'), sourceAmbient);
+  assert.strictEqual(linkedObjects.some(entity => entity.components?.PrefabInstance?.prefabId === 'linked-rig'), false);
+};
+
 const testPrefabValidationIsAtomicAndSnapshotsRemainDefinitionFree = () => {
   const engine = new AH2D.Engine({ physics: 'builtin' });
   const valid = {
@@ -2946,10 +3062,21 @@ const testAnimationEventBoundariesAndPrefabTargetResolution = () => {
   instanceEngine.createEntity({ id: 'body', parentId: 'actor-a', components: { Transform: { x: 0, y: 0 }, PrefabInstance: marker('body', 'actor-a') } });
   instanceEngine.createEntity({ id: 'actor-b', components: { Animation: { clipId: instanceClip.id, playing: true }, PrefabInstance: marker('root', 'actor-b') } });
   instanceEngine.createEntity({ id: 'body-b', parentId: 'actor-b', components: { Transform: { x: 0, y: 0 }, PrefabInstance: marker('body', 'actor-b') } });
-  instanceEngine.animation.load([instanceClip]);
+  const isolatedClip = {
+    id: 'isolated-motion', name: 'Isolated Motion', fps: 10, frameCount: 1, loop: true,
+    tracks: [{ id: 'isolated-position', type: 'position', targetEntityId: 'foreign-body', keyframes: [
+      { id: 'isolated-position-0', frame: 0, value: { x: 99 } }
+    ] }]
+  };
+  instanceEngine.createEntity({ id: 'foreign-body', components: { Transform: { x: 3, y: 0 } } });
+  instanceEngine.createEntity({ id: 'actor-c', components: {
+    Animation: { clipId: isolatedClip.id, playing: true }, PrefabInstance: marker('root', 'actor-c')
+  } });
+  instanceEngine.animation.load([instanceClip, isolatedClip]);
   instanceEngine.update(0);
   assert.strictEqual(instanceEngine.ecs.get('body', 'Transform').x, 42);
   assert.strictEqual(instanceEngine.ecs.get('body-b', 'Transform').x, 42, 'Prefab source targets resolve inside the Animation owner instance');
+  assert.strictEqual(instanceEngine.ecs.get('foreign-body', 'Transform').x, 3, 'a marked Animation owner cannot fall back outside its exact Prefab group');
 
   const atomicEngine = new AH2D.Engine({ physics: 'builtin' });
   atomicEngine.load({ scene: [{ id: 'kept' }] });
@@ -2961,6 +3088,574 @@ const testAnimationEventBoundariesAndPrefabTargetResolution = () => {
   assert.strictEqual(JSON.stringify(atomicEngine.document), previousDocument, 'a dangling Animation Clip load must be atomic');
   assert.strictEqual(atomicEngine.ecs.entities.has('kept'), true);
   assert.strictEqual(atomicEngine.ecs.entities.has('broken'), false);
+};
+
+const skeletonProject = ({ includeIK = true, includeSkin = false, animations = [] } = {}) => {
+  const objects = [
+    {
+      id: 'rig',
+      components: {
+        Transform: { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 },
+        Skeleton: { rootBoneId: 'upper', enabled: true, solveIK: true },
+        ...(animations.length ? { Animation: { clipId: animations[0].id, playing: true, speed: 0 } } : {})
+      }
+    },
+    { id: 'upper', parentId: 'rig', components: { Transform: { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 }, Bone: { length: 10 } } },
+    { id: 'lower', parentId: 'upper', components: { Transform: { x: 10, y: 0, rotation: 0, scaleX: 1, scaleY: 1 }, Bone: { length: 10 } } }
+  ];
+  if (includeIK) objects.push({
+    id: 'hand-target',
+    components: {
+      Transform: { x: 10, y: 10, rotation: 0, scaleX: 1, scaleY: 1 },
+      IK: { skeletonRootId: 'rig', bones: ['upper', 'lower'], mix: 1, iterations: 40, tolerance: 0.001, enabled: true, bendDirection: 1 }
+    }
+  });
+  if (includeSkin) objects.push({
+    id: 'skin',
+    components: {
+      Transform: { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 },
+      Skin: {
+        skeletonRootId: 'rig',
+        assetId: 'skin-image',
+        vertices: [
+          { x: 0, y: 0, weights: [{ boneId: 'upper', weight: 1 }] },
+          { x: 10, y: 0, weights: [{ boneId: 'upper', weight: 1 }] },
+          { x: 10, y: 4, weights: [{ boneId: 'upper', weight: 1 }] },
+          { x: 0, y: 4, weights: [{ boneId: 'upper', weight: 1 }] }
+        ],
+        uvs: [0, 0, 1, 0, 1, 1, 0, 1],
+        indices: [0, 1, 2, 0, 2, 3]
+      }
+    }
+  });
+  return {
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main', prefabs: [], animations,
+    assets: [{ id: 'skin-image', imageSrc: '/skin.png' }],
+    scenes: [{ id: 'main', name: 'Main', objects }],
+    scene: JSON.parse(JSON.stringify(objects))
+  };
+};
+
+const testSkeletonForwardKinematicsAndCCD = () => {
+  const inheritance = new AH2D.Engine({ physics: 'builtin' });
+  inheritance.load(skeletonProject({ includeIK: false }));
+  Object.assign(inheritance.ecs.get('rig', 'Transform'), { rotation: 90, scaleX: 2, scaleY: 2 });
+  Object.assign(inheritance.ecs.get('upper', 'Transform'), { x: 5, rotation: 10, scaleX: 1.5, scaleY: 0.5 });
+  Object.assign(inheritance.ecs.get('upper', 'Bone'), { inheritRotation: false, inheritScale: false });
+  inheritance.transform.update();
+  let inheritedWorld = inheritance.transform.getWorld('upper');
+  near(inheritedWorld.x, 0, 1e-8, 'Bone origin still follows its parent matrix');
+  near(inheritedWorld.y, 10, 1e-8, 'Bone origin still follows its parent matrix');
+  near(inheritedWorld.rotation, 10, 1e-8, 'Bone can opt out of parent rotation');
+  near(inheritedWorld.scaleX, 1.5, 1e-8, 'Bone can opt out of parent scale');
+  near(inheritedWorld.scaleY, 0.5, 1e-8, 'Bone can opt out of parent scale');
+  inheritance.transform.setWorld('upper', { x: 20, y: 30, rotation: 25, scaleX: 2, scaleY: 3 });
+  inheritedWorld = inheritance.transform.getWorld('upper');
+  near(inheritedWorld.x, 20, 1e-8, 'setWorld converts non-inheriting Bone position correctly');
+  near(inheritedWorld.y, 30, 1e-8, 'setWorld converts non-inheriting Bone position correctly');
+  near(inheritedWorld.rotation, 25, 1e-8, 'setWorld converts non-inheriting Bone rotation correctly');
+  near(inheritedWorld.scaleX, 2, 1e-8, 'setWorld converts non-inheriting Bone scale correctly');
+  near(inheritedWorld.scaleY, 3, 1e-8, 'setWorld converts non-inheriting Bone scale correctly');
+  Object.assign(inheritance.ecs.get('upper', 'Transform'), { x: 5, y: 0, rotation: 10, scaleX: 1.5, scaleY: 0.5 });
+  Object.assign(inheritance.ecs.get('upper', 'Bone'), { inheritRotation: true, inheritScale: true });
+  inheritance.transform.update();
+  inheritedWorld = inheritance.transform.getWorld('upper');
+  near(inheritedWorld.rotation, 100, 1e-8, 'Bone inheritance changes invalidate Transform.world');
+  near(inheritedWorld.scaleX, 3, 1e-8, 'Bone inherits parent scale by default');
+  near(inheritedWorld.scaleY, 1, 1e-8, 'Bone inherits parent scale by default');
+
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  engine.load(skeletonProject());
+  assert.ok(engine.skeleton instanceof AH2D.SkeletonSystem);
+  assert.deepStrictEqual(engine.skeleton.listBones('rig'), ['upper', 'lower']);
+  const bindPose = engine.skeleton.getPose('rig');
+  near(bindPose.upper.tip.x, 10, 1e-8, 'upper bind tip x');
+  near(bindPose.lower.tip.x, 20, 1e-8, 'nested FK tip x');
+  near(bindPose.lower.tip.y, 0, 1e-8, 'nested FK tip y');
+
+  engine.update(0);
+  const solved = engine.skeleton.solve('hand-target');
+  assert.ok(solved.distance <= 0.01, `CCD chain must reach its target, distance was ${solved.distance}`);
+  near(solved.end.x, 10, 0.01, 'IK end x');
+  near(solved.end.y, 10, 0.01, 'IK end y');
+  assert.deepStrictEqual(engine.ecs.get('rig', 'Skeleton').boneMatrices.lower, engine.transform.getWorldMatrix('lower'));
+
+  const upper = engine.ecs.get('upper', 'Transform');
+  const lower = engine.ecs.get('lower', 'Transform');
+  const target = engine.ecs.get('hand-target', 'Transform');
+  const ik = engine.ecs.get('hand-target', 'IK');
+  ik.enabled = false;
+  target.x = -12; target.y = 7;
+  engine.update(0);
+  near(upper.rotation, 0, 1e-10, 'disabled IK restores the unconstrained upper base pose');
+  near(lower.rotation, 0, 1e-10, 'disabled IK restores the unconstrained lower base pose');
+
+  upper.rotation = 0; lower.rotation = 0;
+  ik.enabled = true; ik.mix = 0;
+  target.x = 10; target.y = 10;
+  engine.update(0);
+  near(upper.rotation, 0, 1e-10, 'zero-mix IK upper rotation');
+  near(lower.rotation, 0, 1e-10, 'zero-mix IK lower rotation');
+
+  ik.mix = 0.5;
+  engine.update(0);
+  assert.ok(Math.abs(lower.rotation) > 1, 'partial-mix IK must influence the chain');
+  assert.ok(Math.abs(lower.rotation) < 89, 'partial-mix IK must blend instead of converging to the full solved pose');
+  const partialPose = [upper.rotation, lower.rotation];
+  engine.update(0);
+  near(upper.rotation, partialPose[0], 1e-10, 'repeated IK updates retain the same mixed upper pose');
+  near(lower.rotation, partialPose[1], 1e-10, 'repeated IK updates must not accumulate mix toward the full solution');
+
+  upper.rotation = 0; lower.rotation = 0;
+  ik.mix = 1; ik.bendDirection = 1;
+  target.x = 15; target.y = 0;
+  const bendPositive = engine.skeleton.solve('hand-target');
+  assert.ok(bendPositive.distance <= 0.01, 'CCD must contract a collinear multi-Bone chain');
+  assert.ok(upper.rotation > 0, 'positive bendDirection selects the positive elbow side');
+  upper.rotation = 0; lower.rotation = 0;
+  ik.bendDirection = -1;
+  const bendNegative = engine.skeleton.solve('hand-target');
+  assert.ok(bendNegative.distance <= 0.01, 'negative-bend CCD must still reach the target');
+  assert.ok(upper.rotation < 0, 'negative bendDirection selects the negative elbow side');
+};
+
+const testLinearBlendSkinningAndSnapshotRestore = () => {
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  engine.load(skeletonProject({ includeIK: false, includeSkin: true }));
+  assert.deepStrictEqual(engine.ecs.get('skin', 'Skin').deformedVertices[1], { x: 10, y: 0 });
+
+  engine.ecs.get('upper', 'Transform').rotation = 90;
+  engine.update(0);
+  let vertices = engine.ecs.get('skin', 'Skin').deformedVertices;
+  near(vertices[1].x, 0, 1e-8, 'LBS rotated vertex x');
+  near(vertices[1].y, 10, 1e-8, 'LBS rotated vertex y');
+  near(vertices[2].x, -4, 1e-8, 'LBS preserves authored local vertex offset');
+  near(vertices[2].y, 10, 1e-8, 'LBS preserves authored local vertex offset');
+
+  const snapshot = engine.captureSnapshot();
+  engine.ecs.get('upper', 'Transform').rotation = 180;
+  engine.update(0);
+  near(engine.ecs.get('skin', 'Skin').deformedVertices[1].x, -10, 1e-8);
+  engine.restoreSnapshot(snapshot);
+  near(engine.ecs.get('upper', 'Transform').rotation, 90, 1e-8, 'snapshot restores animated Bone local pose');
+  vertices = engine.ecs.get('skin', 'Skin').deformedVertices;
+  near(vertices[1].x, 0, 1e-8, 'snapshot restores bind-cache deformation x');
+  near(vertices[1].y, 10, 1e-8, 'snapshot restores bind-cache deformation y');
+
+  engine.ecs.remove('upper', 'Bone');
+  engine.skeleton.deform('skin');
+  assert.strictEqual(engine.skeleton.bindings.get('skin').inverseBindMatrices.has('upper'), false, 'removing a referenced Bone invalidates its bind cache');
+  engine.ecs.add('upper', 'Bone', { length: 10 });
+  engine.skeleton.deform('skin');
+  assert.strictEqual(engine.skeleton.bindings.get('skin').inverseBindMatrices.has('upper'), true, 'adding a referenced Bone rebuilds its bind cache');
+  assert.deepStrictEqual(engine.ecs.get('skin', 'Skin').deformedVertices[1], { x: 10, y: 0 }, 'a newly-added Bone is captured in its current bind pose');
+};
+
+const testSkeletonBindCacheSurvivesRuntimeLifecycle = () => {
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  engine.load(skeletonProject({ includeIK: false, includeSkin: true }));
+  engine.ecs.get('upper', 'Transform').rotation = 45;
+  engine.update(0);
+  const originalInverse = engine.skeleton.bindings.get('skin').inverseBindMatrices.get('upper').slice();
+
+  engine.createEntity({ id: 'unrelated-parent', components: { Transform: { x: 7 } } });
+  engine.createEntity({ id: 'unrelated-child', components: { Transform: { y: 4 } } });
+  engine.reparent('unrelated-child', 'unrelated-parent');
+  engine.destroyEntity('unrelated-child');
+  assert.deepStrictEqual(
+    engine.skeleton.bindings.get('skin').inverseBindMatrices.get('upper'),
+    originalInverse,
+    'unrelated graph mutation and destruction must not recapture an animated bind pose'
+  );
+
+  engine.createEntity({ id: 'bone-parent', parentId: 'rig', components: { Transform: { x: 5 } } });
+  engine.reparent('upper', 'bone-parent');
+  assert.deepStrictEqual(
+    engine.skeleton.bindings.get('skin').inverseBindMatrices.get('upper'),
+    originalInverse,
+    'reparenting a live Bone reconciles topology while preserving its authored inverse bind'
+  );
+  engine.skeleton.rebind('skin');
+  assert.notDeepStrictEqual(
+    engine.skeleton.bindings.get('skin').inverseBindMatrices.get('upper'),
+    originalInverse,
+    'an explicit rebind deliberately captures the current topology and pose'
+  );
+};
+
+const testSkeletonPrefabReferencesAndAnimationTracks = () => {
+  const marker = (sourceEntityId, instanceRootId) => ({
+    prefabId: 'rig-prefab', sourceEntityId, instanceRootId, prefabRevision: 1, overrides: {}
+  });
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  for (const suffix of ['a', 'b']) {
+    const rootId = `rig-${suffix}`;
+    const boneId = `bone-${suffix}`;
+    const skinId = `skin-${suffix}`;
+    engine.createEntity({ id: rootId, components: {
+      Transform: {}, Skeleton: { rootBoneId: 'bone' }, PrefabInstance: marker('rig', rootId)
+    } });
+    engine.createEntity({ id: boneId, parentId: rootId, components: {
+      Transform: {}, Bone: { length: 10 }, PrefabInstance: marker('bone', rootId)
+    } });
+    engine.createEntity({ id: skinId, components: {
+      Transform: {},
+      Skin: { skeletonRootId: 'rig', vertices: [{ x: 10, y: 0, weights: [{ boneId: 'bone', weight: 1 }] }] },
+      PrefabInstance: marker('skin', rootId)
+    } });
+  }
+  engine.skeleton.rebind();
+  assert.deepStrictEqual(engine.skeleton.listBones('rig-a'), ['bone-a']);
+  assert.deepStrictEqual(engine.skeleton.listBones('rig-b'), ['bone-b']);
+  engine.ecs.get('bone-a', 'Transform').rotation = 90;
+  engine.transform.update();
+  engine.skeleton.deform();
+  near(engine.ecs.get('skin-a', 'Skin').deformedVertices[0].x, 0, 1e-8, 'Prefab A source Bone maps to instance A');
+  near(engine.ecs.get('skin-a', 'Skin').deformedVertices[0].y, 10, 1e-8, 'Prefab A source Bone maps to instance A');
+  near(engine.ecs.get('skin-b', 'Skin').deformedVertices[0].x, 10, 1e-8, 'Prefab B stays independent');
+  near(engine.ecs.get('skin-b', 'Skin').deformedVertices[0].y, 0, 1e-8, 'Prefab B stays independent');
+
+  // A marked owner whose instance is incomplete must never bind to a Scene
+  // Entity merely because its Runtime id equals the Prefab source id.
+  engine.createEntity({ id: 'rig', components: { Transform: {}, Skeleton: { rootBoneId: 'bone' } } });
+  engine.createEntity({ id: 'bone', parentId: 'rig', components: { Transform: {}, Bone: { length: 10 } } });
+  engine.createEntity({ id: 'isolated-rig', components: {
+    Transform: {}, Skeleton: { rootBoneId: 'bone' }, PrefabInstance: marker('rig', 'missing-instance')
+  } });
+  engine.createEntity({ id: 'isolated-skin', components: {
+    Transform: {},
+    Skin: { skeletonRootId: 'rig', vertices: [{ x: 10, y: 0, weights: [{ boneId: 'bone', weight: 1 }] }] },
+    PrefabInstance: marker('skin', 'missing-instance')
+  } });
+  engine.createEntity({ id: 'isolated-target', components: {
+    Transform: { x: 0, y: 10 },
+    IK: { skeletonRootId: 'rig', bones: ['bone'], iterations: 4 },
+    PrefabInstance: marker('target', 'missing-instance')
+  } });
+  assert.deepStrictEqual(engine.skeleton.listBones('isolated-rig'), [], 'a marked Skeleton root cannot fall back to a same-id Scene Bone');
+  engine.skeleton.rebind('isolated-skin');
+  assert.strictEqual(engine.skeleton.bindings.get('isolated-skin').inverseBindMatrices.size, 0, 'Skin references cannot escape a marked Prefab group');
+  assert.deepStrictEqual(engine.skeleton.solve('isolated-target').bones, [], 'IK references cannot escape a marked Prefab group');
+  assert.strictEqual(engine.ecs.get('bone', 'Transform').rotation, 0, 'isolated IK must not mutate a same-id Scene Bone');
+
+  const clip = {
+    id: 'rig-pose', name: 'Rig Pose', fps: 30, frameCount: 1, loop: true,
+    tracks: [
+      { id: 'bone-pose', type: 'bone', targetEntityId: 'lower', keyframes: [{ id: 'bone-0', frame: 0, value: { x: 12, rotation: 45, scaleX: 1.5 } }] },
+      { id: 'ik-pose', type: 'ik', targetEntityId: 'hand-target', keyframes: [{ id: 'ik-0', frame: 0, value: { x: 14, y: 6, mix: 0.25, enabled: false, iterations: 9, tolerance: 0.2, bendDirection: -1 } }] }
+    ]
+  };
+  const animated = new AH2D.Engine({ physics: 'builtin' });
+  animated.load(skeletonProject({ animations: [clip] }));
+  animated.update(0);
+  const lower = animated.ecs.get('lower', 'Transform');
+  const target = animated.ecs.get('hand-target', 'Transform');
+  const ik = animated.ecs.get('hand-target', 'IK');
+  near(lower.x, 12); near(lower.rotation, 45); near(lower.scaleX, 1.5);
+  near(target.x, 14); near(target.y, 6);
+  assert.strictEqual(ik.mix, 0.25);
+  assert.strictEqual(ik.enabled, false);
+  assert.strictEqual(ik.iterations, 9);
+  assert.strictEqual(ik.tolerance, 0.2);
+  assert.strictEqual(ik.bendDirection, -1);
+
+  const drivenClip = {
+    id: 'driven-base', name: 'Driven Base', fps: 30, frameCount: 1, loop: true,
+    tracks: [{ id: 'upper-base', type: 'bone', targetEntityId: 'upper', keyframes: [
+      { id: 'upper-base-0', frame: 0, value: { rotation: 10 } }
+    ] }]
+  };
+  const drivenDocument = skeletonProject({ animations: [drivenClip] });
+  const drivenTarget = drivenDocument.scenes[0].objects.find(entity => entity.id === 'hand-target');
+  drivenTarget.components.IK.mix = 0.5;
+  drivenDocument.scene = JSON.parse(JSON.stringify(drivenDocument.scenes[0].objects));
+  const driven = new AH2D.Engine({ physics: 'builtin' });
+  driven.load(drivenDocument);
+  driven.update(0);
+  const firstDrivenPose = [
+    driven.ecs.get('upper', 'Transform').rotation,
+    driven.ecs.get('lower', 'Transform').rotation
+  ];
+  near(driven.skeleton.ikBasePose.get('upper').rotation, 10, 1e-10, 'Animation Bone Track becomes the stable pre-IK pose');
+  driven.update(0);
+  near(driven.ecs.get('upper', 'Transform').rotation, firstDrivenPose[0], 1e-10, 'Animation-driven base pose prevents mixed IK accumulation');
+  near(driven.ecs.get('lower', 'Transform').rotation, firstDrivenPose[1], 1e-10, 'Animation-driven child solution remains stable');
+};
+
+const testPartialBoneAnimationKeepsStableIKBase = () => {
+  const clip = {
+    id: 'partial-base', name: 'Partial Base', fps: 30, frameCount: 1, loop: true,
+    tracks: [
+      { id: 'upper-x', type: 'bone', targetEntityId: 'upper', keyframes: [
+        { id: 'upper-x-0', frame: 0, value: { x: 1 } }
+      ] },
+      { id: 'lower-x', type: 'position', targetEntityId: 'lower', keyframes: [
+        { id: 'lower-x-0', frame: 0, value: { x: 11, y: 0 } }
+      ] }
+    ]
+  };
+  const document = skeletonProject({ animations: [clip] });
+  const objects = document.scenes[0].objects;
+  objects.find(entity => entity.id === 'upper').components.Transform.rotation = 10;
+  objects.find(entity => entity.id === 'lower').components.Transform.rotation = -5;
+  objects.find(entity => entity.id === 'hand-target').components.IK.mix = 0.5;
+  document.scene = JSON.parse(JSON.stringify(objects));
+
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  engine.load(document);
+  engine.update(0);
+  const first = [
+    engine.ecs.get('upper', 'Transform').rotation,
+    engine.ecs.get('lower', 'Transform').rotation
+  ];
+  near(engine.skeleton.ikBasePose.get('upper').rotation, 10, 1e-10, 'an x-only Bone Track preserves the authored base rotation');
+  near(engine.skeleton.ikBasePose.get('lower').rotation, -5, 1e-10, 'a Position Track preserves the authored Bone base rotation');
+  for (let index = 0; index < 4; index += 1) engine.update(0);
+  near(engine.ecs.get('upper', 'Transform').rotation, first[0], 1e-10, 'partial Bone animation must not accumulate IK mix');
+  near(engine.ecs.get('lower', 'Transform').rotation, first[1], 1e-10, 'partial Position animation must not accumulate IK mix');
+};
+
+const testIKReleaseAndReparentPreserveBasePose = () => {
+  const clip = {
+    id: 'release-base', name: 'Release Base', fps: 30, frameCount: 1, loop: true,
+    tracks: [{ id: 'upper-x-only', type: 'bone', targetEntityId: 'upper', keyframes: [
+      { id: 'upper-x-only-0', frame: 0, value: { x: 2 } }
+    ] }]
+  };
+  const releaseDocument = skeletonProject({ animations: [clip] });
+  releaseDocument.scenes[0].objects.find(entity => entity.id === 'hand-target').components.IK.mix = 0.5;
+  releaseDocument.scene = JSON.parse(JSON.stringify(releaseDocument.scenes[0].objects));
+  const release = new AH2D.Engine({ physics: 'builtin' });
+  release.load(releaseDocument);
+  release.update(0);
+  assert.ok(Math.abs(release.ecs.get('lower', 'Transform').rotation) > 1, 'the IK constraint must establish a solved pose before removal');
+  release.destroyEntity('hand-target');
+  release.update(0);
+  near(release.ecs.get('upper', 'Transform').x, 2, 1e-10, 'releasing an IK chain keeps the x-only Animation field');
+  near(release.ecs.get('upper', 'Transform').rotation, 0, 1e-10, 'releasing an IK chain restores the authored upper rotation');
+  near(release.ecs.get('lower', 'Transform').rotation, 0, 1e-10, 'releasing an IK chain restores every formerly constrained Bone');
+  assert.strictEqual(release.skeleton.ikBasePose.size, 0, 'released IK base caches are discarded after restoration');
+
+  const document = skeletonProject();
+  document.scenes[0].objects.find(entity => entity.id === 'hand-target').components.IK.mix = 0.5;
+  document.scene = JSON.parse(JSON.stringify(document.scenes[0].objects));
+  const reparented = new AH2D.Engine({ physics: 'builtin' });
+  reparented.load(document);
+  reparented.update(0);
+  const first = [
+    reparented.ecs.get('upper', 'Transform').rotation,
+    reparented.ecs.get('lower', 'Transform').rotation
+  ];
+  reparented.createEntity({ id: 'bone-parent', parentId: 'rig', components: { Transform: {} } });
+  reparented.reparent('upper', 'bone-parent');
+  reparented.update(0);
+  near(reparented.ecs.get('upper', 'Transform').rotation, first[0], 1e-10, 'reparenting an actively constrained chain must not seed its base from the solved upper pose');
+  near(reparented.ecs.get('lower', 'Transform').rotation, first[1], 1e-10, 'reparenting an actively constrained chain must not accumulate IK mix');
+
+  const preserveWorld = new AH2D.Engine({ physics: 'builtin' });
+  preserveWorld.load(document);
+  preserveWorld.update(0);
+  const preserved = [
+    preserveWorld.ecs.get('upper', 'Transform').rotation,
+    preserveWorld.ecs.get('lower', 'Transform').rotation
+  ];
+  preserveWorld.createEntity({ id: 'offset-parent', parentId: 'rig', components: { Transform: { x: 5 } } });
+  preserveWorld.reparent('upper', 'offset-parent', { preserveWorld: true });
+  near(preserveWorld.skeleton.ikBasePose.get('upper').x, -5, 1e-10, 'preserve-world reparent expresses the pre-IK base in the new parent space');
+  preserveWorld.update(0);
+  near(preserveWorld.ecs.get('upper', 'Transform').rotation, preserved[0], 1e-10, 'preserve-world reparent keeps the mixed upper solution stable');
+  near(preserveWorld.ecs.get('lower', 'Transform').rotation, preserved[1], 1e-10, 'preserve-world reparent keeps the mixed lower solution stable');
+};
+
+const testSkeletalComponentGenerationInvalidation = () => {
+  const skinEngine = new AH2D.Engine({ physics: 'builtin' });
+  skinEngine.load(skeletonProject({ includeIK: false, includeSkin: true }));
+  const originalBoneGeneration = skinEngine.ecs.componentGeneration('upper', 'Bone');
+  const replacementBone = JSON.parse(JSON.stringify(skinEngine.ecs.get('upper', 'Bone')));
+  skinEngine.ecs.get('upper', 'Transform').rotation = 90;
+  skinEngine.transform.update();
+  skinEngine.ecs.remove('upper', 'Bone');
+  skinEngine.ecs.add('upper', 'Bone', replacementBone);
+  const replacementBoneGeneration = skinEngine.ecs.componentGeneration('upper', 'Bone');
+  assert.ok(replacementBoneGeneration > originalBoneGeneration, 'remove/add gives an identical Bone a new lifecycle generation');
+  skinEngine.skeleton.deform('skin');
+  assert.strictEqual(skinEngine.skeleton.bindings.get('skin').boneGenerations.get('upper'), replacementBoneGeneration);
+  assert.deepStrictEqual(skinEngine.ecs.get('skin', 'Skin').deformedVertices[1], { x: 10, y: 0 }, 'a replacement Bone is captured at its own bind pose even when topology is identical');
+
+  const oldSkinGeneration = skinEngine.ecs.componentGeneration('skin', 'Skin');
+  const replacementSkin = JSON.parse(JSON.stringify(skinEngine.ecs.get('skin', 'Skin')));
+  delete replacementSkin.deformedVertices;
+  skinEngine.ecs.get('upper', 'Transform').rotation = 180;
+  skinEngine.transform.update();
+  skinEngine.ecs.remove('skin', 'Skin');
+  skinEngine.ecs.add('skin', 'Skin', replacementSkin);
+  const newSkinGeneration = skinEngine.ecs.componentGeneration('skin', 'Skin');
+  assert.ok(newSkinGeneration > oldSkinGeneration, 'remove/add gives an identical Skin a new lifecycle generation');
+  skinEngine.skeleton.deform('skin');
+  assert.strictEqual(skinEngine.skeleton.bindings.get('skin').skinGeneration, newSkinGeneration);
+  assert.deepStrictEqual(skinEngine.ecs.get('skin', 'Skin').deformedVertices[1], { x: 10, y: 0 }, 'a replacement Skin recaptures its complete bind space');
+
+  const ikDocument = skeletonProject();
+  ikDocument.scenes[0].objects.find(entity => entity.id === 'hand-target').components.IK.mix = 0.5;
+  ikDocument.scene = JSON.parse(JSON.stringify(ikDocument.scenes[0].objects));
+  const ikEngine = new AH2D.Engine({ physics: 'builtin' });
+  ikEngine.load(ikDocument);
+  ikEngine.update(0);
+  const first = [ikEngine.ecs.get('upper', 'Transform').rotation, ikEngine.ecs.get('lower', 'Transform').rotation];
+  const oldIKGeneration = ikEngine.ecs.componentGeneration('hand-target', 'IK');
+  const replacementIK = JSON.parse(JSON.stringify(ikEngine.ecs.get('hand-target', 'IK')));
+  ikEngine.ecs.remove('hand-target', 'IK');
+  ikEngine.ecs.add('hand-target', 'IK', replacementIK);
+  const newIKGeneration = ikEngine.ecs.componentGeneration('hand-target', 'IK');
+  assert.ok(newIKGeneration > oldIKGeneration, 'remove/add gives an identical IK constraint a new lifecycle generation');
+  ikEngine.update(0);
+  assert.strictEqual(ikEngine.skeleton.ikConstraintState.get('hand-target').generation, newIKGeneration, 'the solver observes the replacement IK lifecycle');
+  near(ikEngine.ecs.get('upper', 'Transform').rotation, first[0], 1e-10, 'replacing an identical IK component keeps the stable upper base');
+  near(ikEngine.ecs.get('lower', 'Transform').rotation, first[1], 1e-10, 'replacing an identical IK component does not accumulate mix');
+};
+
+const testNestedSkeletonOwnershipBoundaries = () => {
+  const objects = [
+    { id: 'outer-rig', components: { Transform: {}, Skeleton: { rootBoneId: 'outer-bone' } } },
+    { id: 'outer-bone', parentId: 'outer-rig', components: { Transform: {}, Bone: { length: 10 } } },
+    { id: 'inner-rig', parentId: 'outer-bone', components: { Transform: { x: 10 }, Skeleton: { rootBoneId: 'inner-bone' } } },
+    { id: 'inner-bone', parentId: 'inner-rig', components: { Transform: {}, Bone: { length: 6 } } },
+    { id: 'outer-target', components: { Transform: { x: 0, y: 10 }, IK: { skeletonRootId: 'outer-rig', bones: ['outer-bone'], iterations: 8 } } },
+    { id: 'inner-target', components: { Transform: { x: 14, y: 4 }, IK: { skeletonRootId: 'inner-rig', bones: ['inner-bone'], iterations: 8 } } },
+    { id: 'outer-skin', components: { Transform: {}, Skin: {
+      skeletonRootId: 'outer-rig', vertices: [{ x: 5, y: 0, weights: [{ boneId: 'outer-bone', weight: 1 }] }]
+    } } },
+    { id: 'inner-skin', components: { Transform: {}, Skin: {
+      skeletonRootId: 'inner-rig', vertices: [{ x: 4, y: 0, weights: [{ boneId: 'inner-bone', weight: 1 }] }]
+    } } }
+  ];
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  engine.load({
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main', prefabs: [], animations: [],
+    scenes: [{ id: 'main', name: 'Main', objects }], scene: JSON.parse(JSON.stringify(objects))
+  });
+  assert.deepStrictEqual(engine.skeleton.listBones('outer-rig'), ['outer-bone'], 'an outer Skeleton must stop at a nested Skeleton root');
+  assert.deepStrictEqual(engine.skeleton.listBones('inner-rig'), ['inner-bone']);
+  assert.deepStrictEqual(Object.keys(engine.skeleton.getPose('outer-rig')), ['outer-bone']);
+  assert.deepStrictEqual(Object.keys(engine.skeleton.getPose('inner-bone')), ['inner-bone'], 'Bone ownership uses its nearest Skeleton ancestor');
+
+  engine.ecs.get('outer-target', 'IK').bones.push('inner-bone');
+  const outerResult = engine.skeleton.solve('outer-target');
+  assert.deepStrictEqual(outerResult.bones, ['outer-bone'], 'Runtime IK rejects Bones owned by a nested Skeleton');
+
+  const outerSkin = engine.ecs.get('outer-skin', 'Skin');
+  outerSkin.vertices[0].weights = [{ boneId: 'inner-bone', weight: 1 }];
+  engine.skeleton.rebind('outer-skin');
+  assert.strictEqual(engine.skeleton.bindings.get('outer-skin').inverseBindMatrices.has('inner-bone'), false, 'Skin cannot bind through a nested Skeleton boundary');
+  engine.ecs.get('inner-bone', 'Transform').rotation = 90;
+  engine.transform.update();
+  engine.skeleton.deform('outer-skin');
+  assert.deepStrictEqual(outerSkin.deformedVertices[0], { x: 5, y: 0 }, 'foreign nested Bone weights fall back to the authored vertex');
+
+  engine.createEntity({ id: 'implicit-rig', components: { Transform: {}, Skeleton: {} } });
+  engine.createEntity({ id: 'implicit-nested', parentId: 'implicit-rig', components: { Transform: {}, Skeleton: {}, Bone: { length: 2 } } });
+  engine.createEntity({ id: 'implicit-owned', parentId: 'implicit-rig', components: { Transform: {}, Bone: { length: 3 } } });
+  assert.deepStrictEqual(engine.skeleton.listBones('implicit-rig'), ['implicit-owned'], 'implicit root selection skips a direct nested co-located Skeleton/Bone boundary');
+};
+
+const testCoLocatedSkeletonBoneOwnership = () => {
+  const objects = [
+    { id: 'outer-root', components: {
+      Transform: {}, Skeleton: { rootBoneId: 'outer-root' }, Bone: { length: 10 }
+    } },
+    { id: 'inner-root', parentId: 'outer-root', components: {
+      Transform: { x: 10 }, Skeleton: { rootBoneId: 'inner-root' }, Bone: { length: 6 }
+    } },
+    { id: 'outer-target', components: {
+      Transform: { x: 0, y: 10 }, IK: { skeletonRootId: 'outer-root', bones: ['outer-root'], iterations: 20, tolerance: 0.001 }
+    } },
+    { id: 'inner-target', components: {
+      Transform: { x: 0, y: 16 }, IK: { skeletonRootId: 'inner-root', bones: ['inner-root'], iterations: 20, tolerance: 0.001 }
+    } },
+    { id: 'outer-skin-colocated', components: { Transform: {}, Skin: {
+      skeletonRootId: 'outer-root', vertices: [{ x: 10, y: 0, weights: [{ boneId: 'outer-root', weight: 1 }] }]
+    } } },
+    { id: 'inner-skin-colocated', components: { Transform: {}, Skin: {
+      skeletonRootId: 'inner-root', vertices: [{ x: 16, y: 0, weights: [{ boneId: 'inner-root', weight: 1 }] }]
+    } } }
+  ];
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  engine.load({
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main', prefabs: [], animations: [],
+    scenes: [{ id: 'main', name: 'Main', objects }], scene: JSON.parse(JSON.stringify(objects))
+  });
+
+  assert.deepStrictEqual(engine.skeleton.listBones('outer-root'), ['outer-root'], 'a co-located outer rig owns its own Bone but not a nested Skeleton root');
+  assert.deepStrictEqual(engine.skeleton.listBones('inner-root'), ['inner-root'], 'a nested co-located rig owns its own Bone');
+  assert.deepStrictEqual(Object.keys(engine.skeleton.getPose('inner-root')), ['inner-root']);
+  assert.strictEqual(engine.skeleton.bindings.get('outer-skin-colocated').inverseBindMatrices.has('outer-root'), true);
+  assert.strictEqual(engine.skeleton.bindings.get('inner-skin-colocated').inverseBindMatrices.has('inner-root'), true);
+
+  const outerResult = engine.skeleton.solve('outer-target');
+  assert.deepStrictEqual(outerResult.bones, ['outer-root']);
+  assert.ok(outerResult.distance <= 0.01, 'IK must solve a co-located Skeleton/Bone root');
+  const innerResult = engine.skeleton.solve('inner-target');
+  assert.deepStrictEqual(innerResult.bones, ['inner-root']);
+  engine.skeleton.deform();
+  const outerVertex = engine.ecs.get('outer-skin-colocated', 'Skin').deformedVertices[0];
+  const innerVertex = engine.ecs.get('inner-skin-colocated', 'Skin').deformedVertices[0];
+  near(outerVertex.x, 0, 0.01, 'co-located outer Skin deformation x');
+  near(outerVertex.y, 10, 0.01, 'co-located outer Skin deformation y');
+  near(innerVertex.x, 0, 0.01, 'nested co-located Skin respects its own root x');
+  near(innerVertex.y, 16, 0.01, 'nested co-located Skin respects its own root y');
+};
+
+const testPixiSkinnedMeshGeometry = async () => {
+  const PIXI = createFakePixi();
+  const texture = PIXI.Texture.from('/skin.png');
+  const engine = new AH2D.Engine({
+    physics: 'builtin', runtime: 'pixijs',
+    runtimeOptions: { PIXI, loadAssets: false, textureResolver: () => texture }
+  });
+  engine.load(skeletonProject({ includeIK: false, includeSkin: true }));
+  engine.start(fakeHost(), { restoreOnStop: false });
+  await engine.runtime.ready;
+  const record = engine.runtime.nodes.get('skin');
+  assert.ok(record.visual instanceof PIXI.Mesh, 'Pixi v8 must render Skin output as a real Mesh');
+  const initialGeometry = record.visual.geometry;
+  assert.deepStrictEqual(Array.from(record.visual.geometry.positions), [0, 0, 10, 0, 10, 4, 0, 4]);
+  assert.deepStrictEqual(Array.from(record.visual.geometry.uvs), [0, 0, 1, 0, 1, 1, 0, 1]);
+  assert.deepStrictEqual(Array.from(record.visual.geometry.indices), [0, 1, 2, 0, 2, 3]);
+  assert.strictEqual(record.visual.texture, texture);
+
+  engine.ecs.get('upper', 'Transform').rotation = 90;
+  engine.update(0);
+  engine.runtime.render();
+  const positions = Array.from(record.visual.geometry.positions);
+  near(positions[2], 0, 1e-6, 'Pixi Mesh receives live LBS x');
+  near(positions[3], 10, 1e-6, 'Pixi Mesh receives live LBS y');
+  engine.ecs.get('skin', 'Skin').indices = [0, 1, 3, 1, 2, 3];
+  engine.runtime.render();
+  const replacementGeometry = record.visual.geometry;
+  assert.notStrictEqual(replacementGeometry, initialGeometry, 'a changed Skin topology recreates its owned Pixi Geometry');
+  assert.strictEqual(initialGeometry.destroyCount, 1, 'topology recreation destroys the superseded Geometry exactly once');
+  engine.ecs.get('skin', 'Skin').indices = [0, 1, 99];
+  engine.runtime.render();
+  assert.strictEqual(record.visual, null, 'Pixi rejects an out-of-range topology instead of uploading a malformed index buffer');
+  assert.strictEqual(replacementGeometry.destroyCount, 1, 'invalid topology removal destroys the active Geometry exactly once');
+
+  engine.ecs.get('skin', 'Skin').indices = [0, 1, 2, 0, 2, 3];
+  engine.runtime.render();
+  const removedGeometry = record.visual.geometry;
+  engine.ecs.remove('skin', 'Skin');
+  engine.runtime.render();
+  assert.strictEqual(record.visual, null);
+  assert.strictEqual(removedGeometry.destroyCount, 1, 'removing Skin destroys its owned Geometry exactly once');
+  engine.stop({ restore: false });
+  assert.strictEqual(initialGeometry.destroyCount, 1);
+  assert.strictEqual(replacementGeometry.destroyCount, 1);
+  assert.strictEqual(removedGeometry.destroyCount, 1, 'adapter shutdown must not double-destroy released Geometry');
 };
 
 const testEditorRuntimeContract = () => {
@@ -3034,10 +3729,21 @@ const run = async () => {
   await testMultiScenePlaySnapshotRestoreWithPixi();
   testFrameErrorStopsPixiRuntime();
   testPrefabAssetInstanceOverrideApplyRevertAndUnpack();
+  testSkeletalPrefabUnpackRemapsRigAndAnimationReferences();
   testPrefabValidationIsAtomicAndSnapshotsRemainDefinitionFree();
   testPrefabArrayOverrideCoordinatesAndStalePromotion();
   testRealAnimationClipsAndTimelineSampling();
   testAnimationEventBoundariesAndPrefabTargetResolution();
+  testSkeletonForwardKinematicsAndCCD();
+  testLinearBlendSkinningAndSnapshotRestore();
+  testSkeletonBindCacheSurvivesRuntimeLifecycle();
+  testSkeletonPrefabReferencesAndAnimationTracks();
+  testPartialBoneAnimationKeepsStableIKBase();
+  testIKReleaseAndReparentPreserveBasePose();
+  testSkeletalComponentGenerationInvalidation();
+  testNestedSkeletonOwnershipBoundaries();
+  testCoLocatedSkeletonBoneOwnership();
+  await testPixiSkinnedMeshGeometry();
   testEditorRuntimeContract();
   console.log('AH2D Engine tests passed');
 };

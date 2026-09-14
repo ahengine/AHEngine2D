@@ -15,7 +15,7 @@
     RUNTIME: 'runtime',
     SNAPSHOT: 'snapshot'
   });
-  const ANIMATION_TRACK_TYPES = Object.freeze(['sprite', 'position', 'rotation', 'event', 'hitbox']);
+  const ANIMATION_TRACK_TYPES = Object.freeze(['sprite', 'position', 'rotation', 'event', 'hitbox', 'bone', 'ik']);
   const PROFILE_NAMES = Object.freeze(Object.values(PROFILES));
   const COMPONENT_NAME_PATTERN = '^[A-Z][A-Za-z0-9]*$';
   const COMPONENT_NAME_RE = new RegExp(COMPONENT_NAME_PATTERN);
@@ -361,6 +361,49 @@
     ...ANIMATION_AUTHORING_SCHEMA.properties,
     frame: number({ minimum: 0 }), sampledHitboxes: { type: 'array', items: { type: 'object' } }, completed: boolean()
   });
+  const SKELETON_AUTHORING_SCHEMA = object({
+    rootBoneId: string({ minLength: 1, pattern: '\\S' }),
+    enabled: boolean(), solveIK: boolean(), debug: boolean()
+  });
+  const SKELETON_RUNTIME_SCHEMA = object({
+    ...SKELETON_AUTHORING_SCHEMA.properties,
+    pose: object(),
+    boneMatrices: object({}, {
+      additionalProperties: { type: 'array', items: number(), minItems: 6, maxItems: 6 }
+    })
+  });
+  const BONE_SCHEMA = object({
+    length: number({ minimum: 0 }), inheritRotation: boolean(), inheritScale: boolean(), color: string()
+  }, { required: ['length'] });
+  const IK_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    skeletonRootId: string({ minLength: 1, pattern: '\\S' }),
+    bones: { type: 'array', items: string({ minLength: 1, pattern: '\\S' }), minItems: 1 },
+    mix: number({ minimum: 0, maximum: 1 }),
+    iterations: integer({ minimum: 1 }),
+    tolerance: number({ minimum: 0 }),
+    enabled: boolean(),
+    bendDirection: { type: 'integer', enum: [-1, 1] }
+  }, { required: ['skeletonRootId', 'bones'] });
+  const SKIN_WEIGHT_SCHEMA = object({
+    boneId: string({ minLength: 1, pattern: '\\S' }),
+    weight: number({ minimum: 0 })
+  }, { required: ['boneId', 'weight'] });
+  const SKIN_VERTEX_SCHEMA = object({
+    x: number(), y: number(),
+    weights: { type: 'array', items: SKIN_WEIGHT_SCHEMA, minItems: 1 }
+  }, { required: ['x', 'y', 'weights'] });
+  const SKIN_AUTHORING_SCHEMA = object({
+    skeletonRootId: string({ minLength: 1, pattern: '\\S' }),
+    assetId: string({ minLength: 1, pattern: '\\S' }),
+    vertices: { type: 'array', items: SKIN_VERTEX_SCHEMA },
+    uvs: { type: 'array', items: number() },
+    indices: { type: 'array', items: integer({ minimum: 0 }) }
+  }, { required: ['skeletonRootId', 'vertices'] });
+  const SKIN_RUNTIME_SCHEMA = object({
+    ...SKIN_AUTHORING_SCHEMA.properties,
+    deformedVertices: { type: 'array', items: object({ x: number(), y: number() }, { required: ['x', 'y'] }) }
+  }, { required: SKIN_AUTHORING_SCHEMA.required });
   const TILEMAP_SCHEMA = object({
     tileWidth: number({ exclusiveMinimum: 0 }), tileHeight: number({ exclusiveMinimum: 0 }),
     width: integer({ minimum: 0 }), height: integer({ minimum: 0 }), tiles: { type: 'array', items: { type: 'array' } }, assetId: nullableString()
@@ -384,6 +427,10 @@
     Light: profileSet(LIGHT_SCHEMA),
     ShadowCaster: profileSet(SHADOW_SCHEMA),
     Animation: profileSet(ANIMATION_AUTHORING_SCHEMA, ANIMATION_RUNTIME_SCHEMA),
+    Skeleton: profileSet(SKELETON_AUTHORING_SCHEMA, SKELETON_RUNTIME_SCHEMA),
+    Bone: profileSet(BONE_SCHEMA),
+    IK: profileSet(IK_SCHEMA),
+    Skin: profileSet(SKIN_AUTHORING_SCHEMA, SKIN_RUNTIME_SCHEMA),
     Tilemap: profileSet(TILEMAP_SCHEMA),
     ParticleEmitter: profileSet(PARTICLE_SCHEMA),
     BoxCollider: profileSet(COLLIDER_SCHEMA),
@@ -521,7 +568,7 @@
         usedTrackIds.add(track.id);
       } else track.id = animationGeneratedId(type, usedTrackIds, `track-${trackIndex + 1}`);
       if (typeof track.interpolation !== 'string' || !track.interpolation.trim()) {
-        track.interpolation = type === 'position' || type === 'rotation' ? 'linear' : 'step';
+        track.interpolation = ['position', 'rotation', 'bone', 'ik'].includes(type) ? 'linear' : 'step';
       }
       const usedKeyframeIds = new Set();
       track.keyframes = (Array.isArray(rawTrack.keyframes) ? rawTrack.keyframes : [])
@@ -541,6 +588,16 @@
               keyframe.value.frame = Number.isInteger(Number(authoredFrame)) ? Number(authoredFrame) : authoredFrame;
             }
             if (hasLegacyFrame) delete keyframe.value.spriteFrame;
+          }
+          if ((type === 'bone' || type === 'ik') && isPlainObject(keyframe.value)) {
+            const numericFields = type === 'bone'
+              ? ['x', 'y', 'rotation', 'scaleX', 'scaleY']
+              : ['x', 'y', 'mix', 'iterations', 'tolerance', 'bendDirection'];
+            for (const field of numericFields) {
+              if (hasOwn(keyframe.value, field) && Number.isFinite(Number(keyframe.value[field]))) {
+                keyframe.value[field] = Number(keyframe.value[field]);
+              }
+            }
           }
           return keyframe;
         })
@@ -629,6 +686,18 @@
       }
       return value;
     }
+    if ((type === 'bone' || type === 'ik') && isPlainObject(left.value) && isPlainObject(right.value)) {
+      const value = cloneJson(left.value);
+      const numericFields = type === 'bone'
+        ? ['x', 'y', 'rotation', 'scaleX', 'scaleY']
+        : ['x', 'y', 'mix', 'tolerance'];
+      for (const field of numericFields) {
+        if (animationFiniteNumber(left.value[field], true) && animationFiniteNumber(right.value[field], true)) {
+          value[field] = Number(left.value[field]) + (Number(right.value[field]) - Number(left.value[field])) * t;
+        }
+      }
+      return value;
+    }
     return cloneJson(left.value);
   }
 
@@ -675,9 +744,9 @@
       }
       if (!left) continue;
       if (track.type === 'event' && Math.abs(left.frame - sampleFrame) > 1e-7) continue;
-      const interpolation = String(track.interpolation || (track.type === 'position' || track.type === 'rotation' ? 'linear' : 'step')).toLowerCase();
+      const interpolation = String(track.interpolation || (['position', 'rotation', 'bone', 'ik'].includes(track.type) ? 'linear' : 'step')).toLowerCase();
       let value = cloneJson(left.value);
-      if (interpolation !== 'step' && right && right.frame > left.frame && (track.type === 'position' || track.type === 'rotation')) {
+      if (interpolation !== 'step' && right && right.frame > left.frame && ['position', 'rotation', 'bone', 'ik'].includes(track.type)) {
         value = interpolateAnimationValue(track.type, left, right, (sampleFrame - left.frame) / (right.frame - left.frame));
       }
       const sampled = {
@@ -703,12 +772,110 @@
     };
   }
 
-  function animationKnownEntityIds(document) {
-    const ids = new Set();
+  function animationKnownEntityRecords(document, codec) {
+    const records = new Map();
+    const add = (reference, entity) => {
+      if (typeof reference !== 'string' || !reference.trim()) return;
+      const matches = records.get(reference) || [];
+      matches.push(entity);
+      records.set(reference, matches);
+    };
     for (const collection of animationEntityCollections(document)) {
-      for (const entity of collection.entities) if (typeof entity?.id === 'string') ids.add(entity.id);
+      for (const entity of collection.entities) {
+        if (!isPlainObject(entity)) continue;
+        add(entity.id, entity);
+        let marker;
+        try { marker = codec.resolve(entity, 'PrefabInstance'); }
+        catch (_) { marker = null; }
+        if (marker?.found && isPlainObject(marker.value)) add(marker.value.sourceEntityId, entity);
+      }
     }
-    return ids;
+    return records;
+  }
+
+  function animationTargetHasComponent(records, targetId, type, codec) {
+    return (records.get(targetId) || []).some(entity => {
+      try { return codec.resolve(entity, type).found; }
+      catch (_) { return false; }
+    });
+  }
+
+  function animationBindingContexts(document, codec) {
+    const bindings = [];
+    for (const collection of animationEntityCollections(document)) {
+      const records = [];
+      const byId = new Map();
+      collection.entities.forEach((entity, entityIndex) => {
+        if (!isPlainObject(entity)) return;
+        const id = typeof entity.id === 'string' && entity.id.trim() ? entity.id : '';
+        const record = {
+          entity,
+          id,
+          pointer: `${collection.pointer}/${entityIndex}`,
+          marker: null
+        };
+        records.push(record);
+        if (id && !byId.has(id)) byId.set(id, record);
+      });
+
+      const instanceGroups = new Map();
+      for (const record of records) {
+        let marker;
+        try { marker = codec.resolve(record.entity, 'PrefabInstance'); }
+        catch (_) { marker = null; }
+        const value = marker?.found && isPlainObject(marker.value) ? marker.value : null;
+        if (!value || typeof value.prefabId !== 'string' || !value.prefabId.trim() ||
+            typeof value.instanceRootId !== 'string' || !value.instanceRootId.trim() ||
+            typeof value.sourceEntityId !== 'string' || !value.sourceEntityId.trim()) continue;
+        record.marker = value;
+        const groupKey = `${value.prefabId}\u0000${value.instanceRootId}`;
+        const group = instanceGroups.get(groupKey) || new Map();
+        if (!group.has(value.sourceEntityId)) group.set(value.sourceEntityId, record);
+        instanceGroups.set(groupKey, group);
+      }
+
+      for (const record of records) {
+        let resolved;
+        try { resolved = codec.resolve(record.entity, 'Animation'); }
+        catch (_) { resolved = null; }
+        if (!resolved?.found || !isPlainObject(resolved.value)) continue;
+        bindings.push({
+          entity: record.entity,
+          entityId: record.id,
+          pointer: `${record.pointer}${pointerForStorage(resolved.storage)}`,
+          animation: resolved.value,
+          resolveReference(authoredId) {
+            const reference = typeof authoredId === 'string' ? authoredId.trim() : '';
+            if (!reference) return null;
+            if (record.marker) {
+              const group = instanceGroups.get(`${record.marker.prefabId}\u0000${record.marker.instanceRootId}`);
+              // Connected instances author Skeleton/Animation references in
+              // prefab source-ID space. Never escape into another instance or
+              // an unrelated concrete Entity with the same text ID.
+              return group?.get(reference) || null;
+            }
+            return byId.get(reference) || null;
+          }
+        });
+      }
+    }
+    return bindings;
+  }
+
+  function animationBindingMatchesClip(binding, clipId, clipName, uniqueClipNames) {
+    const stable = typeof binding.animation.clipId === 'string' ? binding.animation.clipId.trim() : '';
+    if (stable) return Boolean(clipId) && stable === clipId;
+    const legacy = typeof binding.animation.clip === 'string' ? binding.animation.clip.trim() : '';
+    if (!legacy) return false;
+    if (clipId && legacy === clipId) return true;
+    const foldedName = typeof clipName === 'string' ? clipName.toLocaleLowerCase() : '';
+    return Boolean(foldedName) && legacy.toLocaleLowerCase() === foldedName && uniqueClipNames.get(foldedName) === 1;
+  }
+
+  function animationRecordHasComponent(record, type, codec) {
+    if (!record) return false;
+    try { return codec.resolve(record.entity, type).found; }
+    catch (_) { return false; }
   }
 
   function animationLegacyDiagnostic(output, strict, message, pointer, details) {
@@ -753,6 +920,43 @@
     } else if (type === 'hitbox') {
       if (!isPlainObject(value)) output.push(diagnostic('E_ANIMATION_HITBOX_VALUE', 'Hitbox keyframe value must be an object', pointer));
       else if (value.colliderId != null && (typeof value.colliderId !== 'string' || !value.colliderId.trim())) output.push(diagnostic('E_ANIMATION_HITBOX_ID', 'Hitbox colliderId must be a non-empty string', joinPointer(pointer, 'colliderId')));
+    } else if (type === 'bone') {
+      const fields = ['x', 'y', 'rotation', 'scaleX', 'scaleY'];
+      if (!isPlainObject(value) || !fields.some(field => hasOwn(value, field))) {
+        output.push(diagnostic('E_ANIMATION_BONE_VALUE', 'Bone keyframe value must contain at least one transform field', pointer));
+      } else {
+        for (const field of fields) {
+          if (hasOwn(value, field) && !animationFiniteNumber(value[field], strict)) {
+            output.push(diagnostic('E_ANIMATION_BONE_VALUE', `${field} must be a finite number`, joinPointer(pointer, field)));
+          }
+        }
+      }
+    } else if (type === 'ik') {
+      const fields = ['x', 'y', 'mix', 'iterations', 'tolerance', 'enabled', 'bendDirection'];
+      if (!isPlainObject(value) || !fields.some(field => hasOwn(value, field))) {
+        output.push(diagnostic('E_ANIMATION_IK_VALUE', 'IK keyframe value must contain at least one target or constraint field', pointer));
+      } else {
+        for (const field of ['x', 'y']) if (hasOwn(value, field) && !animationFiniteNumber(value[field], strict)) {
+          output.push(diagnostic('E_ANIMATION_IK_VALUE', `${field} must be a finite number`, joinPointer(pointer, field)));
+        }
+        if (hasOwn(value, 'mix') && (!animationFiniteNumber(value.mix, strict) || Number(value.mix) < 0 || Number(value.mix) > 1)) {
+          output.push(diagnostic('E_ANIMATION_IK_VALUE', 'mix must be between 0 and 1', joinPointer(pointer, 'mix')));
+        }
+        if (hasOwn(value, 'iterations') && (!animationInteger(value.iterations, strict) || Number(value.iterations) < 1)) {
+          output.push(diagnostic('E_ANIMATION_IK_VALUE', 'iterations must be a positive integer', joinPointer(pointer, 'iterations')));
+        }
+        if (hasOwn(value, 'tolerance') && (!animationFiniteNumber(value.tolerance, strict) || Number(value.tolerance) < 0)) {
+          output.push(diagnostic('E_ANIMATION_IK_VALUE', 'tolerance must be a non-negative finite number', joinPointer(pointer, 'tolerance')));
+        }
+        if (hasOwn(value, 'enabled') && typeof value.enabled !== 'boolean') {
+          output.push(diagnostic('E_ANIMATION_IK_VALUE', 'enabled must be boolean', joinPointer(pointer, 'enabled')));
+        }
+        if (hasOwn(value, 'bendDirection') && ![-1, 1].includes(Number(value.bendDirection))) {
+          output.push(diagnostic('E_ANIMATION_IK_VALUE', 'bendDirection must be -1 or 1', joinPointer(pointer, 'bendDirection')));
+        } else if (hasOwn(value, 'bendDirection') && strict && typeof value.bendDirection !== 'number') {
+          output.push(diagnostic('E_ANIMATION_IK_VALUE', 'bendDirection must be -1 or 1', joinPointer(pointer, 'bendDirection')));
+        }
+      }
     }
   }
 
@@ -852,7 +1056,17 @@
     const clipIds = new Map();
     const clipNames = new Map();
     const hasEntityContext = isPlainObject(document) && document.format !== 'AH2D.Animation';
-    const knownEntityIds = hasEntityContext ? animationKnownEntityIds(document) : new Set();
+    const codec = options.entityCodec instanceof EntityCodec ? options.entityCodec : createDefaultEntityCodec();
+    const knownEntityRecords = hasEntityContext ? animationKnownEntityRecords(document, codec) : new Map();
+    const knownEntityIds = new Set(knownEntityRecords.keys());
+    const animationBindings = hasEntityContext ? animationBindingContexts(document, codec) : [];
+    const uniqueClipNames = new Map();
+    for (const candidate of animations) {
+      const candidateName = isPlainObject(candidate) && typeof candidate.name === 'string'
+        ? candidate.name.trim().toLocaleLowerCase()
+        : '';
+      if (candidateName) uniqueClipNames.set(candidateName, (uniqueClipNames.get(candidateName) || 0) + 1);
+    }
     animations.forEach((clip, clipIndex) => {
       const pointer = basePointer ? joinPointer(basePointer, clipIndex) : '';
       if (!isPlainObject(clip)) { output.push(diagnostic('E_ANIMATION_CLIP_TYPE', 'Animation Clip must be a plain object', pointer)); return; }
@@ -870,6 +1084,8 @@
         matches.push(joinPointer(pointer, 'name'));
         clipNames.set(folded, matches);
       }
+      const clipBindings = animationBindings.filter(binding => animationBindingMatchesClip(binding, id, name, uniqueClipNames));
+      const resolvedClipTargets = new Map();
       if (!animationFiniteNumber(clip.fps, strict) || Number(clip.fps) <= 0) output.push(diagnostic('E_ANIMATION_FPS', 'Animation Clip fps must be a number greater than zero', joinPointer(pointer, 'fps')));
       let frameCount = clip.frameCount;
       if (frameCount == null && clip.frames != null && !Array.isArray(clip.frames)) {
@@ -882,7 +1098,18 @@
       if (clip.speed != null && !animationFiniteNumber(clip.speed, strict)) output.push(diagnostic('E_ANIMATION_SPEED', 'Animation Clip speed must be a finite number', joinPointer(pointer, 'speed')));
       if (clip.targetEntityId != null) {
         if (typeof clip.targetEntityId !== 'string' || !clip.targetEntityId.trim()) output.push(diagnostic('E_ANIMATION_TARGET_ID', 'targetEntityId must be a non-empty string', joinPointer(pointer, 'targetEntityId')));
-        else if (hasEntityContext && !knownEntityIds.has(clip.targetEntityId)) output.push(diagnostic('E_ANIMATION_TARGET_MISSING', `Animation target Entity does not exist: ${clip.targetEntityId}`, joinPointer(pointer, 'targetEntityId')));
+        else if (clipBindings.length) {
+          for (const binding of clipBindings) {
+            const target = binding.resolveReference(clip.targetEntityId);
+            resolvedClipTargets.set(binding, target);
+            if (!target) output.push(diagnostic(
+              'E_ANIMATION_TARGET_MISSING',
+              `Animation target Entity does not exist in the bound Entity scope: ${clip.targetEntityId}`,
+              joinPointer(pointer, 'targetEntityId'),
+              { targetEntityId: clip.targetEntityId, animationEntityId: binding.entityId, animationPointer: binding.pointer }
+            ));
+          }
+        } else if (hasEntityContext && !knownEntityIds.has(clip.targetEntityId)) output.push(diagnostic('E_ANIMATION_TARGET_MISSING', `Animation target Entity does not exist: ${clip.targetEntityId}`, joinPointer(pointer, 'targetEntityId')));
       }
       let tracks = clip.tracks;
       if (!Array.isArray(tracks)) {
@@ -909,7 +1136,53 @@
         if (track.interpolation != null && typeof track.interpolation !== 'string') output.push(diagnostic('E_ANIMATION_INTERPOLATION', 'Animation track interpolation must be a string', joinPointer(trackPointer, 'interpolation')));
         if (track.targetEntityId != null) {
           if (typeof track.targetEntityId !== 'string' || !track.targetEntityId.trim()) output.push(diagnostic('E_ANIMATION_TARGET_ID', 'targetEntityId must be a non-empty string', joinPointer(trackPointer, 'targetEntityId')));
-          else if (hasEntityContext && !knownEntityIds.has(track.targetEntityId)) output.push(diagnostic('E_ANIMATION_TARGET_MISSING', `Animation target Entity does not exist: ${track.targetEntityId}`, joinPointer(trackPointer, 'targetEntityId')));
+          else if (clipBindings.length) {
+            for (const binding of clipBindings) if (!binding.resolveReference(track.targetEntityId)) output.push(diagnostic(
+              'E_ANIMATION_TARGET_MISSING',
+              `Animation target Entity does not exist in the bound Entity scope: ${track.targetEntityId}`,
+              joinPointer(trackPointer, 'targetEntityId'),
+              { targetEntityId: track.targetEntityId, animationEntityId: binding.entityId, animationPointer: binding.pointer }
+            ));
+          } else if (hasEntityContext && !knownEntityIds.has(track.targetEntityId)) output.push(diagnostic('E_ANIMATION_TARGET_MISSING', `Animation target Entity does not exist: ${track.targetEntityId}`, joinPointer(trackPointer, 'targetEntityId')));
+        }
+        if (hasEntityContext && (type === 'bone' || type === 'ik')) {
+          const hasTrackTarget = track.targetEntityId != null;
+          const targetId = hasTrackTarget
+            ? (typeof track.targetEntityId === 'string' && track.targetEntityId.trim() ? track.targetEntityId : '')
+            : (typeof clip.targetEntityId === 'string' && clip.targetEntityId.trim() ? clip.targetEntityId : '');
+          const targetPointer = hasTrackTarget ? joinPointer(trackPointer, 'targetEntityId') : joinPointer(pointer, 'targetEntityId');
+          const expected = type === 'bone' ? 'Bone' : 'IK';
+          if (clipBindings.length) {
+            for (const binding of clipBindings) {
+              let target = null;
+              if (targetId) target = hasTrackTarget
+                ? binding.resolveReference(targetId)
+                : resolvedClipTargets.get(binding);
+              else if (!hasTrackTarget && clip.targetEntityId == null) target = {
+                entity: binding.entity,
+                id: binding.entityId,
+                pointer: binding.pointer
+              };
+              if (target && !animationRecordHasComponent(target, expected, codec)) output.push(diagnostic(
+                type === 'bone' ? 'E_ANIMATION_BONE_TARGET' : 'E_ANIMATION_IK_TARGET',
+                `${type === 'bone' ? 'Bone' : 'IK'} track target must have the ${expected} component: ${targetId || binding.entityId}`,
+                targetId ? targetPointer : trackPointer,
+                {
+                  targetEntityId: targetId || binding.entityId,
+                  requiredComponent: expected,
+                  animationEntityId: binding.entityId,
+                  animationPointer: binding.pointer
+                }
+              ));
+            }
+          } else if (targetId && knownEntityIds.has(targetId)) {
+            if (!animationTargetHasComponent(knownEntityRecords, targetId, expected, codec)) output.push(diagnostic(
+              type === 'bone' ? 'E_ANIMATION_BONE_TARGET' : 'E_ANIMATION_IK_TARGET',
+              `${type === 'bone' ? 'Bone' : 'IK'} track target must have the ${expected} component: ${targetId}`,
+              targetPointer,
+              { targetEntityId: targetId, requiredComponent: expected }
+            ));
+          }
         }
         if (!Array.isArray(track.keyframes)) { output.push(diagnostic('E_ANIMATION_KEYFRAMES', 'Animation track keyframes must be an array', joinPointer(trackPointer, 'keyframes'))); return; }
         const keyIds = new Map();
@@ -942,6 +1215,335 @@
 
   function assertAnimationDocument(document, options = {}) {
     const diagnostics = validateAnimationDocument(document, options);
+    const errors = diagnostics.filter(item => item.severity === 'error');
+    if (errors.length) {
+      const first = errors[0];
+      throw new ComponentSchemaError(first.code, first.message, { pointer: first.pointer, details: first.details, diagnostics });
+    }
+    return diagnostics;
+  }
+
+  function skeletonEntityCollections(document) {
+    if (!isPlainObject(document)) return [];
+    const collections = [];
+    if (Array.isArray(document.scenes)) {
+      document.scenes.forEach((scene, sceneIndex) => {
+        if (Array.isArray(scene?.objects)) collections.push({
+          kind: 'scene', id: scene.id, entities: scene.objects,
+          pointer: `/scenes/${sceneIndex}/objects`
+        });
+      });
+    } else if (Array.isArray(document.entities)) {
+      collections.push({ kind: 'entities', id: null, entities: document.entities, pointer: '/entities' });
+    } else if (Array.isArray(document.scene)) {
+      collections.push({ kind: 'scene', id: null, entities: document.scene, pointer: '/scene' });
+    }
+    if (Array.isArray(document.prefabs)) {
+      document.prefabs.forEach((prefab, prefabIndex) => {
+        if (Array.isArray(prefab?.entities)) collections.push({
+          kind: 'prefab', id: prefab.id, entities: prefab.entities,
+          pointer: `/prefabs/${prefabIndex}/entities`
+        });
+      });
+    }
+    return collections;
+  }
+
+  function validateSkeletonDocument(document, options = {}) {
+    if (!isPlainObject(document)) return [diagnostic('E_SKELETON_DOCUMENT', 'Skeleton document must be a plain object', '')];
+    const output = [];
+    const strict = Boolean(options.strict);
+    const codec = options.entityCodec instanceof EntityCodec ? options.entityCodec : createDefaultEntityCodec();
+    // A lossy ECS snapshot contains expanded runtime Entity IDs but connected
+    // Prefab components may intentionally retain their Asset source IDs. The
+    // component shapes remain checkable; authoring-scope reference semantics do
+    // not. Keep this exemption as narrow as the Animation snapshot boundary.
+    const definitionFreeEcsSnapshot = document.format === 'AH2D' && Number(document.version) === 3 &&
+      Array.isArray(document.entities) && document.scenes == null && document.prefabs == null;
+
+    for (const scope of skeletonEntityCollections(document)) {
+      const byId = new Map();
+      const records = [];
+      scope.entities.forEach((entity, entityIndex) => {
+        if (!isPlainObject(entity)) return;
+        const pointer = `${scope.pointer}/${entityIndex}`;
+        const id = typeof entity.id === 'string' && entity.id.trim() ? entity.id : '';
+        const record = { entity, entityIndex, pointer, id, components: new Map() };
+        records.push(record);
+        if (!id) return;
+        if (!byId.has(id)) byId.set(id, record);
+      });
+
+      const component = (record, type) => {
+        if (record.components.has(type)) return record.components.get(type);
+        let resolved;
+        try { resolved = codec.resolve(record.entity, type); }
+        catch (_) { resolved = { found: false }; }
+        const result = resolved.found
+          ? { value: resolved.value, pointer: `${record.pointer}${pointerForStorage(resolved.storage)}`, resolved }
+          : null;
+        record.components.set(type, result);
+        if (result && options.validateComponents !== false) {
+          output.push(...codec.registry.validate(type, result.value, {
+            pointer: result.pointer,
+            profile: definitionFreeEcsSnapshot ? PROFILES.SNAPSHOT : PROFILES.AUTHORING,
+            mode: strict ? 'strict' : 'compat',
+            strict
+          }));
+        }
+        return result;
+      };
+
+      const skeletons = new Map();
+      const bones = new Map();
+      for (const record of records) {
+        const skeleton = component(record, 'Skeleton');
+        if (skeleton && isPlainObject(skeleton.value) && record.id) skeletons.set(record.id, { ...record, component: skeleton });
+        const bone = component(record, 'Bone');
+        if (bone && isPlainObject(bone.value) && record.id) bones.set(record.id, { ...record, component: bone });
+        component(record, 'IK');
+        component(record, 'Skin');
+      }
+      if (definitionFreeEcsSnapshot) continue;
+
+      // Connected Prefab instances keep Skeleton-domain references in Asset
+      // source-ID space while their concrete Scene Entity IDs are remapped.
+      // Resolve marked owners only inside their exact instance group; ordinary
+      // unmarked owners continue to use same-collection concrete Entity IDs.
+      const markerByRecord = new Map();
+      const instanceGroups = new Map();
+      for (const record of records) {
+        let resolved;
+        try { resolved = codec.resolve(record.entity, 'PrefabInstance'); }
+        catch (_) { resolved = null; }
+        const marker = resolved?.found && isPlainObject(resolved.value) ? resolved.value : null;
+        if (!marker || typeof marker.prefabId !== 'string' || typeof marker.instanceRootId !== 'string' ||
+            typeof marker.sourceEntityId !== 'string') continue;
+        markerByRecord.set(record.pointer, marker);
+        const groupKey = `${marker.prefabId}\u0000${marker.instanceRootId}`;
+        const group = instanceGroups.get(groupKey) || new Map();
+        if (!group.has(marker.sourceEntityId)) group.set(marker.sourceEntityId, record);
+        instanceGroups.set(groupKey, group);
+      }
+      const resolveReference = (owner, authoredId) => {
+        const reference = typeof authoredId === 'string' ? authoredId.trim() : '';
+        if (!reference) return null;
+        const marker = markerByRecord.get(owner.pointer);
+        if (marker) {
+          const group = instanceGroups.get(`${marker.prefabId}\u0000${marker.instanceRootId}`);
+          return group?.get(reference) || null;
+        }
+        return byId.get(reference) || null;
+      };
+
+      const owningSkeleton = boneId => {
+        if (skeletons.has(boneId)) return skeletons.get(boneId);
+        const seen = new Set();
+        let cursor = byId.get(boneId);
+        while (cursor && typeof cursor.entity.parentId === 'string' && !seen.has(cursor.id)) {
+          seen.add(cursor.id);
+          const parentId = cursor.entity.parentId;
+          if (skeletons.has(parentId)) return skeletons.get(parentId);
+          cursor = byId.get(parentId);
+        }
+        return null;
+      };
+
+      for (const bone of bones.values()) {
+        const owner = owningSkeleton(bone.id);
+        const parentId = bone.entity.parentId;
+        if (!owner) {
+          output.push(diagnostic(
+            'E_BONE_SKELETON_ANCESTRY',
+            `Bone must descend from an Entity with Skeleton: ${bone.id}`,
+            joinPointer(bone.pointer, 'parentId'),
+            { boneId: bone.id }
+          ));
+        } else if (bone.id !== owner.id && !bones.has(parentId) && parentId !== owner.id) {
+          output.push(diagnostic(
+            'E_BONE_PARENT',
+            'A Bone parent must be another Bone or its Skeleton root Entity',
+            joinPointer(bone.pointer, 'parentId'),
+            { boneId: bone.id, parentId }
+          ));
+        }
+      }
+
+      for (const skeleton of skeletons.values()) {
+        const rootPointer = joinPointer(skeleton.component.pointer, 'rootBoneId');
+        const rootBoneId = typeof skeleton.component.value.rootBoneId === 'string' && skeleton.component.value.rootBoneId.trim()
+          ? skeleton.component.value.rootBoneId
+          : '';
+        const directRootBones = bones.has(skeleton.id)
+          ? [bones.get(skeleton.id)]
+          : [...bones.values()].filter(bone => bone.entity.parentId === skeleton.id && owningSkeleton(bone.id)?.id === skeleton.id);
+        if (rootBoneId) {
+          const resolvedRoot = resolveReference(skeleton, rootBoneId);
+          const rootBone = resolvedRoot ? bones.get(resolvedRoot.id) : null;
+          if (!rootBone) output.push(diagnostic(
+            'E_SKELETON_ROOT_BONE_REFERENCE',
+            `Skeleton rootBoneId must reference a Bone in the same scope: ${rootBoneId}`,
+            rootPointer,
+            { skeletonRootId: skeleton.id, rootBoneId }
+          ));
+          else if (owningSkeleton(rootBone.id)?.id !== skeleton.id || (rootBone.id !== skeleton.id && rootBone.entity.parentId !== skeleton.id)) output.push(diagnostic(
+            'E_SKELETON_ROOT_BONE_ANCESTRY',
+            'Skeleton rootBoneId must be a direct child of the Skeleton Entity',
+            rootPointer,
+            { skeletonRootId: skeleton.id, rootBoneId }
+          ));
+          for (const root of directRootBones) if (root.id !== rootBone?.id) output.push(diagnostic(
+            'E_SKELETON_ROOT_BONE_DUPLICATE',
+            'A Skeleton may have only one root Bone',
+            joinPointer(root.pointer, 'parentId'),
+            { skeletonRootId: skeleton.id, rootBoneId, duplicateRootBoneId: root.id }
+          ));
+        } else if (directRootBones.length > 1) {
+          for (const duplicate of directRootBones.slice(1)) output.push(diagnostic(
+            'E_SKELETON_ROOT_BONE_DUPLICATE',
+            'A Skeleton without rootBoneId may have only one direct root Bone',
+            joinPointer(duplicate.pointer, 'parentId'),
+            { skeletonRootId: skeleton.id, firstRootBoneId: directRootBones[0].id, duplicateRootBoneId: duplicate.id }
+          ));
+        }
+      }
+
+      for (const record of records) {
+        const ik = component(record, 'IK');
+        if (ik && isPlainObject(ik.value)) {
+          const value = ik.value;
+          const skeletonRootId = typeof value.skeletonRootId === 'string' && value.skeletonRootId.trim() ? value.skeletonRootId : '';
+          const resolvedSkeleton = resolveReference(record, skeletonRootId);
+          const skeleton = resolvedSkeleton ? skeletons.get(resolvedSkeleton.id) : null;
+          if (skeletonRootId && !skeleton) output.push(diagnostic(
+            'E_IK_SKELETON_REFERENCE',
+            `IK skeletonRootId must reference a Skeleton in the same scope: ${skeletonRootId}`,
+            joinPointer(ik.pointer, 'skeletonRootId'),
+            { skeletonRootId }
+          ));
+          const seenBones = new Map();
+          const resolvedChain = [];
+          const chain = Array.isArray(value.bones) ? value.bones : [];
+          chain.forEach((boneId, boneIndex) => {
+            const bonePointer = joinPointer(joinPointer(ik.pointer, 'bones'), boneIndex);
+            if (typeof boneId !== 'string' || !boneId.trim()) return;
+            const resolvedBone = resolveReference(record, boneId);
+            const resolvedBoneId = resolvedBone?.id || boneId;
+            resolvedChain[boneIndex] = resolvedBoneId;
+            if (seenBones.has(resolvedBoneId)) output.push(diagnostic(
+              'E_IK_BONE_DUPLICATE',
+              `IK chain contains duplicate Bone: ${boneId}`,
+              bonePointer,
+              { boneId, resolvedBoneId, firstPointer: seenBones.get(resolvedBoneId) }
+            ));
+            else seenBones.set(resolvedBoneId, bonePointer);
+            const bone = resolvedBone ? bones.get(resolvedBone.id) : null;
+            if (!bone) output.push(diagnostic(
+              'E_IK_BONE_REFERENCE',
+              `IK chain must reference a Bone in the same scope: ${boneId}`,
+              bonePointer,
+              { boneId }
+            ));
+            else if (skeleton && owningSkeleton(bone.id)?.id !== skeleton.id) output.push(diagnostic(
+              'E_IK_BONE_ANCESTRY',
+              `IK Bone must belong to Skeleton ${skeletonRootId}: ${boneId}`,
+              bonePointer,
+              { skeletonRootId, boneId }
+            ));
+            if (boneIndex > 0 && bone && bone.entity.parentId !== resolvedChain[boneIndex - 1]) output.push(diagnostic(
+              'E_IK_CHAIN',
+              'IK bones must be ordered as a contiguous ancestor-to-descendant chain',
+              bonePointer,
+              { boneId, expectedParentId: resolvedChain[boneIndex - 1], actualParentId: bone.entity.parentId }
+            ));
+          });
+        }
+
+        const skin = component(record, 'Skin');
+        if (!skin || !isPlainObject(skin.value)) continue;
+        const value = skin.value;
+        const skeletonRootId = typeof value.skeletonRootId === 'string' && value.skeletonRootId.trim() ? value.skeletonRootId : '';
+        const resolvedSkeleton = resolveReference(record, skeletonRootId);
+        const skeleton = resolvedSkeleton ? skeletons.get(resolvedSkeleton.id) : null;
+        if (skeletonRootId && !skeleton) output.push(diagnostic(
+          'E_SKIN_SKELETON_REFERENCE',
+          `Skin skeletonRootId must reference a Skeleton in the same scope: ${skeletonRootId}`,
+          joinPointer(skin.pointer, 'skeletonRootId'),
+          { skeletonRootId }
+        ));
+        const vertices = Array.isArray(value.vertices) ? value.vertices : [];
+        if (Array.isArray(value.uvs) && value.uvs.length !== vertices.length * 2) output.push(diagnostic(
+          'E_SKIN_UV_COUNT',
+          'Skin uvs must contain exactly two values for every vertex',
+          joinPointer(skin.pointer, 'uvs'),
+          { vertexCount: vertices.length, expected: vertices.length * 2, actual: value.uvs.length }
+        ));
+        if (Array.isArray(value.indices)) {
+          if (value.indices.length % 3 !== 0) output.push(diagnostic(
+            'E_SKIN_INDEX_COUNT',
+            'Skin indices must contain complete triangles',
+            joinPointer(skin.pointer, 'indices'),
+            { indexCount: value.indices.length, remainder: value.indices.length % 3 }
+          ));
+          value.indices.forEach((indexValue, index) => {
+            if (!animationInteger(indexValue, strict) || Number(indexValue) < 0 || Number(indexValue) < vertices.length) return;
+            output.push(diagnostic(
+              'E_SKIN_INDEX_RANGE',
+              `Skin index must reference an existing vertex: ${indexValue}`,
+              joinPointer(joinPointer(skin.pointer, 'indices'), index),
+              { index: Number(indexValue), vertexCount: vertices.length }
+            ));
+          });
+        }
+        vertices.forEach((vertex, vertexIndex) => {
+          if (!isPlainObject(vertex) || !Array.isArray(vertex.weights)) return;
+          const weightsPointer = joinPointer(joinPointer(skin.pointer, 'vertices'), vertexIndex) + '/weights';
+          const seenWeights = new Map();
+          let total = 0;
+          let numericWeights = true;
+          vertex.weights.forEach((weight, weightIndex) => {
+            if (!isPlainObject(weight)) { numericWeights = false; return; }
+            const pointer = joinPointer(weightsPointer, weightIndex);
+            const boneId = typeof weight.boneId === 'string' && weight.boneId.trim() ? weight.boneId : '';
+            if (animationFiniteNumber(weight.weight, strict)) total += Number(weight.weight);
+            else numericWeights = false;
+            if (!boneId) return;
+            if (seenWeights.has(boneId)) output.push(diagnostic(
+              'E_SKIN_BONE_DUPLICATE',
+              `Skin vertex contains duplicate Bone weight: ${boneId}`,
+              joinPointer(pointer, 'boneId'),
+              { boneId, firstPointer: seenWeights.get(boneId) }
+            ));
+            else seenWeights.set(boneId, joinPointer(pointer, 'boneId'));
+            const resolvedBone = resolveReference(record, boneId);
+            const bone = resolvedBone ? bones.get(resolvedBone.id) : null;
+            if (!bone) output.push(diagnostic(
+              'E_SKIN_BONE_REFERENCE',
+              `Skin weight must reference a Bone in the same scope: ${boneId}`,
+              joinPointer(pointer, 'boneId'),
+              { boneId }
+            ));
+            else if (skeleton && owningSkeleton(bone.id)?.id !== skeleton.id) output.push(diagnostic(
+              'E_SKIN_BONE_ANCESTRY',
+              `Skin Bone must belong to Skeleton ${skeletonRootId}: ${boneId}`,
+              joinPointer(pointer, 'boneId'),
+              { skeletonRootId, boneId }
+            ));
+          });
+          if (numericWeights && total <= 0) output.push(diagnostic(
+            'E_SKIN_WEIGHT_TOTAL',
+            'Skin vertex Bone weights must have a positive total',
+            weightsPointer,
+            { total }
+          ));
+        });
+      }
+    }
+    return output;
+  }
+
+  function assertSkeletonDocument(document, options = {}) {
+    const diagnostics = validateSkeletonDocument(document, options);
     const errors = diagnostics.filter(item => item.severity === 'error');
     if (errors.length) {
       const first = errors[0];
@@ -1248,6 +1850,10 @@
     { type: 'Light', schemas: COMPONENT_SCHEMAS.Light, defaults: {} },
     { type: 'ShadowCaster', schemas: COMPONENT_SCHEMAS.ShadowCaster, defaults: {} },
     { type: 'Animation', schemas: COMPONENT_SCHEMAS.Animation, defaults: {}, runtimeOnlyFields: ['frame', 'sampledHitboxes', 'completed'] },
+    { type: 'Skeleton', schemas: COMPONENT_SCHEMAS.Skeleton, defaults: { enabled: true, solveIK: true, debug: false }, runtimeOnlyFields: ['pose', 'boneMatrices'] },
+    { type: 'Bone', schemas: COMPONENT_SCHEMAS.Bone, defaults: { length: 32, inheritRotation: true, inheritScale: true } },
+    { type: 'IK', schemas: COMPONENT_SCHEMAS.IK, defaults: {} },
+    { type: 'Skin', schemas: COMPONENT_SCHEMAS.Skin, defaults: {}, runtimeOnlyFields: ['deformedVertices'] },
     { type: 'Tilemap', schemas: COMPONENT_SCHEMAS.Tilemap, defaults: {} },
     { type: 'ParticleEmitter', schemas: COMPONENT_SCHEMAS.ParticleEmitter, defaults: {} },
     { type: 'BoxCollider', schemas: COMPONENT_SCHEMAS.BoxCollider, defaults: context => colliderDefaults(context, 'box'), normalize: normalizeCollider, runtimeOnlyFields: ['source', '*.source', 'colliders.*.source', 'shapes.*.source'] },
@@ -2359,6 +2965,8 @@
     sampleAnimationClip,
     validateAnimationDocument,
     assertAnimationDocument,
+    validateSkeletonDocument,
+    assertSkeletonDocument,
     createDefaultComponentRegistry,
     createDefaultEntityCodec
   });

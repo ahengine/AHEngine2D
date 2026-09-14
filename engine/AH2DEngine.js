@@ -21,7 +21,19 @@
       this.schemas = schemas;
       this.entities = new Set();
       this.components = new Map();
+      this.componentGenerations = new Map();
+      this.componentGenerationCounter = 0;
       this.destroyGuard = null;
+    }
+    _touchComponent(id, canonical) {
+      const store = this.componentGenerations.get(canonical) || new Map();
+      store.set(id, ++this.componentGenerationCounter);
+      this.componentGenerations.set(canonical, store);
+      return store.get(id);
+    }
+    componentGeneration(id, type) {
+      const canonical = this.schemas.resolve(type);
+      return canonical ? (this.componentGenerations.get(canonical)?.get(id) || 0) : 0;
     }
     bindDestroyGuard(guard) { this.destroyGuard = typeof guard === 'function' ? guard : null; return this; }
     create(id = uid()) {
@@ -44,7 +56,9 @@
         this.events.emit('entity:beforeDestroy', id);
       }
       this.entities.delete(id);
-      this.components.forEach(store => store.delete(id));
+      this.components.forEach((store, canonical) => {
+        if (store.delete(id)) this._touchComponent(id, canonical);
+      });
       if (options.emit !== false) this.events.emit('entity:destroy', id);
       return true;
     }
@@ -54,13 +68,21 @@
       const normalized = this.schemas.assert(canonical, value, { profile: DataModel.PROFILES.RUNTIME });
       if (!this.entities.has(id)) this.create(id);
       const store = this.components.get(canonical) || new Map();
-      store.set(id, normalized); this.components.set(canonical, store); return normalized;
+      store.set(id, normalized); this.components.set(canonical, store); this._touchComponent(id, canonical); return normalized;
     }
     get(id, type) { const canonical = this.schemas.resolve(type); return canonical ? this.components.get(canonical)?.get(id) : undefined; }
     has(id, type) { const canonical = this.schemas.resolve(type); return canonical ? (this.components.get(canonical)?.has(id) || false) : false; }
-    remove(id, type) { const canonical = this.schemas.resolve(type); if (canonical) this.components.get(canonical)?.delete(id); }
+    remove(id, type) {
+      const canonical = this.schemas.resolve(type);
+      if (canonical && this.components.get(canonical)?.delete(id)) this._touchComponent(id, canonical);
+    }
     query(...types) { return [...this.entities].filter(id => types.every(type => this.has(id, type))); }
-    clear() { this.entities.clear(); this.components.clear(); }
+    clear() {
+      this.entities.clear();
+      this.components.clear();
+      this.componentGenerations.clear();
+      this.componentGenerationCounter = 0;
+    }
   }
 
   const graphError = (code, message, details) => new DataModel.ComponentSchemaError(code, message, { details });
@@ -130,12 +152,22 @@
       const oldParent = this.getParent(child);
       if (oldParent === parent) return child;
       const preserveWorld = options.preserveWorld === true;
-      const preservedLocal = preserveWorld ? this._requireTransforms().computeLocalForParent(child, parent) : null;
+      const transforms = preserveWorld ? this._requireTransforms() : this.transforms;
+      const oldLocal = preserveWorld ? transforms.getLocal(child) : null;
+      const oldParentWorld = preserveWorld
+        ? (oldParent == null ? IDENTITY_MATRIX.slice() : transforms.getWorldMatrix(oldParent))
+        : null;
+      const preservedLocal = preserveWorld ? transforms.computeLocalForParent(child, parent) : null;
       this._setParent(child, parent);
       if (preservedLocal) this.transforms._applyLocal(child, preservedLocal);
       else this.transforms?.markDirty(child);
       this.transforms?.update();
-      this.events?.emit('graph:attach', { child, parent, oldParent, preserveWorld });
+      this.events?.emit('graph:attach', {
+        child, parent, oldParent, preserveWorld,
+        oldLocal: oldLocal ? { ...oldLocal } : null,
+        oldParentWorld: oldParentWorld ? oldParentWorld.slice() : null,
+        preservedLocal: preservedLocal ? { ...preservedLocal } : null
+      });
       return child;
     }
     reparent(child, parent = null, options = {}) { return this.attach(child, parent, options); }
@@ -268,15 +300,28 @@
       const targetParent = childPolicy === 'reparent' ? this.getParent(id) : null;
       const preserveWorld = options.preserveWorld === true;
       const prepared = preserveWorld
-        ? directChildren.map(child => [child, this._requireTransforms().computeLocalForParent(child, targetParent)])
+        ? directChildren.map(child => ({
+          child,
+          oldLocal: this._requireTransforms().getLocal(child),
+          oldParentWorld: this.transforms.getWorldMatrix(id),
+          local: this.transforms.computeLocalForParent(child, targetParent)
+        }))
         : [];
+      const preparedById = new Map(prepared.map(item => [item.child, item]));
       if (typeof options.beforeCommit === 'function') options.beforeCommit([id]);
       for (const child of directChildren) {
         const oldParent = this._setParent(child, targetParent);
-        emitGraph('graph:attach', { child, parent: targetParent, oldParent, preserveWorld });
+        const preparedChild = preparedById.get(child);
+        if (preparedChild) this.transforms._applyLocal(child, preparedChild.local);
+        else this.transforms?.markDirty(child);
+        emitGraph('graph:attach', {
+          child, parent: targetParent, oldParent, preserveWorld,
+          oldLocal: preparedChild ? { ...preparedChild.oldLocal } : null,
+          oldParentWorld: preparedChild ? preparedChild.oldParentWorld.slice() : null,
+          preservedLocal: preparedChild ? { ...preparedChild.local } : null
+        });
       }
-      for (const [child, local] of prepared) this.transforms._applyLocal(child, local);
-      if (!preserveWorld) directChildren.forEach(child => this.transforms?.markDirty(child));
+      this.transforms?.update();
       const parent = this.getParent(id);
       if (parent != null) this.children.get(parent)?.delete(id);
       this.parent.delete(id);
@@ -432,15 +477,20 @@
       }
       return values;
     }
-    _signature(transform) {
+    _signature(id, transform) {
       const value = this._localValues(transform);
-      return [value.x, value.y, value.rotation, value.scaleX, value.scaleY];
+      const bone = this.engine.ecs.get(id, 'Bone');
+      return [
+        value.x, value.y, value.rotation, value.scaleX, value.scaleY,
+        bone ? bone.inheritRotation !== false : null,
+        bone ? bone.inheritScale !== false : null
+      ];
     }
     _detectChanges() {
       const active = new Set(this.engine.ecs.query('Transform'));
       for (const id of active) {
         const transform = this.engine.ecs.get(id, 'Transform');
-        const signature = this._signature(transform);
+        const signature = this._signature(id, transform);
         const previous = this.localState.get(id);
         const previousWorld = this.worldState.get(id);
         if (!previous || signature.some((value, index) => value !== previous[index]) || !matricesEqual(transform.world, previousWorld)) {
@@ -494,10 +544,20 @@
         if (transform) {
           const local = this._localValues(transform);
           if (isDirty) {
-            world = multiply(parentWorld, matrix(local.x, local.y, local.rotation, local.scaleX, local.scaleY));
+            const bone = ecs.get(id, 'Bone');
+            if (bone && (bone.inheritRotation === false || bone.inheritScale === false)) {
+              const origin = transformPoint(parentWorld, { x: local.x, y: local.y });
+              const inherited = decompose(parentWorld, { strict: false });
+              const rotation = local.rotation + (bone.inheritRotation === false ? 0 : inherited.rotation);
+              const scaleX = local.scaleX * (bone.inheritScale === false ? 1 : inherited.scaleX);
+              const scaleY = local.scaleY * (bone.inheritScale === false ? 1 : inherited.scaleY);
+              world = matrix(origin.x, origin.y, rotation, scaleX, scaleY);
+            } else {
+              world = multiply(parentWorld, matrix(local.x, local.y, local.rotation, local.scaleX, local.scaleY));
+            }
             transform.world = world;
             this.worldState.set(id, world.slice());
-            this.localState.set(id, [local.x, local.y, local.rotation, local.scaleX, local.scaleY]);
+            this.localState.set(id, this._signature(id, transform));
             this.dirty.delete(id);
             changed.push(id);
           } else {
@@ -543,7 +603,10 @@
       const path = this.engine.graph.has(id) ? this.engine.graph.path(id) : [id];
       return path.reduce((rotation, entityId) => {
         const transform = this.engine.ecs.get(entityId, 'Transform');
-        return rotation + (transform ? this._localValues(transform).rotation : 0);
+        if (!transform) return rotation;
+        const localRotation = this._localValues(transform).rotation;
+        const bone = this.engine.ecs.get(entityId, 'Bone');
+        return bone?.inheritRotation === false ? localRotation : rotation + localRotation;
       }, 0);
     }
     getWorld(id) {
@@ -592,6 +655,27 @@
     computeLocalForParent(id, parentId = null, worldMatrix = null) {
       const current = this.getLocal(id);
       const world = worldMatrix ? assertMatrix(worldMatrix).slice() : this.getWorldMatrix(id);
+      const bone = this.engine.ecs.get(id, 'Bone');
+      if (parentId != null && bone && (bone.inheritRotation === false || bone.inheritScale === false)) {
+        const parentWorld = this.getWorldMatrix(parentId);
+        const origin = transformPoint(invert(parentWorld), { x: world[4], y: world[5] });
+        const desired = decompose(world, { strict: true, rotationHint: this._worldRotationHint(id) });
+        const inherited = decompose(parentWorld, { strict: false });
+        const parentScaleX = bone.inheritScale === false ? 1 : inherited.scaleX;
+        const parentScaleY = bone.inheritScale === false ? 1 : inherited.scaleY;
+        if (Math.abs(parentScaleX) <= MATRIX_EPSILON || Math.abs(parentScaleY) <= MATRIX_EPSILON) {
+          throw graphError('E_NON_INVERTIBLE_TRANSFORM', 'Inherited Bone scale is singular and cannot be converted to a local Transform', {
+            id, parentId, parentWorld
+          });
+        }
+        return {
+          x: origin.x,
+          y: origin.y,
+          rotation: desired.rotation - (bone.inheritRotation === false ? 0 : inherited.rotation),
+          scaleX: desired.scaleX / parentScaleX,
+          scaleY: desired.scaleY / parentScaleY
+        };
+      }
       const localMatrix = parentId == null ? world : multiply(invert(this.getWorldMatrix(parentId)), world);
       return decompose(localMatrix, { strict: true, rotationHint: current.rotation });
     }
@@ -800,6 +884,13 @@
               marker?.instanceRootId === ownerMarker.instanceRootId &&
               marker?.sourceEntityId === targetId) return candidateId;
         }
+        const exact = this.engine.ecs.get(targetId, 'PrefabInstance');
+        if (this.engine.ecs.entities.has(targetId) &&
+            exact?.prefabId === ownerMarker.prefabId && exact?.instanceRootId === ownerMarker.instanceRootId) return targetId;
+        // A marked Prefab Instance is an isolated reference namespace. Falling
+        // back to an unrelated Runtime Entity whose id happens to match the
+        // authored source id can animate another Instance (or the Scene).
+        return null;
       }
       return this.engine.ecs.entities.has(targetId) ? targetId : null;
     }
@@ -845,16 +936,49 @@
         if (track.type === 'position') {
           const transform = this.engine.ecs.get(targetId, 'Transform');
           if (transform && track.value && typeof track.value === 'object') {
-            if (Number.isFinite(Number(track.value.x))) transform.x = Number(track.value.x);
-            if (Number.isFinite(Number(track.value.y))) transform.y = Number(track.value.y);
+            const changed = [];
+            if (Number.isFinite(Number(track.value.x))) { transform.x = Number(track.value.x); changed.push('x'); }
+            if (Number.isFinite(Number(track.value.y))) { transform.y = Number(track.value.y); changed.push('y'); }
+            if (changed.length && this.engine.ecs.has(targetId, 'Bone')) this.engine.skeleton?.markBasePoseChanged(targetId, changed);
           }
         } else if (track.type === 'rotation') {
           const transform = this.engine.ecs.get(targetId, 'Transform');
           const rotation = track.value && typeof track.value === 'object' ? track.value.rotation : track.value;
-          if (transform && Number.isFinite(Number(rotation))) transform.rotation = Number(rotation);
+          if (transform && Number.isFinite(Number(rotation))) {
+            transform.rotation = Number(rotation);
+            if (this.engine.ecs.has(targetId, 'Bone')) this.engine.skeleton?.markBasePoseChanged(targetId, 'rotation');
+          }
         } else if (track.type === 'sprite' && track.value && typeof track.value === 'object') {
           const renderable = this.engine.ecs.get(targetId, 'Renderable');
           if (renderable) Object.assign(renderable, clone(track.value));
+        } else if (track.type === 'bone' && track.value && typeof track.value === 'object') {
+          const transform = this.engine.ecs.get(targetId, 'Transform');
+          if (transform && this.engine.ecs.has(targetId, 'Bone')) {
+            const changed = [];
+            for (const field of ['x', 'y', 'rotation', 'scaleX', 'scaleY']) {
+              if (Number.isFinite(Number(track.value[field]))) {
+                transform[field] = Number(track.value[field]);
+                changed.push(field);
+              }
+            }
+            if (changed.length) this.engine.skeleton?.markBasePoseChanged(targetId, changed);
+          }
+        } else if (track.type === 'ik' && track.value && typeof track.value === 'object') {
+          const transform = this.engine.ecs.get(targetId, 'Transform');
+          const ik = this.engine.ecs.get(targetId, 'IK');
+          if (transform) {
+            const changed = [];
+            if (Number.isFinite(Number(track.value.x))) { transform.x = Number(track.value.x); changed.push('x'); }
+            if (Number.isFinite(Number(track.value.y))) { transform.y = Number(track.value.y); changed.push('y'); }
+            if (changed.length && this.engine.ecs.has(targetId, 'Bone')) this.engine.skeleton?.markBasePoseChanged(targetId, changed);
+          }
+          if (ik) {
+            if (Number.isFinite(Number(track.value.mix))) ik.mix = clamp(Number(track.value.mix), 0, 1);
+            if (typeof track.value.enabled === 'boolean') ik.enabled = track.value.enabled;
+            if (Number.isInteger(Number(track.value.iterations)) && Number(track.value.iterations) > 0) ik.iterations = Number(track.value.iterations);
+            if (Number.isFinite(Number(track.value.tolerance)) && Number(track.value.tolerance) >= 0) ik.tolerance = Number(track.value.tolerance);
+            if (Number(track.value.bendDirection) === -1 || Number(track.value.bendDirection) === 1) ik.bendDirection = Number(track.value.bendDirection);
+          }
         }
       }
       const hitboxes = this._collectHitboxes(entityId, sample);
@@ -907,6 +1031,792 @@
           this.engine.events.emit('animation:complete', { entityId, clipId: clip.id, time: animation.time, frame: animation.frame, animation, engine: this.engine });
         } else if (animation.playing) animation.completed = false;
       });
+    }
+  }
+
+  /**
+   * Framework-neutral 2D skeletal runtime.
+   *
+   * Bone transforms remain ordinary Scene Graph local Transforms. Bind poses
+   * are kept in this Runtime-only cache so authoring documents never acquire
+   * inverse matrices. Skin vertices and their deformed output both use the
+   * Skin Entity's local coordinate space.
+   */
+  class SkeletonSystem {
+    constructor(engine) {
+      this.engine = engine;
+      this.bindings = new Map();
+      this.dirty = true;
+      this.suspendCount = 0;
+      this.ikBasePose = new Map();
+      this.ikSolvedPose = new Map();
+      this.basePoseChanged = new Map();
+      this.ikConstraintState = new Map();
+      this.engine.events.on('graph:attach', event => {
+        if (!this._graphAffectsSkeleton(event?.child)) return;
+        if (this.suspendCount > 0) { this.dirty = true; return; }
+        // SceneGraph.attach is a public Runtime mutation API. Capture its new
+        // bind structure before control returns to game code, rather than on
+        // the next frame after Animation has already sampled a pose.
+        if (this.dirty) this.rebind();
+        else this._rebindGraphScope(event);
+      });
+    }
+    suspend() { this.suspendCount += 1; return this; }
+    resume(options = {}) {
+      this.suspendCount = Math.max(0, this.suspendCount - 1);
+      if (this.suspendCount === 0 && this.dirty && options.rebind !== false) this.rebind();
+      return this;
+    }
+    _graphAffectsSkeleton(childId) {
+      const stores = this.engine.ecs.components;
+      if (!(stores.get('Skeleton')?.size || stores.get('Bone')?.size || stores.get('Skin')?.size)) return false;
+      const relevant = id => this.engine.ecs.has(id, 'Skeleton') || this.engine.ecs.has(id, 'Bone') || this.engine.ecs.has(id, 'Skin');
+      const id = childId == null ? null : String(childId);
+      return Boolean(id && (relevant(id) || (this.engine.graph.has(id) && this.engine.graph.traverse(id).some(relevant))));
+    }
+    _nearestSkeleton(id) {
+      let current = id == null ? null : String(id);
+      const seen = new Set();
+      while (current != null && !seen.has(current)) {
+        seen.add(current);
+        if (this.engine.ecs.has(current, 'Skeleton')) return current;
+        current = this.engine.graph.has(current) ? this.engine.graph.getParent(current) : null;
+      }
+      return null;
+    }
+    _graphScope(event) {
+      const skeletonIds = new Set();
+      const boneIds = new Set();
+      const skinIds = new Set();
+      const child = event?.child == null ? null : String(event.child);
+      const moved = child && this.engine.graph.has(child) ? this.engine.graph.traverse(child) : (child ? [child] : []);
+      for (const id of moved) {
+        if (this.engine.ecs.has(id, 'Skeleton')) skeletonIds.add(id);
+        if (this.engine.ecs.has(id, 'Bone')) {
+          boneIds.add(id);
+          const owner = this._owningSkeletonEntity(id);
+          if (owner) skeletonIds.add(owner);
+        }
+        if (this.engine.ecs.has(id, 'Skin')) skinIds.add(id);
+      }
+      for (const id of [event?.parent, event?.oldParent]) {
+        const skeletonId = this._nearestSkeleton(id);
+        if (skeletonId) skeletonIds.add(skeletonId);
+      }
+      for (const skeletonId of skeletonIds) this.listBones(skeletonId).forEach(id => boneIds.add(id));
+      for (const skinId of this.engine.ecs.query('Skin')) {
+        const skin = this.engine.ecs.get(skinId, 'Skin');
+        const skeletonId = this.resolveReference(skinId, skin?.skeletonRootId);
+        if (skeletonIds.has(skeletonId)) skinIds.add(skinId);
+      }
+      return { skeletonIds, boneIds, skinIds };
+    }
+    _rebindGraphScope(event) {
+      const scope = this._graphScope(event);
+      this._remapIKBaseForGraph(event);
+      this.engine.transform.update();
+      for (const skinId of scope.skinIds) this._reconcileBinding(skinId);
+      for (const skeletonId of scope.skeletonIds) this._poseFor(skeletonId);
+      return scope;
+    }
+    clear() {
+      this.bindings.clear();
+      this.dirty = true;
+      this._resetIKPose();
+      return this;
+    }
+    _resetIKPose(boneIds = null) {
+      if (boneIds == null) {
+        this.ikBasePose.clear();
+        this.ikSolvedPose.clear();
+        this.basePoseChanged.clear();
+        this.ikConstraintState.clear();
+        return this;
+      }
+      const reset = new Set([...boneIds].map(String));
+      for (const id of reset) {
+        this.ikBasePose.delete(id);
+        this.ikSolvedPose.delete(id);
+        this.basePoseChanged.delete(id);
+      }
+      for (const [ikId, state] of this.ikConstraintState) {
+        if ((state?.bones || []).some(id => reset.has(id))) this.ikConstraintState.delete(ikId);
+      }
+      return this;
+    }
+    markBasePoseChanged(boneId, fields = ['x', 'y', 'rotation', 'scaleX', 'scaleY']) {
+      if (boneId == null) return this;
+      const id = String(boneId);
+      const changed = this.basePoseChanged.get(id) || new Set();
+      const requested = Array.isArray(fields) ? fields : [fields];
+      for (const field of requested) {
+        if (['x', 'y', 'rotation', 'scaleX', 'scaleY'].includes(field)) changed.add(field);
+      }
+      if (changed.size) this.basePoseChanged.set(id, changed);
+      return this;
+    }
+    _localBonePose(boneId) {
+      const transform = this.engine.ecs.get(boneId, 'Transform');
+      if (!transform) return null;
+      return {
+        x: finite(transform.x, 0),
+        y: finite(transform.y, 0),
+        rotation: finite(transform.rotation ?? transform.rot, 0),
+        scaleX: finite(transform.scaleX ?? transform.sx, 1),
+        scaleY: finite(transform.scaleY ?? transform.sy, 1)
+      };
+    }
+    _mergeIKBasePose(boneId, current = this._localBonePose(boneId)) {
+      if (!current) return null;
+      const solved = this.ikSolvedPose.get(boneId);
+      const changed = this.basePoseChanged.get(boneId);
+      const previous = this.ikBasePose.get(boneId);
+      const base = previous ? { ...previous } : { ...current };
+      if (previous) {
+        for (const field of ['x', 'y', 'rotation', 'scaleX', 'scaleY']) {
+          // Animation declares precisely which local fields it authored this
+          // frame. Unmarked differences still support direct gameplay edits,
+          // while fields left at the last IK result restore from the stable
+          // unconstrained pose instead of accumulating mix every update.
+          if (changed?.has(field) || !solved || current[field] !== solved[field]) base[field] = current[field];
+        }
+      }
+      this.ikBasePose.set(boneId, base);
+      this.basePoseChanged.delete(boneId);
+      return base;
+    }
+    _restoreIKBasePose(boneIds) {
+      for (const boneId of boneIds) {
+        const base = this._mergeIKBasePose(boneId);
+        const transform = this.engine.ecs.get(boneId, 'Transform');
+        if (!base || !transform) continue;
+        Object.assign(transform, base);
+        if (Object.prototype.hasOwnProperty.call(transform, 'rot')) transform.rot = base.rotation;
+        if (Object.prototype.hasOwnProperty.call(transform, 'sx')) transform.sx = base.scaleX;
+        if (Object.prototype.hasOwnProperty.call(transform, 'sy')) transform.sy = base.scaleY;
+        this.engine.transform.markDirty(boneId);
+      }
+      this.engine.transform.update();
+    }
+    _captureIKSolvedPose(boneIds) {
+      for (const boneId of boneIds) {
+        const pose = this._localBonePose(boneId);
+        if (pose) this.ikSolvedPose.set(boneId, pose);
+      }
+    }
+    _worldFromBoneLocal(boneId, pose, parentWorld) {
+      const local = {
+        x: finite(pose?.x, 0), y: finite(pose?.y, 0),
+        rotation: finite(pose?.rotation, 0),
+        scaleX: finite(pose?.scaleX, 1), scaleY: finite(pose?.scaleY, 1)
+      };
+      const bone = this.engine.ecs.get(boneId, 'Bone');
+      if (bone && (bone.inheritRotation === false || bone.inheritScale === false)) {
+        const origin = transformPoint(parentWorld, local);
+        const inherited = decompose(parentWorld, { strict: false });
+        return matrix(
+          origin.x,
+          origin.y,
+          local.rotation + (bone.inheritRotation === false ? 0 : inherited.rotation),
+          local.scaleX * (bone.inheritScale === false ? 1 : inherited.scaleX),
+          local.scaleY * (bone.inheritScale === false ? 1 : inherited.scaleY)
+        );
+      }
+      return multiply(parentWorld, matrix(local.x, local.y, local.rotation, local.scaleX, local.scaleY));
+    }
+    _remapIKBaseForGraph(event) {
+      const boneId = event?.child == null ? null : String(event.child);
+      if (!event?.preserveWorld || !boneId || !this.ikBasePose.has(boneId) || !this.engine.ecs.has(boneId, 'Transform')) return false;
+      try {
+        const oldLocal = event.oldLocal && typeof event.oldLocal === 'object' ? event.oldLocal : this._localBonePose(boneId);
+        const base = this._mergeIKBasePose(boneId, oldLocal);
+        const oldParentWorld = Array.isArray(event.oldParentWorld) && event.oldParentWorld.length === 6
+          ? event.oldParentWorld.slice()
+          : IDENTITY_MATRIX.slice();
+        const baseWorld = this._worldFromBoneLocal(boneId, base, oldParentWorld);
+        const remapped = this.engine.transform.computeLocalForParent(boneId, event.parent ?? null, baseWorld);
+        this.ikBasePose.set(boneId, {
+          x: remapped.x, y: remapped.y, rotation: remapped.rotation,
+          scaleX: remapped.scaleX, scaleY: remapped.scaleY
+        });
+        const solved = this._localBonePose(boneId);
+        if (solved) this.ikSolvedPose.set(boneId, solved);
+        return true;
+      } catch (error) {
+        this.engine.events.emit('skeleton:error', { type: 'ik-reparent', boneId, error, engine: this.engine });
+        return false;
+      }
+    }
+    _releaseInactiveIKBones(activeBones) {
+      const active = activeBones instanceof Set ? activeBones : new Set(activeBones || []);
+      const cached = new Set([...this.ikBasePose.keys(), ...this.ikSolvedPose.keys(), ...this.basePoseChanged.keys()]);
+      const released = [...cached].filter(id => !active.has(id));
+      this._restoreIKBasePose(released.filter(id => this.engine.ecs.has(id, 'Transform')));
+      for (const boneId of released) {
+        this.ikBasePose.delete(boneId);
+        this.ikSolvedPose.delete(boneId);
+        this.basePoseChanged.delete(boneId);
+      }
+      return released;
+    }
+    invalidate() {
+      this.dirty = true;
+      return this;
+    }
+    _marker(id) { return this.engine.ecs.get(id, 'PrefabInstance') || null; }
+    resolveReference(ownerId, authoredId) {
+      const reference = String(authoredId == null ? '' : authoredId).trim();
+      if (!reference) return null;
+      const owner = this._marker(ownerId);
+      if (owner?.prefabId && owner?.instanceRootId) {
+        for (const candidateId of this.engine.ecs.query('PrefabInstance')) {
+          const candidate = this._marker(candidateId);
+          if (candidate?.prefabId === owner.prefabId &&
+              candidate?.instanceRootId === owner.instanceRootId &&
+              candidate?.sourceEntityId === reference) return candidateId;
+        }
+        const exact = this._marker(reference);
+        if (this.engine.ecs.entities.has(reference) &&
+            exact?.prefabId === owner.prefabId && exact?.instanceRootId === owner.instanceRootId) return reference;
+        return null;
+      }
+      return this.engine.ecs.entities.has(reference) ? reference : null;
+    }
+    _samePrefabGroup(ownerId, candidateId) {
+      const owner = this._marker(ownerId);
+      if (!owner?.prefabId || !owner?.instanceRootId) return true;
+      const candidate = this._marker(candidateId);
+      return Boolean(candidate?.prefabId === owner.prefabId && candidate?.instanceRootId === owner.instanceRootId);
+    }
+    _skeletonEntity(reference) {
+      if (reference != null) {
+        const id = String(reference);
+        if (this.engine.ecs.has(id, 'Skeleton')) return id;
+        if (this.engine.ecs.has(id, 'Bone')) {
+          return this.engine.ecs.query('Skeleton').find(skeletonId => this.listBones(skeletonId).includes(id)) || null;
+        }
+        return null;
+      }
+      return this.engine.ecs.query('Skeleton')[0] || null;
+    }
+    _owningSkeletonEntity(entityId) {
+      // A root may intentionally carry both Skeleton and Bone. In that valid
+      // compact representation the nearest owning Skeleton is the Entity
+      // itself, not an enclosing rig.
+      if (this.engine.ecs.has(entityId, 'Skeleton') && this.engine.ecs.has(entityId, 'Bone')) return String(entityId);
+      let current = this.engine.graph.has(entityId) ? this.engine.graph.getParent(entityId) : null;
+      const seen = new Set();
+      while (current != null && !seen.has(current)) {
+        seen.add(current);
+        if (this.engine.ecs.has(current, 'Skeleton')) return current;
+        current = this.engine.graph.getParent(current);
+      }
+      return null;
+    }
+    _rootBoneId(skeletonId) {
+      const skeleton = this.engine.ecs.get(skeletonId, 'Skeleton');
+      if (!skeleton) return null;
+      const authoredRootId = String(skeleton.rootBoneId == null ? '' : skeleton.rootBoneId).trim();
+      if (authoredRootId) {
+        const referenced = this.resolveReference(skeletonId, authoredRootId);
+        return referenced && this.engine.ecs.has(referenced, 'Bone') && this._owningSkeletonEntity(referenced) === skeletonId
+          ? referenced
+          : null;
+      }
+      if (this.engine.ecs.has(skeletonId, 'Bone')) return skeletonId;
+      if (!this.engine.graph.has(skeletonId)) return null;
+      return this.engine.graph.getChildren(skeletonId).find(id =>
+        this.engine.ecs.has(id, 'Bone') &&
+        this._owningSkeletonEntity(id) === skeletonId &&
+        this._samePrefabGroup(skeletonId, id)
+      ) || null;
+    }
+    listBones(reference = null) {
+      if (reference == null) return this.engine.ecs.query('Bone');
+      const direct = String(reference);
+      const skeletonId = this.engine.ecs.has(direct, 'Skeleton') ? direct : this._skeletonEntity(direct);
+      const rootId = skeletonId ? this._rootBoneId(skeletonId) : (this.engine.ecs.has(direct, 'Bone') ? direct : null);
+      if (!rootId || !this.engine.graph.has(rootId)) return [];
+      const output = [];
+      this.engine.graph.traverse(rootId, id => {
+        if (id !== rootId && this.engine.ecs.has(id, 'Skeleton')) return false;
+        if (this.engine.ecs.has(id, 'Bone') &&
+            (!skeletonId || (this._owningSkeletonEntity(id) === skeletonId && this._samePrefabGroup(skeletonId, id)))) output.push(id);
+        return true;
+      });
+      return output;
+    }
+    _poseFor(skeletonId) {
+      const skeleton = this.engine.ecs.get(skeletonId, 'Skeleton');
+      if (!skeleton) return null;
+      const boneIds = this.listBones(skeletonId);
+      const boneSet = new Set(boneIds);
+      const pose = {};
+      const boneMatrices = {};
+      for (const id of boneIds) {
+        const bone = this.engine.ecs.get(id, 'Bone');
+        const local = this.engine.transform.getLocal(id);
+        const world = this.engine.transform.getWorldMatrix(id);
+        let parentBoneId = this.engine.graph.getParent(id);
+        while (parentBoneId != null && !boneSet.has(parentBoneId)) parentBoneId = this.engine.graph.getParent(parentBoneId);
+        const length = Math.max(0, finite(bone?.length, 0));
+        pose[id] = {
+          id,
+          parentId: parentBoneId || null,
+          length,
+          local: {
+            x: local.x, y: local.y, rotation: local.rotation,
+            scaleX: local.scaleX, scaleY: local.scaleY
+          },
+          world: world.slice(),
+          tip: transformPoint(world, { x: length, y: 0 })
+        };
+        boneMatrices[id] = world.slice();
+      }
+      skeleton.pose = pose;
+      skeleton.boneMatrices = boneMatrices;
+      return pose;
+    }
+    _refreshPoses() {
+      const output = {};
+      for (const id of this.engine.ecs.query('Skeleton')) output[id] = this._poseFor(id) || {};
+      return output;
+    }
+    getPose(reference = null) {
+      this.engine.transform.update();
+      if (reference == null) {
+        this._refreshPoses();
+        return Object.fromEntries(this.engine.ecs.query('Skeleton').map(id => [id, clone(this.engine.ecs.get(id, 'Skeleton')?.pose || {})]));
+      }
+      const skeletonId = this._skeletonEntity(reference);
+      return skeletonId ? clone(this._poseFor(skeletonId) || {}) : null;
+    }
+    _bindingSignature(skinId, skin) {
+      const references = [];
+      for (const vertex of skin.vertices || []) {
+        for (const influence of vertex?.weights || []) {
+          references.push([String(influence?.boneId || ''), this.resolveReference(skinId, influence?.boneId)]);
+        }
+      }
+      return JSON.stringify({ skeletonRootId: skin.skeletonRootId || '', vertices: skin.vertices || [], references });
+    }
+    _referenceMap(skinId, skin) {
+      const output = new Map();
+      const skeletonRootId = this.resolveReference(skinId, skin.skeletonRootId);
+      for (const vertex of skin.vertices || []) {
+        for (const influence of vertex?.weights || []) {
+          const authoredId = String(influence?.boneId || '');
+          if (!output.has(authoredId)) {
+            const boneId = this.resolveReference(skinId, authoredId);
+            output.set(authoredId, boneId && this._owningSkeletonEntity(boneId) === skeletonRootId ? boneId : null);
+          }
+        }
+      }
+      return output;
+    }
+    _bindingTopologySignature(skinId, skin, references = this._referenceMap(skinId, skin)) {
+      const skeletonRootId = this.resolveReference(skinId, skin.skeletonRootId);
+      return JSON.stringify({
+        skeletonRootId,
+        skinGeneration: this.engine.ecs.componentGeneration(skinId, 'Skin'),
+        references: [...references].map(([authoredId, boneId]) => [
+          authoredId,
+          boneId,
+          Boolean(boneId && this.engine.ecs.has(boneId, 'Bone')),
+          boneId && this.engine.graph.has(boneId) ? this.engine.graph.getParent(boneId) : null,
+          boneId ? this.engine.ecs.componentGeneration(boneId, 'Bone') : 0
+        ])
+      });
+    }
+    _captureBinding(skinId) {
+      const skin = this.engine.ecs.get(skinId, 'Skin');
+      if (!skin) { this.bindings.delete(skinId); return null; }
+      const skinWorld = this.engine.transform.getWorldMatrix(skinId);
+      const inverseBindMatrices = new Map();
+      const referenceMap = this._referenceMap(skinId, skin);
+      const referenced = new Set(referenceMap.values());
+      for (const boneId of referenced) {
+        if (!this.engine.ecs.has(boneId, 'Bone')) continue;
+        try { inverseBindMatrices.set(boneId, invert(this.engine.transform.getWorldMatrix(boneId))); }
+        catch (error) {
+          this.engine.events.emit('skeleton:error', { type: 'bind', skinId, boneId, error, engine: this.engine });
+        }
+      }
+      const binding = {
+        skinId,
+        skinGeneration: this.engine.ecs.componentGeneration(skinId, 'Skin'),
+        signature: this._bindingSignature(skinId, skin),
+        topologySignature: this._bindingTopologySignature(skinId, skin, referenceMap),
+        skinWorld: skinWorld.slice(),
+        inverseBindMatrices,
+        boneGenerations: new Map([...inverseBindMatrices.keys()].map(id => [id, this.engine.ecs.componentGeneration(id, 'Bone')])),
+        referenceMap
+      };
+      this.bindings.set(skinId, binding);
+      skin.deformedVertices = (skin.vertices || []).map(vertex => ({ x: finite(vertex?.x, 0), y: finite(vertex?.y, 0) }));
+      this.engine.events.emit('skeleton:bind', { skinId, boneIds: [...inverseBindMatrices.keys()], engine: this.engine });
+      return binding;
+    }
+    _reconcileBinding(skinId) {
+      const skin = this.engine.ecs.get(skinId, 'Skin');
+      if (!skin) { this.bindings.delete(skinId); return null; }
+      const current = this.bindings.get(skinId);
+      if (!current) return this._captureBinding(skinId);
+      const skinGeneration = this.engine.ecs.componentGeneration(skinId, 'Skin');
+      if (current.skinGeneration !== skinGeneration) return this._captureBinding(skinId);
+      const referenceMap = this._referenceMap(skinId, skin);
+      const topologySignature = this._bindingTopologySignature(skinId, skin, referenceMap);
+      if (current.topologySignature === topologySignature) return current;
+      const inverseBindMatrices = new Map();
+      for (const boneId of new Set(referenceMap.values())) {
+        if (!boneId || !this.engine.ecs.has(boneId, 'Bone')) continue;
+        const generation = this.engine.ecs.componentGeneration(boneId, 'Bone');
+        const preserved = current.boneGenerations?.get(boneId) === generation
+          ? current.inverseBindMatrices.get(boneId)
+          : null;
+        if (preserved) {
+          inverseBindMatrices.set(boneId, preserved);
+          continue;
+        }
+        try { inverseBindMatrices.set(boneId, invert(this.engine.transform.getWorldMatrix(boneId))); }
+        catch (error) {
+          this.engine.events.emit('skeleton:error', { type: 'bind', skinId, boneId, error, engine: this.engine });
+        }
+      }
+      const binding = {
+        skinId,
+        skinGeneration,
+        signature: this._bindingSignature(skinId, skin),
+        topologySignature,
+        // A graph mutation changes the current pose, not the authored bind
+        // space. Preserve both it and every still-valid inverse bind; only a
+        // newly introduced Bone reference is captured at its current pose.
+        skinWorld: current.skinWorld.slice(),
+        inverseBindMatrices,
+        boneGenerations: new Map([...inverseBindMatrices.keys()].map(id => [id, this.engine.ecs.componentGeneration(id, 'Bone')])),
+        referenceMap
+      };
+      this.bindings.set(skinId, binding);
+      this.engine.events.emit('skeleton:bind', { skinId, boneIds: [...inverseBindMatrices.keys()], reconciled: true, engine: this.engine });
+      return binding;
+    }
+    reconcileBindings() {
+      this.engine.transform.update();
+      const live = new Set(this.engine.ecs.query('Skin'));
+      for (const skinId of live) this._reconcileBinding(skinId);
+      for (const skinId of [...this.bindings.keys()]) if (!live.has(skinId)) this.bindings.delete(skinId);
+      this.dirty = false;
+      this._refreshPoses();
+      return [...live];
+    }
+    prepareDestroy(entityIds) {
+      const ids = (entityIds || []).map(String);
+      return {
+        relevant: ids.some(id => this.engine.ecs.has(id, 'Skeleton') || this.engine.ecs.has(id, 'Bone') || this.engine.ecs.has(id, 'Skin') || this.engine.ecs.has(id, 'IK')),
+        boneIds: ids.filter(id => this.engine.ecs.has(id, 'Bone')),
+        skinIds: ids.filter(id => this.engine.ecs.has(id, 'Skin')),
+        ikIds: ids.filter(id => this.engine.ecs.has(id, 'IK'))
+      };
+    }
+    finishDestroy(impact) {
+      if (!impact) return this;
+      for (const skinId of impact.skinIds || []) this.bindings.delete(skinId);
+      this._resetIKPose(impact.boneIds || []);
+      if (impact.relevant) {
+        const activeBones = new Set(this.engine.ecs.query('IK').flatMap(id => this._ikChain(id)));
+        this._releaseInactiveIKBones(activeBones);
+        this.reconcileBindings();
+      }
+      return this;
+    }
+    _skinsFor(reference = null) {
+      const skins = this.engine.ecs.query('Skin');
+      if (reference == null) return skins;
+      const id = String(reference);
+      if (this.engine.ecs.has(id, 'Skin')) return [id];
+      const skeletonId = this._skeletonEntity(id);
+      if (!skeletonId) return [];
+      return skins.filter(skinId => this.resolveReference(skinId, this.engine.ecs.get(skinId, 'Skin')?.skeletonRootId) === skeletonId);
+    }
+    rebind(reference = null) {
+      this.engine.transform.update();
+      const skinIds = this._skinsFor(reference);
+      for (const skinId of skinIds) this._captureBinding(skinId);
+      if (reference == null) {
+        const live = new Set(skinIds);
+        for (const skinId of [...this.bindings.keys()]) if (!live.has(skinId)) this.bindings.delete(skinId);
+        this.dirty = false;
+      }
+      this._refreshPoses();
+      return skinIds;
+    }
+    load() {
+      this.bindings.clear();
+      this.dirty = true;
+      this._resetIKPose();
+      this.engine.transform.update();
+      this.rebind();
+      this.deform();
+      return this;
+    }
+    _ensureBinding(skinId) {
+      const skin = this.engine.ecs.get(skinId, 'Skin');
+      if (!skin) return null;
+      const current = this.bindings.get(skinId);
+      // Mesh edits deliberately require rebind(); avoid serializing every
+      // weighted vertex on every Runtime frame merely to rediscover that the
+      // authored bind topology did not change.
+      if (!current) return this._captureBinding(skinId);
+      const referenceMap = this._referenceMap(skinId, skin);
+      return current.topologySignature === this._bindingTopologySignature(skinId, skin, referenceMap)
+        ? current
+        : this._reconcileBinding(skinId);
+    }
+    _targetPoint(ikId) {
+      const matrixValue = this.engine.transform.getWorldMatrix(ikId);
+      return { x: matrixValue[4], y: matrixValue[5] };
+    }
+    _endPoint(chain) {
+      const lastId = chain[chain.length - 1];
+      const length = Math.max(0, finite(this.engine.ecs.get(lastId, 'Bone')?.length, 0));
+      return transformPoint(this.engine.transform.getWorldMatrix(lastId), { x: length, y: 0 });
+    }
+    _ikChain(ikId, ik = this.engine.ecs.get(ikId, 'IK')) {
+      const skeletonId = this.resolveReference(ikId, ik?.skeletonRootId);
+      return (ik?.bones || [])
+        .map(reference => this.resolveReference(ikId, reference))
+        .filter((id, index, values) => id && values.indexOf(id) === index &&
+          this.engine.ecs.has(id, 'Bone') && this.engine.ecs.has(id, 'Transform') &&
+          this._owningSkeletonEntity(id) === skeletonId);
+    }
+    _solveOne(ikId) {
+      const ik = this.engine.ecs.get(ikId, 'IK');
+      if (!ik) return null;
+      const skeletonId = this.resolveReference(ikId, ik.skeletonRootId);
+      const skeleton = skeletonId ? this.engine.ecs.get(skeletonId, 'Skeleton') : null;
+      const chain = this._ikChain(ikId, ik);
+      const target = this._targetPoint(ikId);
+      const mix = clamp(finite(ik.mix, 1), 0, 1);
+      const iterations = Math.max(1, Math.floor(finite(ik.iterations, 12)));
+      const tolerance = Math.max(0, finite(ik.tolerance, 0.5));
+      const enabled = Boolean(skeleton && ik.enabled !== false && skeleton.enabled !== false && skeleton.solveIK !== false);
+      let end = chain.length ? this._endPoint(chain) : { x: NaN, y: NaN };
+      let distance = Math.hypot(target.x - end.x, target.y - end.y);
+      let usedIterations = 0;
+      if (enabled && mix > 0 && chain.length) {
+        const bendDirection = Number(ik.bendDirection) === -1 ? -1 : 1;
+        const originalRotations = new Map(chain.map(boneId => {
+          const transform = this.engine.ecs.get(boneId, 'Transform');
+          return [boneId, finite(transform.rotation ?? transform.rot, 0)];
+        }));
+        if (chain.length > 1) {
+          const rootWorld = this.engine.transform.getWorldMatrix(chain[0]);
+          const root = { x: rootWorld[4], y: rootWorld[5] };
+          const toEnd = { x: end.x - root.x, y: end.y - root.y };
+          const toTarget = { x: target.x - root.x, y: target.y - root.y };
+          // CCD is singular when a perfectly straight chain must contract on
+          // its own axis. A tiny deterministic bend selects the requested
+          // elbow side and lets the ordinary iterations converge.
+          if (Math.abs(cross(toEnd, toTarget)) <= MATRIX_EPSILON &&
+              dot(toEnd, toTarget) > 0 &&
+              Math.hypot(toTarget.x, toTarget.y) + tolerance < Math.hypot(toEnd.x, toEnd.y)) {
+            const seedId = chain[0];
+            const seed = this.engine.ecs.get(seedId, 'Transform');
+            seed.rotation = finite(seed.rotation ?? seed.rot, 0) + bendDirection * 0.1;
+            if (Object.prototype.hasOwnProperty.call(seed, 'rot')) seed.rot = seed.rotation;
+            this.engine.transform.markDirty(seedId);
+            this.engine.transform.update();
+            end = this._endPoint(chain);
+            distance = Math.hypot(target.x - end.x, target.y - end.y);
+          }
+        }
+        for (let iteration = 0; iteration < iterations && distance > tolerance; iteration += 1) {
+          usedIterations = iteration + 1;
+          for (let index = chain.length - 1; index >= 0; index -= 1) {
+            const boneId = chain[index];
+            const boneWorld = this.engine.transform.getWorldMatrix(boneId);
+            const origin = { x: boneWorld[4], y: boneWorld[5] };
+            end = this._endPoint(chain);
+            const toEnd = { x: end.x - origin.x, y: end.y - origin.y };
+            const toTarget = { x: target.x - origin.x, y: target.y - origin.y };
+            if (Math.hypot(toEnd.x, toEnd.y) <= MATRIX_EPSILON || Math.hypot(toTarget.x, toTarget.y) <= MATRIX_EPSILON) continue;
+            let radians = Math.atan2(cross(toEnd, toTarget), dot(toEnd, toTarget));
+            if (Math.abs(cross(toEnd, toTarget)) <= MATRIX_EPSILON && dot(toEnd, toTarget) < 0) radians = Math.PI * bendDirection;
+            const transform = this.engine.ecs.get(boneId, 'Transform');
+            transform.rotation = finite(transform.rotation ?? transform.rot, 0) + radians * RAD_TO_DEG;
+            if (Object.prototype.hasOwnProperty.call(transform, 'rot')) transform.rot = transform.rotation;
+            this.engine.transform.markDirty(boneId);
+            this.engine.transform.update();
+          }
+          end = this._endPoint(chain);
+          distance = Math.hypot(target.x - end.x, target.y - end.y);
+        }
+        if (mix < 1) {
+          for (const boneId of chain) {
+            const transform = this.engine.ecs.get(boneId, 'Transform');
+            const original = originalRotations.get(boneId);
+            const solved = finite(transform.rotation ?? transform.rot, original);
+            const delta = ((solved - original + 540) % 360) - 180;
+            transform.rotation = original + delta * mix;
+            if (Object.prototype.hasOwnProperty.call(transform, 'rot')) transform.rot = transform.rotation;
+            this.engine.transform.markDirty(boneId);
+          }
+          this.engine.transform.update();
+          end = this._endPoint(chain);
+          distance = Math.hypot(target.x - end.x, target.y - end.y);
+        }
+      }
+      const result = { ikId, skeletonRootId: skeletonId, bones: chain.slice(), target, end, distance, iterations: usedIterations, enabled, mix };
+      this.engine.events.emit('skeleton:ik', { ...result, engine: this.engine });
+      return result;
+    }
+    solve(reference = null) {
+      this.engine.transform.update();
+      const allIds = this.engine.ecs.query('IK');
+      const nextConstraintState = new Map(allIds.map(id => [id, {
+        generation: this.engine.ecs.componentGeneration(id, 'IK'),
+        bones: this._ikChain(id)
+      }]));
+      const activeBones = new Set([...nextConstraintState.values()].flatMap(state => state.bones));
+      // Constraints and Bone membership can disappear through low-level ECS
+      // component mutation without an Entity lifecycle event. Restore any Bone
+      // leaving every active chain before forgetting its stable pre-IK pose.
+      this._releaseInactiveIKBones(activeBones);
+      let ids = allIds;
+      if (reference != null) {
+        const id = String(reference);
+        if (this.engine.ecs.has(id, 'IK')) ids = [id];
+        else {
+          const skeletonId = this._skeletonEntity(id);
+          ids = skeletonId ? ids.filter(ikId => this.resolveReference(ikId, this.engine.ecs.get(ikId, 'IK')?.skeletonRootId) === skeletonId) : [];
+        }
+      }
+      const constrainedBones = [...new Set(ids.flatMap(id => nextConstraintState.get(id)?.bones || []))];
+      this._restoreIKBasePose(constrainedBones);
+      const results = ids.map(id => this._solveOne(id)).filter(Boolean);
+      this.engine.transform.update();
+      this._captureIKSolvedPose(constrainedBones);
+      this.ikConstraintState = nextConstraintState;
+      this._refreshPoses();
+      return reference != null && results.length <= 1 ? (results[0] || null) : results;
+    }
+    _deformOne(skinId) {
+      const skin = this.engine.ecs.get(skinId, 'Skin');
+      const binding = this._ensureBinding(skinId);
+      if (!skin || !binding) return null;
+      let inverseSkinWorld;
+      try { inverseSkinWorld = invert(this.engine.transform.getWorldMatrix(skinId)); }
+      catch (error) {
+        this.engine.events.emit('skeleton:error', { type: 'skin', skinId, error, engine: this.engine });
+        return null;
+      }
+      const references = binding.referenceMap || this._referenceMap(skinId, skin);
+      const deformMatrices = new Map();
+      for (const boneId of new Set(references.values())) {
+        const inverseBind = binding.inverseBindMatrices.get(boneId);
+        if (!boneId || !inverseBind || !this.engine.ecs.has(boneId, 'Bone')) continue;
+        deformMatrices.set(boneId, multiply(
+          inverseSkinWorld,
+          multiply(this.engine.transform.getWorldMatrix(boneId), multiply(inverseBind, binding.skinWorld))
+        ));
+      }
+      const output = (skin.vertices || []).map(vertex => {
+        const source = { x: finite(vertex?.x, 0), y: finite(vertex?.y, 0) };
+        let x = 0, y = 0, total = 0;
+        for (const influence of vertex?.weights || []) {
+          const weight = Math.max(0, finite(influence?.weight, 0));
+          if (!(weight > 0)) continue;
+          const boneId = references.get(String(influence?.boneId || ''));
+          const deformMatrix = deformMatrices.get(boneId);
+          if (!deformMatrix) continue;
+          const point = transformPoint(deformMatrix, source);
+          x += point.x * weight;
+          y += point.y * weight;
+          total += weight;
+        }
+        return total > MATRIX_EPSILON ? { x: x / total, y: y / total } : source;
+      });
+      skin.deformedVertices = output;
+      this.engine.events.emit('skeleton:skin', { skinId, vertices: clone(output), engine: this.engine });
+      return output;
+    }
+    deform(reference = null) {
+      this.engine.transform.update();
+      if (this.dirty) this.rebind();
+      const ids = this._skinsFor(reference);
+      const output = ids.map(id => ({ skinId: id, vertices: this._deformOne(id) })).filter(item => item.vertices);
+      return reference != null && output.length <= 1 ? (output[0]?.vertices || null) : output;
+    }
+    update() {
+      if (this.dirty) this.rebind();
+      const ik = this.solve();
+      this.engine.transform.update();
+      const skins = this.deform();
+      return { ik, skins, poses: this._refreshPoses() };
+    }
+    snapshot() {
+      if (this.dirty) this.rebind();
+      return {
+        bindings: [...this.bindings.values()].map(binding => ({
+          skinId: binding.skinId,
+          signature: binding.signature,
+          skinWorld: binding.skinWorld.slice(),
+          inverseBindMatrices: Object.fromEntries([...binding.inverseBindMatrices].map(([id, value]) => [id, value.slice()]))
+        })),
+        ikBasePose: Object.fromEntries([...this.ikBasePose].map(([id, pose]) => [id, clone(pose)])),
+        ikSolvedPose: Object.fromEntries([...this.ikSolvedPose].map(([id, pose]) => [id, clone(pose)])),
+        basePoseChanged: Object.fromEntries([...this.basePoseChanged].map(([id, fields]) => [id, [...fields]]))
+      };
+    }
+    restore(snapshot) {
+      if (!snapshot || !Array.isArray(snapshot.bindings)) return false;
+      this.bindings.clear();
+      for (const item of snapshot.bindings) {
+        if (!item || !this.engine.ecs.has(item.skinId, 'Skin') || !Array.isArray(item.skinWorld) || item.skinWorld.length !== 6) continue;
+        const inverseBindMatrices = new Map();
+        for (const [id, value] of Object.entries(item.inverseBindMatrices || {})) {
+          if (this.engine.ecs.has(id, 'Bone') && Array.isArray(value) && value.length === 6 && value.every(Number.isFinite)) inverseBindMatrices.set(id, value.slice());
+        }
+        this.bindings.set(item.skinId, {
+          skinId: item.skinId,
+          skinGeneration: this.engine.ecs.componentGeneration(item.skinId, 'Skin'),
+          signature: this._bindingSignature(item.skinId, this.engine.ecs.get(item.skinId, 'Skin')),
+          topologySignature: this._bindingTopologySignature(item.skinId, this.engine.ecs.get(item.skinId, 'Skin')),
+          skinWorld: item.skinWorld.slice(),
+          inverseBindMatrices,
+          boneGenerations: new Map([...inverseBindMatrices.keys()].map(id => [id, this.engine.ecs.componentGeneration(id, 'Bone')])),
+          referenceMap: this._referenceMap(item.skinId, this.engine.ecs.get(item.skinId, 'Skin'))
+        });
+      }
+      const restorePoseMap = source => new Map(Object.entries(source || {}).flatMap(([id, pose]) => {
+        if (!this.engine.ecs.has(id, 'Bone') || !pose || !['x', 'y', 'rotation', 'scaleX', 'scaleY'].every(field => Number.isFinite(pose[field]))) return [];
+        return [[id, clone(pose)]];
+      }));
+      this.ikBasePose = restorePoseMap(snapshot.ikBasePose);
+      this.ikSolvedPose = restorePoseMap(snapshot.ikSolvedPose);
+      this.basePoseChanged = new Map();
+      const savedChanges = snapshot.basePoseChanged;
+      if (Array.isArray(savedChanges)) {
+        for (const id of savedChanges) if (this.engine.ecs.has(id, 'Bone')) {
+          this.basePoseChanged.set(id, new Set(['x', 'y', 'rotation', 'scaleX', 'scaleY']));
+        }
+      } else {
+        for (const [id, fields] of Object.entries(savedChanges || {})) {
+          if (!this.engine.ecs.has(id, 'Bone') || !Array.isArray(fields)) continue;
+          const valid = fields.filter(field => ['x', 'y', 'rotation', 'scaleX', 'scaleY'].includes(field));
+          if (valid.length) this.basePoseChanged.set(id, new Set(valid));
+        }
+      }
+      this.ikConstraintState = new Map(this.engine.ecs.query('IK').map(id => [id, {
+        generation: this.engine.ecs.componentGeneration(id, 'IK'),
+        bones: this._ikChain(id)
+      }]));
+      this.dirty = false;
+      this.engine.transform.update();
+      this._refreshPoses();
+      this.deform();
+      return true;
     }
   }
 
@@ -2542,7 +3452,11 @@
       visualHost.sortableChildren = false;
       node.addChild(visualHost);
       node.addChild(childrenHost);
-      record = { node, visualHost, childrenHost, visual: null, visualKind: null, sourceKey: null, textureGeneration: 0, ownedTexture: null };
+      record = {
+        node, visualHost, childrenHost,
+        visual: null, visualKind: null, sourceKey: null,
+        textureGeneration: 0, ownedTexture: null, ownedGeometry: null, geometryKey: null
+      };
       this.nodes.set(id, record);
       return record;
     }
@@ -2550,7 +3464,7 @@
       const record = this.nodes.get(id);
       if (!record) return;
       record.textureGeneration += 1;
-      this._releaseOwnedTexture(record);
+      this._destroyVisual(record);
       // Entity nodes live below their parent's childrenHost. Detach them before
       // destroying this record so deleting/reparenting a parent cannot
       // recursively destroy DisplayObjects that still exist in the ECS graph.
@@ -2717,27 +3631,44 @@
       if (!record.visual) return;
       this._releaseOwnedTexture(record);
       record.visualHost.removeChild?.(record.visual);
+      // Some older wrappers model Geometry as a directly-owned Mesh field and
+      // destroy it from Mesh.destroy(). Detach that shape when possible so the
+      // adapter remains the single owner. Pixi v8 exposes an accessor instead;
+      // its Mesh only unsubscribes and AH2D destroys the Geometry below.
+      if (record.ownedGeometry && Object.prototype.hasOwnProperty.call(record.visual, 'geometry') &&
+          record.visual.geometry === record.ownedGeometry) record.visual.geometry = null;
       record.visual.destroy?.({ texture: false, textureSource: false, baseTexture: false });
+      // Pixi v8 deliberately treats Geometry as shareable and does not destroy
+      // it with Mesh. AH2D creates one Geometry per Skin visual, so it owns and
+      // releases it. The destroyed guard also keeps older adapters/mocks whose
+      // Mesh.destroy() releases Geometry from doing so twice.
+      if (record.ownedGeometry && record.ownedGeometry.destroyed !== true) record.ownedGeometry.destroy?.();
+      record.ownedGeometry = null;
       record.visual = null;
       record.visualKind = null;
+      record.geometryKey = null;
       record.textureGeneration += 1;
     }
-    _createVisual(record, kind) {
+    _createVisual(record, kind, geometry = null) {
       if (record.visual && record.visualKind === kind) return record.visual;
       this._destroyVisual(record);
-      record.visual = kind === 'graphics'
-        ? new this.PIXI.Graphics()
-        : this._createSprite(this._whiteTexture());
+      if (kind === 'graphics') record.visual = new this.PIXI.Graphics();
+      else if (kind === 'mesh') {
+        try { record.visual = new this.PIXI.Mesh({ geometry, texture: this._whiteTexture() }); }
+        catch (_) { record.visual = new this.PIXI.Mesh(geometry, this._whiteTexture()); }
+        record.ownedGeometry = geometry;
+      } else record.visual = this._createSprite(this._whiteTexture());
       record.visualKind = kind;
       record.visualHost.addChild(record.visual);
       return record.visual;
     }
-    _setTexture(record, renderable, id) {
+    _setTexture(record, renderable, id, options = {}) {
       const { key, source, sourceRect, hasTexture } = this._textureSource(renderable);
-      if (record.sourceKey === key && record.visual) return;
+      const kind = options.kind || null;
+      if (record.sourceKey === key && record.visual && (!kind || record.visualKind === kind)) return;
       record.sourceKey = key;
       record.textureGeneration += 1;
-      if (!hasTexture && this.PIXI.Graphics) {
+      if (!hasTexture && this.PIXI.Graphics && kind !== 'mesh') {
         this._createVisual(record, 'graphics');
         this.objects.set(id, record.visual);
         return;
@@ -2748,7 +3679,7 @@
         resolved = this._whiteTexture();
         this.engine.events.emit('runtime:textureError', { runtime: this, entityId: id, source, error, engine: this.engine });
       }
-      this._createVisual(record, 'sprite');
+      this._createVisual(record, kind || 'sprite', options.geometry || null);
       this.objects.set(id, record.visual);
       const textureGeneration = ++record.textureGeneration;
       if (resolved && typeof resolved.then === 'function') {
@@ -2765,6 +3696,84 @@
         });
       } else this._assignTexture(record, resolved || this._whiteTexture(), sourceRect);
     }
+    _supportsSkinMesh() {
+      return typeof this.PIXI?.Mesh === 'function' && typeof this.PIXI?.MeshGeometry === 'function';
+    }
+    _skinGeometryData(skin) {
+      const vertices = Array.isArray(skin?.deformedVertices) && skin.deformedVertices.length === skin?.vertices?.length
+        ? skin.deformedVertices
+        : skin?.vertices;
+      if (!Array.isArray(vertices) || vertices.length < 3) return null;
+      const positions = new Float32Array(vertices.length * 2);
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (let index = 0; index < vertices.length; index += 1) {
+        const x = Number(vertices[index]?.x), y = Number(vertices[index]?.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+        positions[index * 2] = x;
+        positions[index * 2 + 1] = y;
+        minX = Math.min(minX, x); minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+      }
+      let uvs;
+      if (Array.isArray(skin.uvs) && skin.uvs.length === positions.length && skin.uvs.every(value => Number.isFinite(Number(value)))) {
+        uvs = new Float32Array(skin.uvs.map(Number));
+      } else {
+        const width = Math.max(MATRIX_EPSILON, maxX - minX), height = Math.max(MATRIX_EPSILON, maxY - minY);
+        uvs = new Float32Array(vertices.length * 2);
+        for (let index = 0; index < vertices.length; index += 1) {
+          uvs[index * 2] = (positions[index * 2] - minX) / width;
+          uvs[index * 2 + 1] = (positions[index * 2 + 1] - minY) / height;
+        }
+      }
+      const authoredIndices = Array.isArray(skin.indices) ? skin.indices.map(Number) : [];
+      const generated = [];
+      if (!authoredIndices.length) {
+        for (let index = 1; index + 1 < vertices.length; index += 1) generated.push(0, index, index + 1);
+      }
+      const indexValues = authoredIndices.length ? authoredIndices : generated;
+      if (indexValues.length < 3 || indexValues.length % 3 !== 0 ||
+          indexValues.some(value => !Number.isInteger(value) || value < 0 || value >= vertices.length)) return null;
+      const indices = new Uint32Array(indexValues);
+      return { positions, uvs, indices };
+    }
+    _syncSkinMesh(id, record, skin, renderable = null) {
+      if (!this._supportsSkinMesh()) return false;
+      const data = this._skinGeometryData(skin);
+      if (!data) return false;
+      const geometryKey = JSON.stringify({
+        count: data.positions.length,
+        uvs: Array.from(data.uvs),
+        indices: Array.from(data.indices)
+      });
+      if (!record.visual || record.visualKind !== 'mesh' || record.geometryKey !== geometryKey) {
+        let geometry = null;
+        try {
+          geometry = new this.PIXI.MeshGeometry({ positions: data.positions, uvs: data.uvs, indices: data.indices });
+          if (record.visual) this._destroyVisual(record);
+          this._createVisual(record, 'mesh', geometry);
+          record.geometryKey = geometryKey;
+          record.sourceKey = null;
+        } catch (error) {
+          geometry?.destroy?.();
+          this.engine.events.emit('runtime:skinMeshError', { runtime: this, entityId: id, error, engine: this.engine });
+          return false;
+        }
+      } else if (record.visual.geometry) {
+        try { record.visual.geometry.positions = data.positions; }
+        catch (_) {
+          const buffer = record.visual.geometry.getBuffer?.('aPosition') || record.visual.geometry.getBuffer?.('position');
+          if (buffer) { buffer.data = data.positions; buffer.update?.(); }
+        }
+      }
+      const textureInput = { ...(renderable || {}), assetId: skin.assetId || renderable?.assetId };
+      this._setTexture(record, textureInput, id, { kind: 'mesh', geometry: record.visual.geometry });
+      const visual = record.visual;
+      visual.tint = this._color(renderable?.tint ?? renderable?.color, 0xffffff);
+      visual.alpha = clamp(finite(renderable?.alpha ?? renderable?.opacity, 1), 0, 1);
+      visual.blendMode = renderable?.blendMode ?? 'normal';
+      this.objects.set(id, visual);
+      return true;
+    }
     _drawGraphics(graphics, width, height, color, anchorX = 0.5, anchorY = 0.5) {
       graphics.clear?.();
       const x = -width * anchorX, y = -height * anchorY;
@@ -2778,6 +3787,18 @@
     }
     _syncRenderable(id, record) {
       const renderable = this.engine.ecs.get(id, 'Renderable');
+      const skin = this.engine.ecs.get(id, 'Skin');
+      if (skin && this._syncSkinMesh(id, record, skin, renderable)) {
+        record.node.visible = !(this.engine.ecs.has(id, 'Hidden') || renderable?.visible === false);
+        record.node.alpha = 1;
+        record.node.zIndex = finite(renderable?.zIndex ?? renderable?.zOrder ?? renderable?.layer, 0);
+        return;
+      }
+      if (record.visualKind === 'mesh') {
+        this._destroyVisual(record);
+        record.sourceKey = null;
+        this.objects.delete(id);
+      }
       if (!renderable) {
         if (record.visual) {
           this._destroyVisual(record);
@@ -3009,6 +4030,186 @@
     }
     _removeMarker(entity) {
       return this.engine.entityCodec.remove(entity, 'PrefabInstance', { allLocations: true });
+    }
+    _remapReference(value, ids) {
+      return typeof value === 'string' && ids.has(value) ? ids.get(value) : value;
+    }
+    _remapRigEntityReferences(entity, ids, options = {}) {
+      if (!options.force && this._marker(entity)) return entity;
+      const skeleton = this.engine.entityCodec.resolve(entity, 'Skeleton');
+      if (isPlainObject(skeleton.value) && typeof skeleton.value.rootBoneId === 'string' && ids.has(skeleton.value.rootBoneId)) {
+        this.engine.entityCodec.write(entity, 'Skeleton', {
+          ...skeleton.value,
+          rootBoneId: ids.get(skeleton.value.rootBoneId)
+        }, { storage: 'preserve', profile: DataModel.PROFILES.AUTHORING });
+      }
+      const ik = this.engine.entityCodec.resolve(entity, 'IK');
+      if (isPlainObject(ik.value)) {
+        const next = clone(ik.value);
+        let changed = false;
+        if (typeof next.skeletonRootId === 'string' && ids.has(next.skeletonRootId)) {
+          next.skeletonRootId = ids.get(next.skeletonRootId);
+          changed = true;
+        }
+        if (Array.isArray(next.bones)) {
+          next.bones = next.bones.map(reference => {
+            const remapped = this._remapReference(reference, ids);
+            changed = changed || remapped !== reference;
+            return remapped;
+          });
+        }
+        if (changed) this.engine.entityCodec.write(entity, 'IK', next, { storage: 'preserve', profile: DataModel.PROFILES.AUTHORING });
+      }
+      const skin = this.engine.entityCodec.resolve(entity, 'Skin');
+      if (isPlainObject(skin.value)) {
+        const next = clone(skin.value);
+        let changed = false;
+        if (typeof next.skeletonRootId === 'string' && ids.has(next.skeletonRootId)) {
+          next.skeletonRootId = ids.get(next.skeletonRootId);
+          changed = true;
+        }
+        if (Array.isArray(next.vertices)) {
+          next.vertices = next.vertices.map(vertex => {
+            if (!isPlainObject(vertex) || !Array.isArray(vertex.weights)) return vertex;
+            return {
+              ...vertex,
+              weights: vertex.weights.map(weight => {
+                if (!isPlainObject(weight) || typeof weight.boneId !== 'string' || !ids.has(weight.boneId)) return weight;
+                changed = true;
+                return { ...weight, boneId: ids.get(weight.boneId) };
+              })
+            };
+          });
+        }
+        if (changed) this.engine.entityCodec.write(entity, 'Skin', next, { storage: 'preserve', profile: DataModel.PROFILES.AUTHORING });
+      }
+      return entity;
+    }
+    _animationClipForBinding(document, animation) {
+      if (!isPlainObject(animation) || !Array.isArray(document.animations)) return null;
+      const stable = typeof animation.clipId === 'string' ? animation.clipId.trim() : '';
+      if (stable) return document.animations.find(clip => isPlainObject(clip) && clip.id === stable) || null;
+      const legacy = typeof animation.clip === 'string' ? animation.clip.trim() : '';
+      if (!legacy) return null;
+      const direct = document.animations.find(clip => isPlainObject(clip) && clip.id === legacy);
+      if (direct) return direct;
+      const folded = legacy.toLocaleLowerCase();
+      const matches = document.animations.filter(clip => isPlainObject(clip) && typeof clip.name === 'string' && clip.name.toLocaleLowerCase() === folded);
+      return matches.length === 1 ? matches[0] : null;
+    }
+    _remapAnimationClipTargets(clip, ids) {
+      const next = clone(clip);
+      let changed = false;
+      const remapTarget = target => {
+        if (!isPlainObject(target) || typeof target.targetEntityId !== 'string' || !ids.has(target.targetEntityId)) return;
+        target.targetEntityId = ids.get(target.targetEntityId);
+        changed = true;
+      };
+      remapTarget(next);
+      for (const track of Array.isArray(next.tracks) ? next.tracks : []) remapTarget(track);
+      return changed ? next : null;
+    }
+    _uniqueAnimationCloneIdentity(document, source, suffix) {
+      const animations = Array.isArray(document.animations) ? document.animations : (document.animations = []);
+      const ids = new Set(animations.filter(isPlainObject).map(clip => clip.id));
+      const names = new Set(animations.filter(isPlainObject).map(clip => String(clip.name || '').toLocaleLowerCase()));
+      const suffixId = String(suffix || 'copy').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'copy';
+      const idBase = `${String(source.id || 'animation')}-${suffixId}`;
+      let id = idBase, idIndex = 2;
+      while (ids.has(id)) id = `${idBase}-${idIndex++}`;
+      const nameBase = `${String(source.name || source.id || 'Animation')} ${String(suffix || 'Copy')}`.trim();
+      let name = nameBase, nameIndex = 2;
+      while (names.has(name.toLocaleLowerCase())) name = `${nameBase} ${nameIndex++}`;
+      return { id, name };
+    }
+    _cloneRemappedAnimationBindings(document, entities, ids, options = {}) {
+      if (!Array.isArray(document.animations) || !document.animations.length) return { ids: [], bySource: new Map() };
+      const clones = new Map();
+      const created = [];
+      for (const entity of entities) {
+        if (!options.force && this._marker(entity)) continue;
+        const resolved = this.engine.entityCodec.resolve(entity, 'Animation');
+        const animation = resolved.value;
+        const source = this._animationClipForBinding(document, animation);
+        if (!source) continue;
+        if (!clones.has(source.id)) {
+          const remapped = this._remapAnimationClipTargets(source, ids);
+          if (!remapped) clones.set(source.id, null);
+          else {
+            const identity = this._uniqueAnimationCloneIdentity(document, source, options.suffix || 'Unpacked');
+            remapped.id = identity.id;
+            remapped.name = identity.name;
+            document.animations.push(remapped);
+            clones.set(source.id, remapped);
+            created.push(remapped.id);
+          }
+        }
+        const copiedClip = clones.get(source.id);
+        if (!copiedClip) continue;
+        const next = { ...animation, clipId: copiedClip.id };
+        if (Object.prototype.hasOwnProperty.call(next, 'clip')) next.clip = copiedClip.id;
+        this.engine.entityCodec.write(entity, 'Animation', next, { storage: 'preserve', profile: DataModel.PROFILES.AUTHORING });
+      }
+      return { ids: created, bySource: new Map([...clones].filter(([, clip]) => clip).map(([sourceId, clip]) => [sourceId, clip.id])) };
+    }
+    _unpackMembers(document, members) {
+      const markerValue = member => member?.marker?.value || member?.marker || {};
+      const ids = new Map(members.map(member => [String(markerValue(member).sourceEntityId), member.entity.id]));
+      const entities = members.map(member => member.entity);
+      for (const entity of entities) this._remapRigEntityReferences(entity, ids, { force: true });
+      const animationClips = this._cloneRemappedAnimationBindings(document, entities, ids, { force: true, suffix: 'Unpacked' });
+      for (const entity of entities) this._removeMarker(entity);
+      return { entityIds: entities.map(entity => entity.id), entities, animationClipIds: animationClips.ids, animationClones: animationClips.bySource, idMap: ids };
+    }
+    _animationBindingUsesClip(document, entity, clipId) {
+      const animation = this.engine.entityCodec.resolve(entity, 'Animation').value;
+      return this._animationClipForBinding(document, animation)?.id === clipId;
+    }
+    _rebindAnimationClip(entity, clipId) {
+      const animation = this.engine.entityCodec.resolve(entity, 'Animation').value;
+      if (!isPlainObject(animation)) return false;
+      const next = { ...animation, clipId };
+      if (Object.prototype.hasOwnProperty.call(next, 'clip')) next.clip = clipId;
+      this.engine.entityCodec.write(entity, 'Animation', next, { storage: 'preserve', profile: DataModel.PROFILES.AUTHORING });
+      return true;
+    }
+    _adoptDetachedAnimationClips(document, deletedPrefab, detachedGroups) {
+      if (!Array.isArray(document.animations) || !detachedGroups.length) return [];
+      const candidates = new Map();
+      for (const detached of detachedGroups) {
+        for (const [sourceClipId, cloneClipId] of detached.animationClones) {
+          if (!candidates.has(sourceClipId)) candidates.set(sourceClipId, []);
+          candidates.get(sourceClipId).push({ detached, cloneClipId });
+        }
+      }
+      const externalEntities = [];
+      for (const { objects } of this._scopes(document)) externalEntities.push(...objects);
+      for (const prefab of Array.isArray(document.prefabs) ? document.prefabs : []) {
+        if (prefab !== deletedPrefab) externalEntities.push(...(Array.isArray(prefab?.entities) ? prefab.entities : []));
+      }
+      const adopted = [];
+      for (const [sourceClipId, options] of candidates) {
+        if (externalEntities.some(entity => this._animationBindingUsesClip(document, entity, sourceClipId))) continue;
+        const sourceIndex = document.animations.findIndex(clip => isPlainObject(clip) && clip.id === sourceClipId);
+        if (sourceIndex < 0) continue;
+        const selected = options[0];
+        const remapped = this._remapAnimationClipTargets(document.animations[sourceIndex], selected.detached.idMap);
+        if (!remapped) continue;
+        remapped.id = sourceClipId;
+        remapped.name = document.animations[sourceIndex].name;
+        document.animations[sourceIndex] = remapped;
+        for (const entity of selected.detached.entities) {
+          if (this._animationBindingUsesClip(document, entity, selected.cloneClipId)) this._rebindAnimationClip(entity, sourceClipId);
+        }
+        const cloneStillBound = [...externalEntities, ...detachedGroups.flatMap(group => group.entities)]
+          .some(entity => this._animationBindingUsesClip(document, entity, selected.cloneClipId));
+        if (!cloneStillBound) {
+          const cloneIndex = document.animations.findIndex(clip => isPlainObject(clip) && clip.id === selected.cloneClipId);
+          if (cloneIndex >= 0) document.animations.splice(cloneIndex, 1);
+        }
+        adopted.push(sourceClipId);
+      }
+      return adopted;
     }
     _scopes(document) {
       return (Array.isArray(document.scenes) ? document.scenes : [])
@@ -3516,7 +4717,17 @@
           prefabId, instanceRootIds: [...new Set(linked.map(item => item.marker.instanceRootId))]
         });
       }
-      if (options.unpackInstances === true) linked.forEach(item => this._removeMarker(item.entity));
+      if (options.unpackInstances === true) {
+        const groups = new Map();
+        for (const item of linked) {
+          const key = `${item.sceneId}\u0000${item.marker.prefabId}\u0000${item.marker.instanceRootId}`;
+          const members = groups.get(key) || [];
+          members.push(item);
+          groups.set(key, members);
+        }
+        const detachedGroups = [...groups.values()].map(members => this._unpackMembers(document, members));
+        this._adoptDetachedAnimationClips(document, asset, detachedGroups);
+      }
       document.prefabs.splice(document.prefabs.indexOf(asset), 1);
       const instanceRootIds = [...new Set(linked.map(item => item.marker.instanceRootId))];
       this._commit(document, 'prefab:assetDelete', { prefabId, instanceRootIds, unpacked: options.unpackInstances === true });
@@ -3798,11 +5009,11 @@
       const marker = this._marker(entity);
       if (!marker) throw prefabError('E_PREFAB_NOT_INSTANCE', `Entity is not part of a Prefab instance: ${entityId}`, { entityId });
       const members = this._instanceMembers(scene.objects, marker.value);
-      members.forEach(item => this._removeMarker(item.entity));
+      const detached = this._unpackMembers(document, members);
       const result = {
         prefabId: marker.value.prefabId,
         instanceRootId: marker.value.instanceRootId,
-        entityIds: members.map(item => item.entity.id)
+        entityIds: detached.entityIds
       };
       this._commit(document, 'prefab:unpack', result);
       return clone(result);
@@ -3850,6 +5061,7 @@
       this.lighting = new LightingSystem(this);
       this.shadows = new ShadowSystem(this);
       this.animation = new AnimationSystem(this);
+      this.skeleton = new SkeletonSystem(this);
       this.postProcess = new PostProcessSystem(this);
       this.tilemap = new TilemapSystem(this);
       this.prefabs = new PrefabSystem(this);
@@ -3943,11 +5155,13 @@
       this._destroyInProgress = true;
       try {
         const graphEvents = [], physicsEvents = [];
+        let skeletonImpact = null;
         const removed = this.graph.remove(id, {
           ...options,
           [GRAPH_INTERNAL]: true,
           eventQueue: graphEvents,
           beforeCommit: entityIds => {
+            skeletonImpact = this.skeleton.prepareDestroy(entityIds);
             for (const entityId of entityIds) this.events.emit('entity:beforeDestroy', entityId);
           }
         });
@@ -3967,6 +5181,7 @@
         for (const [type, payload] of graphEvents) emitCommitted(type, payload);
         for (const [type, payload] of physicsEvents) emitCommitted(type, payload);
         for (const entityId of removed) emitCommitted('entity:destroy', entityId);
+        try { this.skeleton.finishDestroy(skeletonImpact); } catch (error) { retainFirstError(error); }
         emitCommitted('entity:destroyTree', {
           rootId: id,
           entities: removed.slice(),
@@ -4021,6 +5236,9 @@
         DataModel.assertPrefabDocument(source, { entityCodec: this.entityCodec });
       }
       DataModel.assertAnimationDocument(source, { entityCodec: this.entityCodec });
+      if (typeof DataModel.assertSkeletonDocument === 'function') {
+        DataModel.assertSkeletonDocument(source, { entityCodec: this.entityCodec });
+      }
       const scenes = Array.isArray(source.scenes) ? source.scenes : [];
       const requestedSceneId = options.sceneId || source.currentSceneId || source.meta?.currentSceneId || null;
       const activeScene = scenes.length
@@ -4110,6 +5328,8 @@
       this.ecs.clear(); this.graph.clear({ [GRAPH_INTERNAL]: true });
       stagedEcs.entities.forEach(id => this.ecs.entities.add(id));
       stagedEcs.components.forEach((store, type) => this.ecs.components.set(type, store));
+      stagedEcs.componentGenerations.forEach((store, type) => this.ecs.componentGenerations.set(type, new Map(store)));
+      this.ecs.componentGenerationCounter = stagedEcs.componentGenerationCounter;
       stagedGraph.nodes.forEach(id => this.graph.nodes.add(id));
       stagedGraph.parent.forEach((parent, child) => this.graph.parent.set(child, parent));
       stagedGraph.children.forEach((children, id) => this.graph.children.set(id, children));
@@ -4123,11 +5343,19 @@
       };
       for (const [type, payload] of physicsEvents) emitCommitted(type, payload);
       emitCommitted('postprocess:change', { postProcess: this.postProcess, engine: this });
-      decodedEntities.forEach(decoded => {
-        emitCommitted('entity:create', decoded.id);
-        emitCommitted('graph:attach', { child: decoded.id, parent: decoded.parentId });
-        if (decoded.conflicts.length) emitCommitted('component:conflict', { entityId: decoded.id, conflicts: clone(decoded.conflicts) });
-      });
+      this.skeleton.suspend();
+      try {
+        decodedEntities.forEach(decoded => {
+          emitCommitted('entity:create', decoded.id);
+          emitCommitted('graph:attach', { child: decoded.id, parent: decoded.parentId });
+          if (decoded.conflicts.length) emitCommitted('component:conflict', { entityId: decoded.id, conflicts: clone(decoded.conflicts) });
+        });
+      } finally {
+        this.skeleton.resume({ rebind: false });
+      }
+      // Capture the authored bind pose only after every local/world Transform
+      // is committed, and before an autoplay Animation can sample a Bone.
+      this.skeleton.load();
       if (transformedEntities.length) emitCommitted('transform:update', { entities: transformedEntities.slice(), engine: this });
       emitCommitted('document:load', source);
       if (activeScene) emitCommitted('scene:change', { id: activeScene.id, name: activeScene.name || 'Scene', scene: activeScene, engine: this });
@@ -4166,10 +5394,14 @@
       dt = clamp(finite(dt, 0), 0, 0.25);
       this.animation.update(dt);
       this.transform.update();
+      this.skeleton.solve();
+      this.transform.update();
       this.physics.sync(this, 'before');
       this.physics.step(dt, this);
       this.physics.sync(this, 'after');
       this.transform.update();
+      this.skeleton.deform();
+      this.skeleton._refreshPoses();
       this.events.emit('engine:update', { dt, engine: this });
       return this;
     }
@@ -4180,6 +5412,7 @@
         runtime: clone(this.export()),
         physics: clone(this.physics.snapshot()),
         physicsAdapter: this.physics.name,
+        skeleton: clone(this.skeleton.snapshot()),
         animationTime: this.animation.time,
         activeCamera: this.camera.active,
         activeSceneId: this.activeSceneId
@@ -4200,10 +5433,13 @@
       this.animation.time = finite(snapshot.animationTime, 0);
       this.camera.active = snapshot.activeCamera || null;
       this.transform.update();
+      if (snapshot.skeleton) this.skeleton.restore(snapshot.skeleton);
       this.physics.sync(this, 'before');
       if (snapshot.physics) this.physics.restore(snapshot.physics);
       this.physics.sync(this, 'after');
       this.transform.update();
+      this.skeleton.deform();
+      this.skeleton._refreshPoses();
       this.events.emit('runtime:restore', { snapshot, engine: this });
       return true;
     }
@@ -4306,7 +5542,7 @@
     normalizeAnimationClip: DataModel.normalizeAnimationClip,
     normalizeAnimationClips: DataModel.normalizeAnimationClips,
     sampleAnimationClip: DataModel.sampleAnimationClip,
-    LightingSystem, ShadowSystem, AnimationSystem, PostProcessSystem, TilemapSystem,
+    LightingSystem, ShadowSystem, AnimationSystem, SkeletonSystem, PostProcessSystem, TilemapSystem,
     DEFAULT_POST_PROCESS_EFFECTS, createDefaultPostProcess, PrefabSystem,
     BODY_TYPES, COLLIDER_SHAPES, PhysicsAdapter, Box2DPhysicsAdapter,
     RuntimeAdapter, PixiRuntimeAdapter, PhaserRuntimeAdapter, CustomRuntimeAdapter,

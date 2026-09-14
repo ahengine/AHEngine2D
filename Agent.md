@@ -343,7 +343,7 @@ function updateHealthSystem(engine) {
 
 ## Gameplay loop rules
 
-AH2D has built-in Transform, Animation Clip sampling/playback, Physics, Camera, Lighting, Shadow, and Tilemap systems. It does not yet have an automatic Script/Behavior scheduler.
+AH2D has built-in Transform, Animation Clip sampling/playback, Skeleton/FK/IK/Skinning, Physics, Camera, Lighting, Shadow, and Tilemap systems. It does not yet have an automatic Script/Behavior scheduler.
 
 If gameplay must affect the current physics step, run it before `engine.update(dt)`:
 
@@ -440,7 +440,7 @@ engine.start(target, { restoreOnStop: true });
 await engine.runtime.ready;
 ```
 
-The adapter creates one `PIXI.Container` for every Scene Graph Entity, mirrors parent/child links, applies exact local matrices, and creates a centered `PIXI.Sprite` or a color `PIXI.Graphics` child for `Renderable`. It reconciles Entity creation, deletion, reparenting, `Hidden`, `Renderable.visible`, and layer order on render. Do not add a second host loop that duplicates this synchronization.
+The adapter creates one `PIXI.Container` for every Scene Graph Entity, mirrors parent/child links, applies exact local matrices, and creates a centered `PIXI.Sprite`, color `PIXI.Graphics`, or real `PIXI.Mesh` for a renderable Skin. It reconciles Entity creation, deletion, reparenting, `Hidden`, `Renderable.visible`, Skin vertex-buffer deformation, and layer order on render. Do not add a second host loop that duplicates this synchronization.
 
 The default texture path is `Renderable.imageSrc`, then the matching `assetId` in `engine.document.assets`, then a directly usable `assetId`. Loading uses `PIXI.Assets.load()` and is asynchronous. A `textureResolver(renderable, entityId, engine, PIXI)` may return a Texture, a Promise for one, or a preloaded alias. Keep global `PIXI.Assets` ownership in the game host; the adapter deliberately does not destroy shared textures when an Entity disappears. Use `loadAssets: false` only when the host has preloaded every source.
 
@@ -450,7 +450,7 @@ Use `designWidth`/`designHeight` or `viewport: { width, height, fit }` for the l
 
 If PixiJS is unavailable or initialization fails, `runtime.backend` reports `editor-bridge` and `runtime.native` is false. Do not claim native rendering based only on `runtime.name`. Handle `runtime:error`, `runtime:fallback`, and `runtime:textureError` when the host needs error UI or recovery.
 
-PixiJS currently maps Transform, Renderable, Hidden, hierarchy, Camera, and resize. When `Renderable.sourceRect` is present, the adapter creates and reuses a cropped Pixi subtexture for that rectangle. A bare `Renderable.frame` number is not enough to derive a crop without sprite-sheet metadata supplied by the Asset or host. Particle rendering, Light/Shadow, Tilemap drawing, and Post Process filters remain host responsibilities.
+PixiJS currently maps Transform, Renderable, Skin mesh, Hidden, hierarchy, Camera, and resize. When `Renderable.sourceRect` is present, the adapter creates and reuses a cropped Pixi subtexture for that rectangle. A bare `Renderable.frame` number is not enough to derive a crop without sprite-sheet metadata supplied by the Asset or host. Particle rendering, Light/Shadow, Tilemap drawing, and Post Process filters remain host responsibilities.
 
 ### PhaserJS
 
@@ -464,6 +464,11 @@ console.log(engine.runtime.backend); // phaserjs or editor-bridge
 ## Animation, prefab, and particle rules
 
 - The built-in AnimationSystem advances each bound clip, samples/interpolates its tracks, applies Position and Rotation to local `Transform`, applies Sprite values to `Renderable`, stores sampled Hitbox state on `Animation`, and dispatches Event Track entries through the Engine event bus.
+- Bone Tracks write local Bone transforms; IK Tracks write the target Transform and constraint settings. Runtime order is Animation, Transform/FK, CCD IK, Transform, Physics, final Transform, then linear-blend Skinning.
+- A rig root has `Skeleton`; each nested bone Entity has `Bone + Transform`; an IK target has `IK + Transform`; a skinned mesh has `Skin` and normally `Renderable`. Read [`docs/SKELETONS.md`](./docs/SKELETONS.md) before changing these schemas or solve/bind behavior.
+- Keep authored Skin vertices in Skin-local space and Bone transforms local to `parentId`. `Skeleton.pose`, `Skeleton.boneMatrices`, inverse bind matrices, and `Skin.deformedVertices` are derived Runtime state, never authoring truth.
+- Capture or deliberately rebuild the bind pose with `engine.skeleton.rebind()` only when mesh topology/binding changes. Do not rebind every frame or after Animation has already posed the rig unless the current pose is intentionally the new bind pose.
+- Internal Prefab rig references remain source Entity IDs and must resolve inside the owner’s exact `prefabId + instanceRootId` group. Never bind one Instance to another Instance’s bones.
 - The PixiJS adapter natively turns `Renderable.sourceRect` into a cropped subtexture. Frame-only sprite-sheet values still need Asset/host metadata that resolves the frame number to a rectangle. PhaserJS and Custom runtimes remain responsible for mapping the resulting `Renderable` state to their native renderer objects.
 - Reusable Prefab definitions live in canonical top-level `prefabs`; the legacy `prefab` workspace is not authoritative. Read [`docs/PREFABS.md`](./docs/PREFABS.md) before changing this contract.
 - A connected Instance is an expanded Scene subtree. Every member must map one source Entity through canonical `components.PrefabInstance` fields `prefabId`, `sourceEntityId`, and `instanceRootId`; do not replace it with a renderer placeholder.
@@ -538,6 +543,7 @@ A game-development task is complete only when all applicable items are true:
 - The requested behavior exists in game code, Engine, Editor, or authoring data at the correct layer.
 - Stable IDs are used and hierarchy invariants remain valid.
 - Runtime choice is explicit and renderer-host responsibilities are implemented.
+- Skeleton hierarchy/reference invariants, bind pose, IK chain order, Skin weights, animation tracks, and Prefab-instance isolation are validated when skeletal data changes.
 - Physics data validates and deterministic behavior is tested where relevant.
 - Universal project data remains version `4` and unknown fields are preserved.
 - The `dataModel` descriptor and component profile/version changes are deliberate, and Universal data has not been confused with snapshot version `3`.

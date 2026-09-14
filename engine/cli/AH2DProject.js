@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const {
   DATA_MODEL_ID, DATA_MODEL_VERSION, COMPONENT_SCHEMA_VERSION, PROFILE_NAMES,
   ComponentSchemaError, EntityCodec, createDefaultComponentRegistry, applyJsonPointerOperation, applyPrefabOverrideOperation, validatePrefabDocument,
-  validateAnimationDocument, parseJsonPointer, prefabOverridePathAllowed, jsonPointerLookup, PREFAB_ASSET_SCHEMA, ANIMATION_CLIP_SCHEMA
+  validateAnimationDocument, validateSkeletonDocument, parseJsonPointer, prefabOverridePathAllowed, jsonPointerLookup, PREFAB_ASSET_SCHEMA, ANIMATION_CLIP_SCHEMA
 } = require('../AH2DDataModel.js');
 
 const PROTOCOL = 'ah2d.cli/v1';
@@ -348,6 +348,7 @@ function validateDocument(document, options = {}) {
   }
   validatePrefabContract(document, diagnostics, options);
   diagnostics.push(...validateAnimationDocument(document, { strict: Boolean(options.strict), entityCodec }));
+  diagnostics.push(...validateSkeletonDocument(document, { strict: Boolean(options.strict), entityCodec, validateComponents: false }));
   for (const key of ['assets', 'folders', 'prefab', 'prefabs', 'animations', 'particles']) if (document[key] != null && !Array.isArray(document[key])) diagnostics.push(diagnostic('error', 'E_RESOURCE_ARRAY', `${key} must be an array`, `/${key}`));
   return diagnostics;
 }
@@ -363,10 +364,133 @@ function assertValid(document, options = {}) {
   return diagnostics;
 }
 
-function remapObjects(objects) {
+function remapReference(value, ids) {
+  return typeof value === 'string' && ids.has(value) ? ids.get(value) : value;
+}
+
+function remapRigEntityReferences(entity, ids, options = {}) {
+  if (!options.force && prefabMarker(entity)) return entity;
+  const skeleton = getComponent(entity, 'Skeleton');
+  if (isObject(skeleton.value) && typeof skeleton.value.rootBoneId === 'string' && ids.has(skeleton.value.rootBoneId)) {
+    putComponent(entity, 'Skeleton', { ...skeleton.value, rootBoneId: ids.get(skeleton.value.rootBoneId) });
+  }
+  const ik = getComponent(entity, 'IK');
+  if (isObject(ik.value)) {
+    const next = clone(ik.value);
+    let changed = false;
+    if (typeof next.skeletonRootId === 'string' && ids.has(next.skeletonRootId)) {
+      next.skeletonRootId = ids.get(next.skeletonRootId);
+      changed = true;
+    }
+    if (Array.isArray(next.bones)) {
+      next.bones = next.bones.map(reference => {
+        const remapped = remapReference(reference, ids);
+        changed = changed || remapped !== reference;
+        return remapped;
+      });
+    }
+    if (changed) putComponent(entity, 'IK', next);
+  }
+  const skin = getComponent(entity, 'Skin');
+  if (isObject(skin.value)) {
+    const next = clone(skin.value);
+    let changed = false;
+    if (typeof next.skeletonRootId === 'string' && ids.has(next.skeletonRootId)) {
+      next.skeletonRootId = ids.get(next.skeletonRootId);
+      changed = true;
+    }
+    if (Array.isArray(next.vertices)) {
+      next.vertices = next.vertices.map(vertex => {
+        if (!isObject(vertex) || !Array.isArray(vertex.weights)) return vertex;
+        return {
+          ...vertex,
+          weights: vertex.weights.map(weight => {
+            if (!isObject(weight) || typeof weight.boneId !== 'string' || !ids.has(weight.boneId)) return weight;
+            changed = true;
+            return { ...weight, boneId: ids.get(weight.boneId) };
+          })
+        };
+      });
+    }
+    if (changed) putComponent(entity, 'Skin', next);
+  }
+  return entity;
+}
+
+function animationClipForBinding(document, animation) {
+  if (!isObject(animation) || !Array.isArray(document.animations)) return null;
+  const stable = typeof animation.clipId === 'string' ? animation.clipId.trim() : '';
+  if (stable) return document.animations.find(clip => isObject(clip) && clip.id === stable) || null;
+  const legacy = typeof animation.clip === 'string' ? animation.clip.trim() : '';
+  if (!legacy) return null;
+  const direct = document.animations.find(clip => isObject(clip) && clip.id === legacy);
+  if (direct) return direct;
+  const folded = legacy.toLocaleLowerCase();
+  const matches = document.animations.filter(clip => isObject(clip) && typeof clip.name === 'string' && clip.name.toLocaleLowerCase() === folded);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function remapAnimationClipTargets(clip, ids) {
+  const next = clone(clip);
+  let changed = false;
+  const remapTarget = target => {
+    if (!isObject(target) || typeof target.targetEntityId !== 'string' || !ids.has(target.targetEntityId)) return;
+    target.targetEntityId = ids.get(target.targetEntityId);
+    changed = true;
+  };
+  remapTarget(next);
+  for (const track of Array.isArray(next.tracks) ? next.tracks : []) remapTarget(track);
+  return changed ? next : null;
+}
+
+function uniqueAnimationCloneIdentity(document, source, suffix) {
+  const animations = Array.isArray(document.animations) ? document.animations : (document.animations = []);
+  const ids = new Set(animations.filter(isObject).map(clip => clip.id));
+  const names = new Set(animations.filter(isObject).map(clip => String(clip.name || '').toLocaleLowerCase()));
+  const idBase = `${String(source.id || 'animation')}-${String(suffix || 'copy').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'copy'}`;
+  let id = idBase, idIndex = 2;
+  while (ids.has(id)) id = `${idBase}-${idIndex++}`;
+  const nameBase = `${String(source.name || source.id || 'Animation')} ${String(suffix || 'Copy')}`.trim();
+  let name = nameBase, nameIndex = 2;
+  while (names.has(name.toLocaleLowerCase())) name = `${nameBase} ${nameIndex++}`;
+  return { id, name };
+}
+
+function cloneRemappedAnimationBindings(document, entities, ids, options = {}) {
+  if (!Array.isArray(document.animations) || !document.animations.length) return { ids: [], bySource: new Map() };
+  const clones = new Map();
+  const created = [];
+  for (const entity of entities) {
+    if (!options.force && prefabMarker(entity)) continue;
+    const resolved = getComponent(entity, 'Animation');
+    const animation = resolved.value;
+    const source = animationClipForBinding(document, animation);
+    if (!source) continue;
+    if (!clones.has(source.id)) {
+      const remapped = remapAnimationClipTargets(source, ids);
+      if (!remapped) clones.set(source.id, null);
+      else {
+        const identity = uniqueAnimationCloneIdentity(document, source, options.suffix || 'Copy');
+        remapped.id = identity.id;
+        remapped.name = identity.name;
+        document.animations.push(remapped);
+        clones.set(source.id, remapped);
+        created.push(remapped.id);
+      }
+    }
+    const copiedClip = clones.get(source.id);
+    if (!copiedClip) continue;
+    const next = { ...animation, clipId: copiedClip.id };
+    if (Object.prototype.hasOwnProperty.call(next, 'clip')) next.clip = copiedClip.id;
+    putComponent(entity, 'Animation', next);
+  }
+  return { ids: created, bySource: new Map([...clones].filter(([, clip]) => clip).map(([sourceId, clip]) => [sourceId, clip.id])) };
+}
+
+function remapObjects(objects, options = {}) {
   const ids = new Map();
   for (const entity of objects) if (entity?.id) ids.set(entity.id, generateId('entity'));
-  return objects.map(entity => {
+  const remapped = objects.map(entity => {
     const next = clone(entity);
     if (next.id) next.id = ids.get(next.id);
     if (next.parentId && ids.has(next.parentId)) next.parentId = ids.get(next.parentId);
@@ -374,8 +498,76 @@ function remapObjects(objects) {
     if (marker && ids.has(marker.value.instanceRootId)) {
       attachPrefabMarker(next, { ...marker.value, instanceRootId: ids.get(marker.value.instanceRootId) });
     }
+    remapRigEntityReferences(next, ids);
     return next;
   });
+  const animationClips = options.document
+    ? cloneRemappedAnimationBindings(options.document, remapped, ids, { suffix: options.animationSuffix || 'Copy' })
+    : { ids: [], bySource: new Map() };
+  return { objects: remapped, idMap: ids, animationClipIds: animationClips.ids };
+}
+
+function unpackPrefabGroup(document, group, options = {}) {
+  const ids = new Map(group.members.map(member => [String(member.marker.value.sourceEntityId), member.entity.id]));
+  const entities = group.members.map(member => member.entity);
+  for (const entity of entities) remapRigEntityReferences(entity, ids, { force: true });
+  const animationClips = cloneRemappedAnimationBindings(document, entities, ids, {
+    force: true,
+    suffix: options.animationSuffix || 'Unpacked'
+  });
+  for (const entity of entities) stripPrefabMarker(entity);
+  return { entityIds: entities.map(entity => entity.id), entities, animationClipIds: animationClips.ids, animationClones: animationClips.bySource, idMap: ids };
+}
+
+function animationBindingUsesClip(document, entity, clipId) {
+  const animation = getComponent(entity, 'Animation').value;
+  return animationClipForBinding(document, animation)?.id === clipId;
+}
+
+function rebindAnimationClip(entity, clipId) {
+  const animation = getComponent(entity, 'Animation').value;
+  if (!isObject(animation)) return false;
+  const next = { ...animation, clipId };
+  if (Object.prototype.hasOwnProperty.call(next, 'clip')) next.clip = clipId;
+  putComponent(entity, 'Animation', next);
+  return true;
+}
+
+function adoptDetachedAnimationClips(document, deletedPrefab, detachedGroups) {
+  if (!Array.isArray(document.animations) || !detachedGroups.length) return [];
+  const candidates = new Map();
+  for (const detached of detachedGroups) {
+    for (const [sourceClipId, cloneClipId] of detached.animationClones) {
+      if (!candidates.has(sourceClipId)) candidates.set(sourceClipId, []);
+      candidates.get(sourceClipId).push({ detached, cloneClipId });
+    }
+  }
+  const externalEntities = [];
+  for (const scene of document.scenes || []) externalEntities.push(...(scene.objects || []));
+  for (const prefab of prefabAssets(document)) if (prefab !== deletedPrefab) externalEntities.push(...(prefab.entities || []));
+  const adopted = [];
+  for (const [sourceClipId, options] of candidates) {
+    if (externalEntities.some(entity => animationBindingUsesClip(document, entity, sourceClipId))) continue;
+    const sourceIndex = document.animations.findIndex(clip => isObject(clip) && clip.id === sourceClipId);
+    if (sourceIndex < 0) continue;
+    const selected = options[0];
+    const remapped = remapAnimationClipTargets(document.animations[sourceIndex], selected.detached.idMap);
+    if (!remapped) continue;
+    remapped.id = sourceClipId;
+    remapped.name = document.animations[sourceIndex].name;
+    document.animations[sourceIndex] = remapped;
+    for (const entity of selected.detached.entities) {
+      if (animationBindingUsesClip(document, entity, selected.cloneClipId)) rebindAnimationClip(entity, sourceClipId);
+    }
+    const cloneStillBound = [...externalEntities, ...detachedGroups.flatMap(group => group.entities)]
+      .some(entity => animationBindingUsesClip(document, entity, selected.cloneClipId));
+    if (!cloneStillBound) {
+      const cloneIndex = document.animations.findIndex(clip => isObject(clip) && clip.id === selected.cloneClipId);
+      if (cloneIndex >= 0) document.animations.splice(cloneIndex, 1);
+    }
+    adopted.push(sourceClipId);
+  }
+  return adopted;
 }
 
 function buildSceneIndex(scene) {
@@ -1182,7 +1374,10 @@ function applyOperationMutable(document, operation) {
   if (op === 'scene.clone') {
     const source = operationScene(document, operation), id = String(operation.id || generateId('scene'));
     if (document.scenes.some(scene => scene.id === id)) throw new DomainError('E_SCENE_EXISTS', `Scene already exists: ${id}`, { exitCode: EXIT.CONFLICT });
-    const scene = { ...clone(source), id, name: String(operation.name || `${source.name} Copy`), objects: operation.keepIds ? clone(source.objects) : remapObjects(source.objects), updatedAt: now() };
+    const remapped = operation.keepIds
+      ? { objects: clone(source.objects), animationClipIds: [] }
+      : remapObjects(source.objects, { document, animationSuffix: 'Scene Copy' });
+    const scene = { ...clone(source), id, name: String(operation.name || `${source.name} Copy`), objects: remapped.objects, updatedAt: now() };
     document.scenes.push(scene);if (operation.activate) document.currentSceneId = id;return { sceneId: id, name: scene.name, objectCount: scene.objects.length };
   }
   if (op === 'scene.rename') { const scene = operationScene(document, operation);scene.name = String(operation.name || '').trim();if (!scene.name) throw new DomainError('E_SCENE_NAME', 'Scene name is required', { exitCode: EXIT.USAGE });return { sceneId: scene.id, name: scene.name }; }
@@ -1254,7 +1449,13 @@ function applyOperationMutable(document, operation) {
         throw new DomainError('E_PREFAB_IN_USE', `Prefab Asset has ${groups.length} connected instance${groups.length === 1 ? '' : 's'}; use --unpack-instances to keep their Entities`, { exitCode: EXIT.CONFLICT, details: { prefabId: prefab.id, instanceRootIds: groups.map(group => group.rootId) } });
       }
       let unpackedEntityCount = 0;
-      for (const group of groups) for (const member of group.members) { stripPrefabMarker(member.entity);unpackedEntityCount += 1; }
+      const detachedGroups = [];
+      for (const group of groups) {
+        const detached = unpackPrefabGroup(document, group);
+        detachedGroups.push(detached);
+        unpackedEntityCount += detached.entityIds.length;
+      }
+      adoptDetachedAnimationClips(document, prefab, detachedGroups);
       storage.list.splice(storage.list.indexOf(prefab), 1);
       return { prefabId: prefab.id, deleted: true, unpackedInstanceCount: groups.length, unpackedEntityCount };
     }
@@ -1357,8 +1558,7 @@ function applyOperationMutable(document, operation) {
     }
     if (op === 'prefab.unpack') {
       const scene = operationScene(document, operation), entity = resolveEntity(scene, operation.entityId || operation.entity || operation.entityName, { allowName: operation.entityName != null }), context = instanceGroupForEntity(document, scene, entity);
-      const entityIds = context.group.members.map(member => member.entity.id);
-      for (const member of context.group.members) stripPrefabMarker(member.entity);
+      const { entityIds } = unpackPrefabGroup(document, context.group);
       return { sceneId: scene.id, prefabId: context.prefab.id, instanceRootId: context.group.rootId, entityIds, unpacked: true };
     }
   }
@@ -1378,8 +1578,9 @@ function applyOperationMutable(document, operation) {
     }
     const entity = resolveEntity(scene, operation.entityId || operation.id || operation.entityName, { allowName: operation.entityName != null, index: sceneIndex });
     if (op === 'entity.clone') {
-      const include = operation.deep ? new Set([entity.id, ...descendants(scene, entity.id, sceneIndex)]) : new Set([entity.id]), originals = scene.objects.filter(item => include.has(item.id)), remapped = remapObjects(originals);
+      const include = operation.deep ? new Set([entity.id, ...descendants(scene, entity.id, sceneIndex)]) : new Set([entity.id]), originals = scene.objects.filter(item => include.has(item.id));
       assertNoConnectedPrefabMembers(originals, 'clone a connected Prefab member');
+      const remapped = remapObjects(originals, { document, animationSuffix: 'Entity Copy' }).objects;
       const rootIndex = originals.findIndex(item => item.id === entity.id), rootCopy = remapped[rootIndex];renameEntityValue(rootCopy, operation.name || `${entityName(entity)} Copy`);offsetEntityValue(rootCopy, Number(operation.offsetX ?? 24), Number(operation.offsetY ?? 24));
       if (!operation.deep && entity.parentId) rootCopy.parentId = entity.parentId;scene.objects.push(...remapped);return { sceneId: scene.id, entityId: rootCopy.id, entityIds: remapped.map(item => item.id) };
     }

@@ -45,6 +45,59 @@ function assertMatrixClose(actual, expected, message) {
   actual.forEach((value, index) => assert.ok(Math.abs(value - expected[index]) < 1e-8, (message || 'matrix mismatch') + ' at index ' + index + ': ' + value + ' !== ' + expected[index]));
 }
 
+function rigRemapObjects() {
+  return [
+    { id: 'rig', components: { Skeleton: { rootBoneId: 'hip', futureSkeleton: { keep: true } }, Animation: { clipId: 'pose', futureBinding: true } } },
+    { id: 'hip', parentId: 'rig', components: { Bone: { length: 40 } } },
+    { id: 'knee', parentId: 'hip', components: { Bone: { length: 30 } } },
+    { id: 'target', parentId: 'rig', components: { IK: { skeletonRootId: 'rig', bones: ['hip', 'knee'], mix: 1, iterations: 8, tolerance: 0.01, bendDirection: 1 } } },
+    { id: 'mesh', parentId: 'rig', components: { Skin: {
+      skeletonRootId: 'rig',
+      vertices: [{ x: 0, y: 0, weights: [{ boneId: 'hip', weight: 0.25 }, { boneId: 'knee', weight: 0.75 }] }],
+      uvs: [0, 0], indices: [0, 0, 0], futureSkin: { keep: true }
+    } } }
+  ];
+}
+
+function rigRemapClips() {
+  return [
+    {
+      id: 'pose', name: 'Pose', fps: 12, frameCount: 2, loop: true, futureClip: { keep: true }, targetEntityId: 'hip',
+      tracks: [
+        { id: 'bone', type: 'bone', keyframes: [{ id: 'bone-0', frame: 0, value: { rotation: 0, futureKey: true } }] },
+        { id: 'ik', type: 'ik', targetEntityId: 'target', keyframes: [{ id: 'ik-0', frame: 0, value: { mix: 1 } }] },
+        { id: 'mesh-position', type: 'position', targetEntityId: 'mesh', keyframes: [{ id: 'mesh-0', frame: 0, value: { x: 0, y: 0 } }] }
+      ]
+    },
+    {
+      id: 'ambient', name: 'Ambient', fps: 12, frameCount: 1, loop: true, targetEntityId: 'bystander', futureAmbient: { keep: true },
+      tracks: [{ id: 'ambient-position', type: 'position', keyframes: [{ id: 'ambient-0', frame: 0, value: { x: 0, y: 0 } }] }]
+    }
+  ];
+}
+
+function assertRemappedRig(objects, idMap) {
+  const byId = new Map(objects.map(entity => [entity.id, entity]));
+  const mapped = sourceId => idMap.get(sourceId);
+  const rig = byId.get(mapped('rig')), target = byId.get(mapped('target')), mesh = byId.get(mapped('mesh'));
+  assert.strictEqual(rig.components.Skeleton.rootBoneId, mapped('hip'));
+  assert.strictEqual(rig.components.Skeleton.futureSkeleton.keep, true);
+  assert.strictEqual(target.components.IK.skeletonRootId, mapped('rig'));
+  assert.deepStrictEqual(target.components.IK.bones, [mapped('hip'), mapped('knee')]);
+  assert.strictEqual(mesh.components.Skin.skeletonRootId, mapped('rig'));
+  assert.deepStrictEqual(mesh.components.Skin.vertices[0].weights.map(weight => weight.boneId), [mapped('hip'), mapped('knee')]);
+  assert.strictEqual(mesh.components.Skin.futureSkin.keep, true);
+}
+
+function assertRemappedRigClip(clip, idMap) {
+  assert.strictEqual(clip.targetEntityId, idMap.get('hip'));
+  assert.strictEqual(clip.tracks.find(track => track.id === 'bone').targetEntityId, undefined);
+  assert.strictEqual(clip.tracks.find(track => track.id === 'ik').targetEntityId, idMap.get('target'));
+  assert.strictEqual(clip.tracks.find(track => track.id === 'mesh-position').targetEntityId, idMap.get('mesh'));
+  assert.strictEqual(clip.futureClip.keep, true);
+  assert.strictEqual(clip.tracks[0].keyframes[0].value.futureKey, true);
+}
+
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ah2d-cli-test-'));
 const projectFile = path.join(tempRoot, 'Agent Project.ah2d.json');
@@ -84,14 +137,25 @@ try {
   assert.strictEqual(capabilities.prefabs.overrideSynchronization.staleInstanceGroups, 'skip');
   assert.strictEqual(capabilities.prefabs.componentContainerSynthesis, 'direct /components/<Type> add only');
   assert.ok(capabilities.prefabs.operations.includes('prefab.unpack'));
-  assert.deepStrictEqual(capabilities.enums.animationTrackType, ['sprite', 'position', 'rotation', 'event', 'hitbox']);
+  assert.deepStrictEqual(capabilities.enums.animationTrackType, ['sprite', 'position', 'rotation', 'event', 'hitbox', 'bone', 'ik']);
+  assert.deepStrictEqual(capabilities.enums.bendDirection, [-1, 1]);
   assert.strictEqual(capabilities.animations.schema, 'animationClip');
   assert.strictEqual(capabilities.animations.stableReference, 'clipId');
+  assert.deepStrictEqual(capabilities.skeletons.components, ['Skeleton', 'Bone', 'IK', 'Skin']);
+  assert.strictEqual(capabilities.skeletons.referenceScope, 'same Scene or Prefab Asset');
+  assert.deepStrictEqual(capabilities.skeletons.runtimeOnly, ['Skeleton.pose', 'Skeleton.boneMatrices', 'Skin.deformedVertices']);
+  assert.deepStrictEqual(capabilities.skeletons.skinning.topology, {
+    uvsPerVertex: 2, indexPrimitive: 'triangles', indicesMustReferenceVertices: true, emptyMesh: true
+  });
 
 
   const schemaIndex = success(['schema', 'list']).data;
   assert.deepStrictEqual(schemaIndex.schemas, ['project', 'prefabAsset', 'animationClip', 'operation', 'batch']);
   assert.ok(schemaIndex.components.includes('Collider'));
+  assert.ok(schemaIndex.components.includes('Skeleton'));
+  assert.ok(schemaIndex.components.includes('Bone'));
+  assert.ok(schemaIndex.components.includes('IK'));
+  assert.ok(schemaIndex.components.includes('Skin'));
   const transformSchema = success(['schema', 'show', '--component', 'Transform']).data;
   assert.strictEqual(transformSchema.name, 'component:Transform');
   assert.strictEqual(transformSchema.component.type, 'Transform');
@@ -99,6 +163,12 @@ try {
   const aliasedSchema = success(['schema', 'show', 'component:Body']).data;
   assert.strictEqual(aliasedSchema.name, 'component:Rigidbody');
   assert.strictEqual(aliasedSchema.component.type, 'Rigidbody');
+  const skeletonSchema = success(['schema', 'show', '--component', 'Skeleton']).data;
+  assert.deepStrictEqual(skeletonSchema.component.runtimeOnlyFields, ['pose', 'boneMatrices']);
+  assert.strictEqual(skeletonSchema.component.schemas.authoring.properties.rootBoneId.type, 'string');
+  const skinSchema = success(['schema', 'show', '--component', 'Skin']).data;
+  assert.deepStrictEqual(skinSchema.component.runtimeOnlyFields, ['deformedVertices']);
+  assert.deepStrictEqual(skinSchema.component.schemas.authoring.required, ['skeletonRootId', 'vertices']);
   const projectSchema = success(['schema', 'show', '--name', 'project']).data.schema;
   assert.strictEqual(projectSchema.title, 'AH2D Project');
   assert.deepStrictEqual(projectSchema.$defs.entity.properties.parentId.type, ['string', 'null']);
@@ -160,6 +230,99 @@ try {
   danglingPrefabAnimationProject.prefabs[0].entities[0].components.Animation.clipId = 'idle';
   fs.writeFileSync(danglingPrefabAnimationFile, JSON.stringify(danglingPrefabAnimationProject));
   assert.deepStrictEqual(success(['validate', '--file', danglingPrefabAnimationFile]).diagnostics, []);
+
+  const skeletonFile = path.join(tempRoot, 'skeleton.ah2d.json');
+  const skeletonProject = createProject({ objects: [
+    { id: 'rig', components: { Skeleton: { rootBoneId: 'hip', enabled: true, solveIK: true, futureSkeleton: true } } },
+    { id: 'hip', parentId: 'rig', components: { Bone: { length: 40, inheritRotation: true } } },
+    { id: 'knee', parentId: 'hip', components: { Bone: { length: 32 } } },
+    { id: 'target', components: { IK: { skeletonRootId: 'rig', bones: ['hip', 'knee'], mix: 1, iterations: 8, tolerance: 0.01, bendDirection: 1 } } },
+    { id: 'mesh', components: { Skin: { skeletonRootId: 'rig', vertices: [
+      { x: 0, y: 0, weights: [{ boneId: 'hip', weight: 0.25 }, { boneId: 'knee', weight: 0.75 }] }
+    ], uvs: [0, 0], indices: [0, 0, 0], futureSkin: true } } }
+  ] });
+  skeletonProject.animations = [{
+    id: 'pose', name: 'Pose', fps: 12, frameCount: 2, loop: true,
+    tracks: [
+      { id: 'hip-bone', type: 'bone', targetEntityId: 'hip', keyframes: [{ id: 'hip-0', frame: 0, value: { rotation: 0 } }] },
+      { id: 'leg-ik', type: 'ik', targetEntityId: 'target', keyframes: [{ id: 'ik-0', frame: 0, value: { x: 10, y: 20, mix: 1 } }] }
+    ]
+  }];
+  fs.writeFileSync(skeletonFile, JSON.stringify(skeletonProject));
+  assert.deepStrictEqual(success(['validate', '--file', skeletonFile]).diagnostics, []);
+  assert.strictEqual(success(['validate', '--file', skeletonFile, '--engine']).data.valid, true);
+
+  const cloneProject = createProject({ objects: [...rigRemapObjects(), { id: 'bystander' }] });
+  cloneProject.animations = rigRemapClips();
+  const originalPoseClip = JSON.parse(JSON.stringify(cloneProject.animations[0]));
+  const originalAmbientClip = JSON.parse(JSON.stringify(cloneProject.animations[1]));
+  const sceneCloneResult = applyOperations(cloneProject, [{ op: 'scene.clone', sceneId: 'main', id: 'rig-copy', name: 'Rig Copy' }]);
+  const copiedScene = sceneCloneResult.document.scenes.find(scene => scene.id === 'rig-copy');
+  const sceneCloneMap = new Map(cloneProject.scenes[0].objects.map((entity, index) => [entity.id, copiedScene.objects[index].id]));
+  assertRemappedRig(copiedScene.objects, sceneCloneMap);
+  const sceneCloneRoot = copiedScene.objects.find(entity => entity.id === sceneCloneMap.get('rig'));
+  assert.notStrictEqual(sceneCloneRoot.components.Animation.clipId, 'pose');
+  assert.strictEqual(sceneCloneRoot.components.Animation.futureBinding, true);
+  assertRemappedRigClip(sceneCloneResult.document.animations.find(clip => clip.id === sceneCloneRoot.components.Animation.clipId), sceneCloneMap);
+  assert.deepStrictEqual(sceneCloneResult.document.animations.find(clip => clip.id === 'pose'), originalPoseClip, 'scene.clone must not mutate the original bound Clip');
+  assert.deepStrictEqual(sceneCloneResult.document.animations.find(clip => clip.id === 'ambient'), originalAmbientClip, 'scene.clone must not clone or mutate unrelated Clips');
+  assert.strictEqual(sceneCloneResult.document.animations.length, 3);
+
+  const entityCloneResult = applyOperations(cloneProject, [{ op: 'entity.clone', sceneId: 'main', entityId: 'rig', deep: true, offsetX: 0, offsetY: 0 }]);
+  const clonedEntityIds = entityCloneResult.results[0].entityIds;
+  const entityCloneMap = new Map(rigRemapObjects().map((entity, index) => [entity.id, clonedEntityIds[index]]));
+  assertRemappedRig(entityCloneResult.document.scenes[0].objects, entityCloneMap);
+  const entityCloneRoot = entityCloneResult.document.scenes[0].objects.find(entity => entity.id === entityCloneMap.get('rig'));
+  assert.notStrictEqual(entityCloneRoot.components.Animation.clipId, 'pose');
+  assertRemappedRigClip(entityCloneResult.document.animations.find(clip => clip.id === entityCloneRoot.components.Animation.clipId), entityCloneMap);
+  assert.deepStrictEqual(entityCloneResult.document.animations.find(clip => clip.id === 'pose'), originalPoseClip, 'entity.clone must not mutate the original bound Clip');
+  assert.deepStrictEqual(entityCloneResult.document.animations.find(clip => clip.id === 'ambient'), originalAmbientClip, 'entity.clone must not clone or mutate unrelated Clips');
+  assert.strictEqual(entityCloneResult.document.animations.length, 3);
+
+  const rigPrefabProject = createProject({ objects: [{ id: 'bystander' }] });
+  rigPrefabProject.animations = rigRemapClips();
+  rigPrefabProject.prefabs = [{ id: 'rig-prefab', name: 'Rig Prefab', rootEntityId: 'rig', revision: 1, entities: rigRemapObjects() }];
+  const instantiatedRig = applyOperations(rigPrefabProject, [{ op: 'prefab.instantiate', sceneId: 'main', prefabId: 'rig-prefab', rootId: 'rig-instance' }]);
+  const prefabInstanceMap = new Map(Object.entries(instantiatedRig.results[0].idMap));
+  const unpackedRig = applyOperations(instantiatedRig.document, [{ op: 'prefab.unpack', sceneId: 'main', entityId: prefabInstanceMap.get('knee') }]);
+  assertRemappedRig(unpackedRig.document.scenes[0].objects, prefabInstanceMap);
+  const unpackedRoot = unpackedRig.document.scenes[0].objects.find(entity => entity.id === prefabInstanceMap.get('rig'));
+  assert.ok(rigRemapObjects().every(source => !unpackedRig.document.scenes[0].objects.find(entity => entity.id === prefabInstanceMap.get(source.id)).components?.PrefabInstance));
+  assert.notStrictEqual(unpackedRoot.components.Animation.clipId, 'pose');
+  assertRemappedRigClip(unpackedRig.document.animations.find(clip => clip.id === unpackedRoot.components.Animation.clipId), prefabInstanceMap);
+  assert.deepStrictEqual(unpackedRig.document.prefabs[0].entities, rigPrefabProject.prefabs[0].entities, 'unpack must not mutate the Prefab Asset definition');
+  assert.deepStrictEqual(unpackedRig.document.animations.find(clip => clip.id === 'pose'), originalPoseClip, 'unpack must preserve the Prefab source Clip');
+  assert.deepStrictEqual(unpackedRig.document.animations.find(clip => clip.id === 'ambient'), originalAmbientClip, 'unpack must preserve unrelated Clips');
+
+  const linkedRigProject = createProject({ objects: [...rigRemapObjects(), { id: 'bystander' }] });
+  linkedRigProject.animations = rigRemapClips();
+  const createdRigAsset = applyOperations(linkedRigProject, [{ op: 'prefab.asset.create', sceneId: 'main', entityId: 'rig', id: 'linked-rig', name: 'Linked Rig' }]);
+  const secondRigInstance = applyOperations(createdRigAsset.document, [{ op: 'prefab.instantiate', sceneId: 'main', prefabId: 'linked-rig', rootId: 'linked-rig-two' }]);
+  const secondRigMap = new Map(Object.entries(secondRigInstance.results[0].idMap));
+  const deletedRigAsset = applyOperations(secondRigInstance.document, [{ op: 'prefab.asset.delete', prefabId: 'linked-rig', unpackInstances: true }]);
+  assert.strictEqual(deletedRigAsset.document.prefabs.some(prefab => prefab.id === 'linked-rig'), false);
+  assert.strictEqual(deletedRigAsset.results[0].unpackedInstanceCount, 2);
+  assert.strictEqual(deletedRigAsset.results[0].unpackedEntityCount, rigRemapObjects().length * 2);
+  assertRemappedRig(deletedRigAsset.document.scenes[0].objects, new Map(rigRemapObjects().map(entity => [entity.id, entity.id])));
+  assertRemappedRig(deletedRigAsset.document.scenes[0].objects, secondRigMap);
+  const secondUnpackedRoot = deletedRigAsset.document.scenes[0].objects.find(entity => entity.id === secondRigMap.get('rig'));
+  assertRemappedRigClip(deletedRigAsset.document.animations.find(clip => clip.id === secondUnpackedRoot.components.Animation.clipId), secondRigMap);
+  assert.deepStrictEqual(deletedRigAsset.document.animations.find(clip => clip.id === 'pose'), originalPoseClip, 'delete --unpack-instances must preserve the source-ID Clip for the source-linked group');
+  assert.deepStrictEqual(deletedRigAsset.document.animations.find(clip => clip.id === 'ambient'), originalAmbientClip, 'delete --unpack-instances must preserve unrelated Clips');
+  assert.strictEqual(deletedRigAsset.document.scenes[0].objects.some(entity => entity.components?.PrefabInstance?.prefabId === 'linked-rig'), false);
+
+  skeletonProject.scenes[0].objects[3].components.IK.bones[1] = 'missing-bone';
+  skeletonProject.scenes[0].objects[4].components.Skin.vertices[0].weights = [{ boneId: 'hip', weight: 0 }];
+  skeletonProject.scenes[0].objects[4].components.Skin.uvs = [0];
+  skeletonProject.scenes[0].objects[4].components.Skin.indices = [0, 1];
+  skeletonProject.scene = JSON.parse(JSON.stringify(skeletonProject.scenes[0].objects));
+  fs.writeFileSync(skeletonFile, JSON.stringify(skeletonProject));
+  const invalidSkeleton = failure(['validate', '--file', skeletonFile, '--engine'], 'E_PROJECT_INVALID').payload;
+  assert.ok(invalidSkeleton.diagnostics.some(item => item.code === 'E_IK_BONE_REFERENCE' && item.pointer === '/scenes/0/objects/3/components/IK/bones/1'));
+  assert.ok(invalidSkeleton.diagnostics.some(item => item.code === 'E_SKIN_WEIGHT_TOTAL' && item.pointer === '/scenes/0/objects/4/components/Skin/vertices/0/weights'));
+  assert.ok(invalidSkeleton.diagnostics.some(item => item.code === 'E_SKIN_UV_COUNT' && item.pointer === '/scenes/0/objects/4/components/Skin/uvs'));
+  assert.ok(invalidSkeleton.diagnostics.some(item => item.code === 'E_SKIN_INDEX_COUNT' && item.pointer === '/scenes/0/objects/4/components/Skin/indices'));
+  assert.ok(invalidSkeleton.diagnostics.some(item => item.code === 'E_SKIN_INDEX_RANGE' && item.pointer === '/scenes/0/objects/4/components/Skin/indices/1'));
   const descriptorFile = path.join(tempRoot, 'descriptor-validation.ah2d.json');
   const descriptorFixture = createProject({ name: 'Descriptor Validation' });
   delete descriptorFixture.dataModel;

@@ -8,7 +8,7 @@ AH2D keeps editor data independent from a specific renderer. The editor can prev
 
 - Scene Graph with cycle-safe nested parent/child relationships
 - Entity Component System (ECS)
-- Transform, Camera, Lighting, Shadow, Animation, and Tilemap systems
+- Transform, Camera, Lighting, Shadow, Animation, Skeleton/FK/IK/Skinning, and Tilemap systems
 - Native Box2D-compatible backend through Planck with pixel/metre conversion
 - Deterministic built-in 2D physics backend available by explicit selection
 - Runtime adapters for PixiJS, PhaserJS, and custom hosts
@@ -25,7 +25,7 @@ npm run ah2d -- inspect --file game.ah2d.json --pretty
 npm run ah2d -- validate --file game.ah2d.json --engine
 ```
 
-See [`CLI.md`](./CLI.md) for Scene, Entity, component, Prefab, runtime, physics, simulation, JSON Patch, and atomic batch workflows. The serialized contract and lifecycle rules are documented in [`../docs/PREFABS.md`](../docs/PREFABS.md).
+See [`CLI.md`](./CLI.md) for Scene, Entity, component, Prefab, runtime, physics, simulation, JSON Patch, and atomic batch workflows. Prefab lifecycle is documented in [`../docs/PREFABS.md`](../docs/PREFABS.md); skeletal authoring/runtime is documented in [`../docs/SKELETONS.md`](../docs/SKELETONS.md).
 
 ## Unified ECS and Component Schema contract
 
@@ -39,7 +39,7 @@ The same descriptor is included in the lossy active ECS snapshot returned by `En
 
 Every registered component exposes `authoring`, `runtime`, and `snapshot` schemas. Authoring normalization removes registered runtime-derived fields while preserving unknown JSON extensions. Runtime normalization supplies/accepts system state such as `Transform.world`; snapshot normalization retains that runtime state for an ECS export. Component values must be JSON-safe objects or arrays.
 
-The built-in registry contains `Name`, `Transform`, `Renderable`, `Rigidbody` (`RigidBody`/`Body` aliases), `Collider`, `Hidden`, `Locked`, `PrefabInstance`, `Camera`, `Light`, `ShadowCaster`, `Animation`, `Tilemap`, `ParticleEmitter`, `BoxCollider`, `BoxCollider2D`, `CircleCollider`, and `CircleCollider2D`. It is open-world by default, so safe PascalCase custom component keys remain usable and are preserved under `components.<Type>` even without a registered specialized schema.
+The built-in registry contains `Name`, `Transform`, `Renderable`, `Rigidbody` (`RigidBody`/`Body` aliases), `Collider`, `Hidden`, `Locked`, `PrefabInstance`, `Camera`, `Light`, `ShadowCaster`, `Animation`, `Skeleton`, `Bone`, `IK`, `Skin`, `Tilemap`, `ParticleEmitter`, `BoxCollider`, `BoxCollider2D`, `CircleCollider`, and `CircleCollider2D`. It is open-world by default, so safe PascalCase custom component keys remain usable and are preserved under `components.<Type>` even without a registered specialized schema.
 
 When a built-in component occurs in more than one authoring location, `components.<canonical-or-alias>` has precedence over legacy locations such as flat transforms, `rigidbody`/`rigidBody`, and `collider`. Resolution returns the selected `storage` and `provenance`; differing lower-precedence values are conflicts. Writes default to `storage: 'preserve'`, update the effective provenance, and leave all other locations and unknown fields untouched. Compact legacy storage is promoted to `components.<CanonicalName>` only when it cannot represent the value being written.
 
@@ -145,6 +145,24 @@ engine.prefabs.unpack(instance.instanceRootId);
 
 The instance root Transform and external parent are placement, not Overrides. Identity, hierarchy, the legacy `prefab` projection and the `PrefabInstance` marker are protected paths. Structural Overrides and nested Prefab Assets are not supported; Unpack before changing the connected hierarchy. Asset deletion rejects connected Instances unless `deleteAsset(id, { unpackInstances: true })` is explicit.
 
+## Skeleton, IK, and skinning
+
+Skeleton authoring uses ordinary Scene Graph Entities: the rig root carries `Skeleton`, each nested joint carries `Bone + Transform`, the target carries `IK + Transform`, and a deformable mesh carries `Skin`. Bone transforms remain local to `parentId`; each tip is `Bone.length` units along local positive X. `inheritRotation` and `inheritScale` control parent orientation/scale inheritance while preserving the inherited parent origin.
+
+```js
+engine.load(project); // Captures bind pose before autoplay animation.
+
+engine.skeleton.listBones('rig');
+engine.skeleton.getPose('rig');
+engine.skeleton.solve('hand-target');
+engine.skeleton.deform('character-skin');
+engine.skeleton.rebind('character-skin');
+```
+
+The system performs deterministic 2D CCD IK and CPU linear-blend skinning. `Skeleton.pose`, `Skeleton.boneMatrices`, inverse bind matrices, and `Skin.deformedVertices` are Runtime-derived state. PixiJS v8 maps a complete Skin to a native `PIXI.Mesh`; PhaserJS and custom hosts can consume `deformedVertices`. Bone/IK animation Tracks run before IK and deformation. Prefab references are authored as source Entity IDs and resolved inside the exact concrete Instance group.
+
+See [`../docs/SKELETONS.md`](../docs/SKELETONS.md) for schemas, coordinates, validation, Editor/Timeline usage, Prefab behavior, animation payloads, renderer responsibilities, and safe CLI mutations.
+
 ## Runtime selection and preview lifecycle
 
 ```js
@@ -223,4 +241,4 @@ The universal AH2D JSON remains the source of truth, so scenes and physics compo
 node engine/AH2DEngine.test.js
 ```
 
-The suite covers deep nested local/world transforms, dirty propagation, traversal, cycle protection, preserve-world reparent/detach, atomic singular/shear rejection, graph-aware deletion, runtime selection, gravity and damping, native contacts, triggers, collision filters, automatic mass, forces, torque, impulses, kinematic bodies, sleeping, bounded substeps, native-handle access, lifecycle restoration, native Box2D conversion, and the Editor contract.
+The suite covers deep nested local/world transforms, dirty propagation, traversal, cycle protection, preserve-world reparent/detach, atomic singular/shear rejection, graph-aware deletion, runtime selection, gravity and damping, native contacts, triggers, collision filters, automatic mass, forces, torque, impulses, kinematic bodies, sleeping, bounded substeps, Skeleton/FK inheritance, CCD IK, linear-blend skinning, Prefab rig isolation, Bone/IK animation, Pixi mesh synchronization, native-handle access, lifecycle restoration, native Box2D conversion, and the Editor contract.

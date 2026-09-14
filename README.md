@@ -15,7 +15,8 @@ AH2D Editor (Next.js)
 └── AH2D Engine
     ├── Scene Graph + ECS
     ├── Transform / Camera / Lighting / Shadow
-    ├── Animation / Post Process / Tilemap
+    ├── Animation / Skeleton / IK / Skinning
+    ├── Post Process / Tilemap
     ├── Native Box2D-compatible Physics (Planck) + explicit built-in fallback
     ├── PixiJS / PhaserJS / Custom adapters
     └── Agent-friendly CLI
@@ -35,6 +36,7 @@ AH2D Editor (Next.js)
 - `docs/COLLABORATION.md`: قرارداد API عمومی، revision، attribution و realtime.
 - `docs/LOCAL_PROJECTS.md`: قرارداد پوشهٔ پروژه، مرورگرهای پشتیبانی‌شده و رفتار Save.
 - `docs/ANIMATIONS.md`: قرارداد Clip/Track/Keyframe، Timeline، binding و Runtime Animation.
+- `docs/SKELETONS.md`: قرارداد Skeleton/Bone/IK/Skin، Bind Pose، Timeline، Prefab و Rendererها.
 - `docs/DEPLOYMENT.md`: اجرای Production و محدودیت storage محلی.
 - `docs/PHYSICS.md`: قرارداد کامل Box2D، واحدها، fixtureها، contactها، Play Mode و API بومی.
 - `Agent.md`: راهنمای توسعهٔ بازی توسط Agent.
@@ -135,7 +137,7 @@ Editor تعبیه‌شده عمومی است، اما در iframe با origin ا
 | --- | ---: | --- | --- |
 | Editor Universal JSON | 4 | تمام Sceneها، assets، Prefab Asset/Instance/Override، animationها، particleها، Post Process و تنظیمات Engine | منبع اصلی پروژه، Save/Load و ادامهٔ ویرایش |
 | `Engine.export()` یا `ah2d ecs export` | 3 | فقط Entity/Componentهای Scene فعال در Runtime | Debug، تست یا انتقال snapshot فعال |
-| Animation asset | 1 | Clip کامل شامل FPS، frame count، Trackها، Keyframeها، easing، event و hitbox | Import/اشتراک Asset و مصرف توسط AnimationSystem |
+| Animation asset | 1 | Clip کامل شامل FPS، frame count، Trackها، Keyframeها، easing، sprite/event/hitbox و Bone/IK | Import/اشتراک Asset و مصرف توسط AnimationSystem/SkeletonSystem |
 | Particle asset | 1 | پارامترهای emitter | مصرف توسط renderer/particle system بازی |
 
 هیچ‌وقت فایل Universal نسخهٔ ۴ را با نتیجهٔ `Engine.export()` جایگزین نکنید؛ snapshot نسخهٔ ۳ Sceneها و resourceهای پروژه را ندارد.
@@ -179,7 +181,7 @@ Universal Project نسخهٔ ۴ منبع حقیقت **Authoring** است. پرو
 
 در storage فشردهٔ flat، `Transform` و `Renderable` روی خود Entity پخش شده‌اند؛ به همین دلیل نوشتن مقدار جدید، propertyهای sibling حذف‌شده را نگه می‌دارد. در `components.*`، مقدار component به‌طور کامل جایگزین می‌شود. برای تغییر فیلدی از `patch` و برای replace کاملاً مستقل از canonical storage استفاده کنید.
 
-Registry پیش‌فرض این componentها را می‌شناسد: `Name`، `Transform`، `Renderable`، `Rigidbody` (با aliasهای `RigidBody` و `Body`)، `Collider`، `Hidden`، `Locked`، `PrefabInstance`، `Camera`، `Light`، `ShadowCaster`، `Animation`، `Tilemap`، `ParticleEmitter`، `BoxCollider`، `BoxCollider2D`، `CircleCollider` و `CircleCollider2D`. registry به‌صورت پیش‌فرض open-world است: component سفارشیِ PascalCase زیر `components.<Type>` حفظ و به‌عنوان object/array اعتبارسنجی می‌شود، حتی اگر هنوز schema اختصاصی ثبت نشده باشد.
+Registry پیش‌فرض این componentها را می‌شناسد: `Name`، `Transform`، `Renderable`، `Rigidbody` (با aliasهای `RigidBody` و `Body`)، `Collider`، `Hidden`، `Locked`، `PrefabInstance`، `Camera`، `Light`، `ShadowCaster`، `Animation`، `Skeleton`، `Bone`، `IK`، `Skin`، `Tilemap`، `ParticleEmitter`، `BoxCollider`، `BoxCollider2D`، `CircleCollider` و `CircleCollider2D`. registry به‌صورت پیش‌فرض open-world است: component سفارشیِ PascalCase زیر `components.<Type>` حفظ و به‌عنوان object/array اعتبارسنجی می‌شود، حتی اگر هنوز schema اختصاصی ثبت نشده باشد.
 
 ### ساختار Universal JSON
 
@@ -843,7 +845,7 @@ Payload شامل `a`, `b`, `bodyA`, `bodyB`, `colliderA`, `colliderB`, `normal`,
 
 ### Animation
 
-Animation Clipهای واقعی در `animations[]` پروژهٔ Universal ذخیره می‌شوند. هر Clip یک ID پایدار، timebase مبتنی بر frame و Trackهای Sprite، Position، Rotation، Event و Hitbox دارد. Entity با `Animation.clipId` به Asset وصل می‌شود:
+Animation Clipهای واقعی در `animations[]` پروژهٔ Universal ذخیره می‌شوند. هر Clip یک ID پایدار، timebase مبتنی بر frame و Trackهای Sprite، Position، Rotation، Event، Hitbox، Bone و IK دارد. Entity با `Animation.clipId` به Asset وصل می‌شود:
 
 ```js
 engine.ecs.add('player', 'Animation', {
@@ -864,7 +866,7 @@ const pose = AH2D.sampleAnimationClip(
 );
 ```
 
-AnimationSystem زمان هر Entity را مستقل جلو می‌برد، Position/Rotation را روی Transform محلی و Sprite را روی Renderable نمونه‌برداری و اعمال می‌کند، Hitbox sample را در state Runtime نگه می‌دارد و Event Track را با `animation:event` منتشر می‌کند. Clip غیر-loop در پایان `animation:complete` می‌فرستد. PixiJS adapter مقدار `Renderable.sourceRect` را مستقیماً به subtexture برش‌خورده تبدیل می‌کند؛ مقدار `frame` بدون `sourceRect` فقط وقتی قابل‌نمایش است که Asset یا host متادیتای Sprite Sheet لازم برای تبدیل شمارهٔ frame به rectangle را فراهم کند. در PhaserJS و Runtime سفارشی، نگاشت Renderable نهایی به Texture/frame بومی همچنان بر عهدهٔ host است.
+AnimationSystem زمان هر Entity را مستقل جلو می‌برد، Position/Rotation و Bone pose را روی Transform محلی، IK Track را روی Target/Constraint و Sprite را روی Renderable نمونه‌برداری و اعمال می‌کند، Hitbox sample را در state Runtime نگه می‌دارد و Event Track را با `animation:event` منتشر می‌کند. سپس SkeletonSystem زنجیره‌های IK را حل و Skin را deform می‌کند. Clip غیر-loop در پایان `animation:complete` می‌فرستد. PixiJS adapter مقدار `Renderable.sourceRect` را مستقیماً به subtexture برش‌خورده تبدیل می‌کند؛ مقدار `frame` بدون `sourceRect` فقط وقتی قابل‌نمایش است که Asset یا host متادیتای Sprite Sheet لازم برای تبدیل شمارهٔ frame به rectangle را فراهم کند. در PhaserJS و Runtime سفارشی، نگاشت Renderable نهایی به Texture/frame بومی همچنان بر عهدهٔ host است.
 
 در Sprite Track، `keyframe.frame` موقعیت زمانی Key و `value.frame` شمارهٔ تصویر Sprite Sheet است؛ `value.sourceRect` برش دقیق پیکسلی را نگه می‌دارد. `spriteFrame` فقط alias سازگاری قدیمی است و خروجی canonical از `frame` استفاده می‌کند.
 
@@ -873,6 +875,23 @@ AnimationSystem زمان هر Entity را مستقل جلو می‌برد، Posi
 یک Clip می‌تواند چند Track هم‌نوع با targetهای متفاوت داشته باشد. اولویت هدف `track.targetEntityId`، سپس `clip.targetEntityId` و در نهایت Entity دارای Animation Component است. اگر چند Track هم‌نوع یک property از یک target مشترک را بنویسند، Track آخر در `tracks[]` برنده است؛ Eventها همگی dispatch و Hitboxها تجمیع می‌شوند.
 
 Animator و Timeline همین قرارداد را مستقیماً Load، ویرایش، Preview و Save می‌کنند؛ frame انتخاب‌شده و playhead state موقت Editor هستند و وارد Asset نمی‌شوند. قرارداد کامل، schema، API، رفتار loop/event و مثال CLI در [`docs/ANIMATIONS.md`](./docs/ANIMATIONS.md) قرار دارد.
+
+### Skeleton، Bone، IK و Skinning
+
+Rig یک Scene Graph واقعی است: Entity ریشه Component از نوع `Skeleton` دارد و هر Entity استخوان با `Bone + Transform` زیر آن Parent می‌شود. Entity هدف IK دارای `IK + Transform` است و `Skin` رأس‌ها، UV، index و Weightهای وابسته به Bone ID را نگه می‌دارد. Bind Pose در Runtime پیش از autoplay ثبت می‌شود؛ CCD دوبعدی Target را حل می‌کند و CPU linear-blend skinning خروجی مشتق‌شدهٔ `Skin.deformedVertices` را تولید می‌کند.
+
+```js
+engine.load(project);
+
+const bones = engine.skeleton.listBones('knight-rig');
+const pose = engine.skeleton.getPose('knight-rig');
+
+engine.transform.setWorld('foot-target', { x: 410, y: 290 });
+engine.skeleton.solve('foot-target');
+const vertices = engine.skeleton.deform('knight-skin');
+```
+
+`Skeleton.pose`، `Skeleton.boneMatrices` و `Skin.deformedVertices` فقط Runtime state هستند و در Universal Authoring ذخیره نمی‌شوند. PixiJS یک Mesh واقعی می‌سازد و position buffer را با deformation همگام می‌کند؛ PhaserJS/Custom می‌توانند همان `deformedVertices` را مصرف کنند. Referenceهای Rig داخل Prefab با Source Entity ID نگه‌داری و برای هر Instance مستقل resolve می‌شوند. قرارداد کامل، مثال JSON، workflow Editor/CLI، Trackهای Bone/IK و قواعد Rebind در [`docs/SKELETONS.md`](./docs/SKELETONS.md) آمده است.
 
 ### Camera، Light، Shadow و Tilemap
 
@@ -959,6 +978,7 @@ Adapter به‌صورت خودکار:
 - برای هر Entity یک `PIXI.Container` می‌سازد و Nested Scene Graph را mirror می‌کند؛
 - Transform محلی را با Matrix اعمال می‌کند تا world transformهای چرخیده، scale غیرهمسان و shear حاصل از nesting دقیق بمانند؛
 - برای Renderable دارای تصویر `PIXI.Sprite` با anchor مرکزی و برای Renderable بدون تصویر `PIXI.Graphics` می‌سازد؛
+- برای Entity دارای Skin معتبر یک `PIXI.Mesh` واقعی می‌سازد و position buffer آن را از `Skin.deformedVertices` به‌روزرسانی می‌کند؛
 - `Renderable.sourceRect` را به subtexture بومی Pixi برش می‌دهد و تا زمانی که Texture یا rectangle همان Sprite عوض نشده، همان subtexture را نگه می‌دارد؛
 - `Hidden`، `Renderable.visible` و `layer`/`zIndex` را همگام می‌کند؛
 - ساخت، حذف و Reparent شدن Entityها را در Frame بعدی reconcile می‌کند؛
@@ -990,7 +1010,7 @@ class GameScene extends Phaser.Scene {
 }
 ```
 
-PixiJS adapter اکنون Display Tree، Sprite/Graphics، Transform، visibility، Camera، asset loading پایه و برش native مقدار `Renderable.sourceRect` را مستقیماً از ECS ایجاد و Render می‌کند. مقدار `Renderable.frame` به‌تنهایی ابعاد و مختصات برش را تعیین نمی‌کند و به metadata مربوط به Asset یا host نیاز دارد. PhaserJS همچنان یک adapter انتخاب/سازگاری است و ساخت Game Objectها، sync ECS و Camera/renderer mapping آن باید توسط پروژهٔ بازی انجام شود؛ مثال `createPhaserObjectsFromECS` بالا host-owned است. Particle rendering، Light/Shadow و Post Process filters نیز در PhaserJS/Custom به نگاشت اختصاصی host نیاز دارند.
+PixiJS adapter اکنون Display Tree، Sprite/Graphics/Mesh، Transform، visibility، Camera، Skin deformation، asset loading پایه و برش native مقدار `Renderable.sourceRect` را مستقیماً از ECS ایجاد و Render می‌کند. مقدار `Renderable.frame` به‌تنهایی ابعاد و مختصات برش را تعیین نمی‌کند و به metadata مربوط به Asset یا host نیاز دارد. PhaserJS همچنان یک adapter انتخاب/سازگاری است و ساخت Game Objectها، همگام‌سازی ECS و `Skin.deformedVertices` و Camera/renderer mapping آن باید توسط پروژهٔ بازی انجام شود؛ مثال `createPhaserObjectsFromECS` بالا host-owned است. Particle rendering، Light/Shadow و Post Process filters نیز در PhaserJS/Custom به نگاشت اختصاصی host نیاز دارند.
 
 ### اجرای Headless در Node.js
 
@@ -1070,6 +1090,12 @@ engine.transform.localToWorld(id, point)
 engine.transform.worldToLocal(id, point)
 AH2D.Matrix2D
 
+engine.skeleton.listBones(skeletonOrBoneId)
+engine.skeleton.getPose(skeletonOrBoneId)
+engine.skeleton.solve(ikOrSkeletonId)
+engine.skeleton.deform(skinOrSkeletonId)
+engine.skeleton.rebind(skinOrSkeletonId)
+
 engine.postProcess.load(config)
 engine.postProcess.get(idOrType)
 engine.postProcess.configure(idOrType, values)
@@ -1090,6 +1116,7 @@ engine.events.emit(type, payload)
 - نام پروژه در خروجی مستقیم Editor فعلاً `Demo Project` است؛ CLI می‌تواند `meta.name` را بدون از دست رفتن داده تغییر دهد.
 - Loader فعلی Editor فیلدهای ناشناختهٔ سند، Scene، `meta`، `engine`، Asset و Entity را هنگام Load/Save حفظ می‌کند؛ بخش‌هایی که Editor واقعاً مدل می‌کند با state فعال به‌روزرسانی می‌شوند. برای mutation اتمیک و قابل‌شرط‌گذاری با hash همچنان از CLI استفاده کنید.
 - Project Load تمام `animations[]` را به state Animator برمی‌گرداند و تغییر Clip/Track/Keyframe را در Save بعدی حفظ می‌کند. Particle Editor فعلاً فقط `particles[0]` را مدل می‌کند و Assetها بر اساس ID merge می‌شوند.
+- Skeleton/Bone/IK/Skin در همان Entity/Componentهای Scene یا Prefab ذخیره می‌شوند؛ Timeline Trackهای Bone و IK را نگه می‌دارد و داده‌های pose/deformation مشتق‌شده وارد Authoring نمی‌شوند.
 - standalone animation/particle JSON ورودی مستقیم Project Load نیستند.
 - layout پنل‌ها، selection، undo history، grid/snap، commentهای محلی داخل canvas و وضعیت دوربین Prefab در Universal JSON ذخیره نمی‌شوند. Commentهای مشارکتی Studio جداگانه در Project API ذخیره می‌شوند.
 - Prefabهای canonical از Asset/Instance/Override/Apply/Revert/Unpack پشتیبانی می‌کنند؛ nested Prefab Asset و structural override هنوز پشتیبانی نمی‌شوند و برای تغییر hierarchy یک Instance متصل باید ابتدا Unpack انجام شود.
@@ -1110,6 +1137,6 @@ npm test
 npm run ah2d -- validate --file game.ah2d.json --engine --pretty
 ```
 
-Test suite شامل hierarchy عمیق و چندریشه، local/world Transform، propagation، traversal، تشخیص cycle/ID تکراری، Reparent و Delete با preserve-world، rollback اتمیک برای shear/singular، Multi-Scene، Runtime selection، Rigidbody، multi-fixture box/circle، trigger، contact بومی، collision filtering، auto mass، force/torque/impulse، kinematic body، sleeping، snapshot/restore، substep، lifecycle و قرارداد Editor است.
+Test suite شامل hierarchy عمیق و چندریشه، local/world Transform، propagation، traversal، تشخیص cycle/ID تکراری، Reparent و Delete با preserve-world، rollback اتمیک برای shear/singular، Multi-Scene، Runtime selection، Rigidbody، multi-fixture box/circle، trigger، contact بومی، collision filtering، auto mass، force/torque/impulse، kinematic body، sleeping، Skeleton/FK، CCD IK، LBS، Prefab Rig reference، Pixi Mesh، Bone/IK animation، snapshot/restore، substep، lifecycle و قرارداد Editor است.
 
 برای workflow استاندارد توسعه توسط Agent، [`Agent.md`](./Agent.md) را بخوانید.

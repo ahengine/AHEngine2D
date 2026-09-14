@@ -70,9 +70,9 @@ Animation در AH2D یک preview نمایشی داخل Editor نیست. Clipها
 - `targetEntityId`: هدف پیش‌فرض اختیاری برای Trackهایی که هدف مستقل ندارند.
 - `tracks`: آرایهٔ مرتب Trackها.
 
-هر Track می‌تواند `targetEntityId` خودش را داشته باشد؛ در غیر این صورت از هدف Clip استفاده می‌کند. نوع‌های built-in عبارت‌اند از `sprite`، `position`، `rotation`، `event` و `hitbox`. نوع سفارشی می‌تواند به شکل step نمونه‌برداری و توسط game/runtime host تفسیر شود.
+هر Track می‌تواند `targetEntityId` خودش را داشته باشد؛ در غیر این صورت از هدف Clip استفاده می‌کند. نوع‌های built-in عبارت‌اند از `sprite`، `position`، `rotation`، `event`، `hitbox`، `bone` و `ik`. نوع سفارشی می‌تواند به شکل step نمونه‌برداری و توسط game/runtime host تفسیر شود.
 
-`position` و `rotation` به‌صورت پیش‌فرض `linear` هستند. `sprite`، `event` و `hitbox` به‌صورت `step` ارزیابی می‌شوند. easingهای شناخته‌شده `ease-in`، `ease-out` و `ease-in-out` هستند؛ نبود easing به معنای linear است. Transformهای حاصل، local به `parentId` همان Entity باقی می‌مانند.
+`position`، `rotation`، `bone` و `ik` به‌صورت پیش‌فرض `linear` هستند. `sprite`، `event` و `hitbox` به‌صورت `step` ارزیابی می‌شوند. easingهای شناخته‌شده `ease-in`، `ease-out` و `ease-in-out` هستند؛ نبود easing به معنای linear است. Transformهای حاصل، local به `parentId` همان Entity باقی می‌مانند. Bone Track می‌تواند هر زیرمجموعه‌ای از `x`، `y`، `rotation`، `scaleX` و `scaleY` را بنویسد. IK Track علاوه بر `x/y` Target می‌تواند `mix`، `iterations`، `tolerance`، `enabled` و `bendDirection` را تغییر دهد؛ فیلدهای عددی پیوسته interpolate و فیلدهای گسسته step می‌شوند.
 
 در Sprite Track، `keyframe.frame` محل Key روی Timeline است اما `keyframe.value.frame` شمارهٔ frame تصویر داخل Sprite Sheet است. `value.sourceRect` مستطیل دقیق pixel-space با `x`، `y`، `width` و `height` مثبت را مشخص می‌کند. `spriteFrame` فقط alias ورودی قدیمی است؛ داده و Export جدید باید `frame` بنویسند. PixiJS adapter وقتی `sourceRect` وجود دارد همان ناحیه را به‌صورت native در یک subtexture برش می‌دهد. `frame` به‌تنهایی مختصات برش را مشخص نمی‌کند؛ برای چنین Clipی Asset یا host باید متادیتای Sprite Sheet و نگاشت frame به rectangle را فراهم کند. PhaserJS و Runtime سفارشی نگاشت هر دو مقدار به primitive بومی renderer خود را انجام می‌دهند.
 
@@ -138,6 +138,7 @@ Animator آرایهٔ واقعی `animations[]` را Load می‌کند. انت�
 - انتخاب Track و افزودن Key در playhead.
 - انتخاب، جابه‌جایی و حذف Keyframe.
 - Preview داده‌محور Position، Rotation، Sprite و Hitbox.
+- ساخت، Keyگذاری و Preview Trackهای Bone و IK روی Entityهای واقعی Rig.
 - Onion Skin از نمونهٔ frame قبلی و بعدی.
 - Inspector واقعی برای `fps`، `frameCount`، `loop`، `speed` و Keyframe انتخاب‌شده.
 
@@ -157,6 +158,10 @@ animations.pause();
 const clip = animations.create({ name: 'Knight Attack', fps: 12, frameCount: 8 });
 const position = animations.addTrack('position', 'knight');
 const key = animations.addKey(position.id, { x: 12, y: 0 }, 3);
+const bone = animations.addTrack('bone', 'lower-leg');
+animations.addKey(bone.id, { rotation: 22 }, 3);
+const ik = animations.addTrack('ik', 'foot-target');
+animations.addKey(ik.id, { x: 405, y: 270, mix: 1 }, 3);
 animations.removeKey(position.id, key.id);
 animations.removeTrack(position.id);
 animations.remove(clip.id);
@@ -222,7 +227,7 @@ engine.animation.pause('knight');
 engine.animation.stop('knight');
 ```
 
-AnimationSystem clock هر Entity را جداگانه جلو می‌برد، Clip را نمونه‌برداری می‌کند و Trackهای built-in را روی Componentهای Runtime هدف اعمال می‌کند. Position/Rotation روی Transform local، Sprite روی Renderable و Hitbox روی state نمونه‌برداری‌شدهٔ Animation قرار می‌گیرد. Event Track از Event Bus ارسال می‌شود:
+AnimationSystem clock هر Entity را جداگانه جلو می‌برد، Clip را نمونه‌برداری می‌کند و Trackهای built-in را روی Componentهای Runtime هدف اعمال می‌کند. Position/Rotation و Bone روی Transform local، IK روی Transform هدف و Constraint، Sprite روی Renderable و Hitbox روی state نمونه‌برداری‌شدهٔ Animation قرار می‌گیرد. پس از نمونه‌برداری، SkeletonSystem زنجیره‌های IK را حل و Skin را deform می‌کند. Event Track از Event Bus ارسال می‌شود:
 
 ```js
 const offEvent = engine.events.on('animation:event', ({ entityId, clipId, name, payload, frame }) => {
@@ -238,6 +243,8 @@ const offComplete = engine.events.on('animation:complete', ({ entityId, clipId }
 
 AnimationSystem فیلدهای canonical Sprite را روی `Renderable.frame` و `Renderable.sourceRect` اعمال می‌کند. PixiJS adapter مقدار `sourceRect` را بدون کد اضافهٔ بازی به subtexture بومی تبدیل می‌کند؛ اگر فقط `frame` موجود باشد، Asset یا host باید متادیتای لازم برای تبدیل شمارهٔ frame به rectangle را بدهد. نگاشت Renderable در PhaserJS و Runtime سفارشی host-owned است و Runtime سفارشی می‌تواند Trackهای ناشناخته را نیز از sample مصرف کند. تعریف Clip Authoring نباید در هر frame توسط Runtime mutate شود.
 
+قرارداد کامل Skeleton/Bone/IK/Skin، Bind Pose، Prefab referenceها، Pixi Mesh و APIهای `engine.skeleton` در [`SKELETONS.md`](./SKELETONS.md) مستند شده است.
+
 ## CLI و تغییر امن پروژه
 
 در CLI فعلی Animation Clip یک resource در `animations` است. ابتدا schema را کشف و پروژه را inspect کنید، سپس mutation را با hash انجام دهید:
@@ -250,4 +257,4 @@ npm run ah2d -- resource put --file game.ah2d.json animations @walk.clip.json --
 npm run ah2d -- validate --file game.ah2d.json --strict --engine --pretty
 ```
 
-برای چند تغییر مرتبط از فرمان `patch` یا operation `resource.put` در یک `apply` اتمیک استفاده کنید. CLI validation، referenceهای `Animation.clipId`، Entityهای هدف، IDهای تکراری، محدودهٔ frame و payloadهای built-in را بررسی می‌کند. `Engine.export()` snapshot فعال نسخهٔ ۳ است و نباید جای Universal Project نسخهٔ ۴ را بگیرد.
+برای چند تغییر مرتبط از فرمان `patch` یا operation `resource.put` در یک `apply` اتمیک استفاده کنید. CLI validation، referenceهای `Animation.clipId`، Entityهای هدف، IDهای تکراری، محدودهٔ frame و payloadهای built-in از جمله Bone/IK را بررسی می‌کند. `Engine.export()` snapshot فعال نسخهٔ ۳ است و نباید جای Universal Project نسخهٔ ۴ را بگیرد.

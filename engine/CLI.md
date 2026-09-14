@@ -37,7 +37,7 @@ stdout is JSON by default:
 
 Errors use the same protocol on stderr and a non-zero, categorized exit code. `capabilities` is the machine-readable discovery contract. It reports `dataModel`, the three component-schema profiles, registry types, `unknownComponents: "preserve"`, and `precedence: "components"`. Human-readable output is opt-in with `--format text`.
 
-The `sceneGraph` capability declares `parentId` storage, local authoring Transform space, the derived world-matrix shape, the default Reparent mode, both preservation flags, and the tree/world inspection command. `prefabs` declares canonical storage, expanded-instance behavior, RFC 6901 override paths, operations, and root-placement rules. `enums.physicsBackend` and `options.physicsBackend` expose the supported Physics execution backends and the commands accepting `--backend`. Agents should discover these fields instead of assuming Editor behavior.
+The `sceneGraph` capability declares `parentId` storage, local authoring Transform space, the derived world-matrix shape, the default Reparent mode, both preservation flags, and the tree/world inspection command. `prefabs` declares canonical storage, expanded-instance behavior, RFC 6901 override paths, operations, and root-placement rules. `skeletons` declares the four canonical Components, reference scope, Bone hierarchy/IK-chain rules, Skin weights, Runtime-only outputs, and animation Track types. `enums.physicsBackend` and `options.physicsBackend` expose the supported Physics execution backends and the commands accepting `--backend`. Agents should discover these fields instead of assuming Editor behavior.
 
 Exit codes:
 
@@ -127,6 +127,10 @@ npm run ah2d -- schema list --pretty
 npm run ah2d -- schema show --name project --pretty
 npm run ah2d -- schema show --name prefabAsset --pretty
 npm run ah2d -- schema show --component Transform --pretty
+npm run ah2d -- schema show --component Skeleton --pretty
+npm run ah2d -- schema show --component Bone --pretty
+npm run ah2d -- schema show --component IK --pretty
+npm run ah2d -- schema show --component Skin --pretty
 npm run ah2d -- schema show component:Body --pretty
 ```
 
@@ -154,6 +158,8 @@ npm run ah2d -- component delete --file game.ah2d.json --scene main player Colli
 Transform and Name are required and cannot be removed.
 
 Values must be JSON-safe objects or arrays, and component keys must be safe PascalCase names. The built-in registry is open-world: an unregistered custom type such as `Health` or `PlayerController` is accepted under `components.<Type>`, validated with the generic object/array schema, and preserved losslessly. Register its stronger schema with the Engine when runtime code needs defaults, normalization, aliases, or migrations; the standalone CLI exposes its built-in registry and does not load arbitrary game code.
+
+Skeleton rigs use the same generic Entity/Component commands; create all related Entities and Components in one atomic `apply` batch so the document never lands in a half-wired state. Semantic validation checks Skeleton ancestry/root, contiguous IK chains, Skin weights, Scene/Prefab scope, and per-Instance source-ID resolution. See [`../docs/SKELETONS.md`](../docs/SKELETONS.md) for the complete contract and examples.
 
 ## Prefab Assets, Instances, and overrides
 
