@@ -394,7 +394,7 @@ async function main(): Promise<void> {
     assert(engineDataModelIndex > enginePlanckIndex);
     assert(engineRuntimeIndex > engineDataModelIndex);
 
-    const frameResponse = await getEditorFrameRoute();
+    const frameResponse = await getEditorFrameRoute(new Request("http://localhost/api/editor/frame"));
     assert.equal(frameResponse.status, 200);
     const frameCsp = frameResponse.headers.get("content-security-policy") ?? "";
     assert.match(frameCsp, /default-src 'none'/);
@@ -418,6 +418,13 @@ async function main(): Promise<void> {
     assert.equal(frameSource.includes('<script src="./engine/AH2DEngine.js"></script>'), false);
     assert.equal(frameSource.includes('<script src="./engine/AH2DDataModel.js"></script>'), false);
     assert.match(frameSource, /const authoredKeys\s*=\s*\[[^\]]*"prefabs"/);
+    assert.match(frameSource, /const REQUEST_ORIGIN = "http:\/\/localhost"/);
+    assert.match(frameSource, /document\.referrer \? new URL\(document\.referrer\)\.origin : REQUEST_ORIGIN/);
+    assert.match(frameSource, /event\.source !== window\.parent \|\| event\.origin !== EXPECTED_PARENT_ORIGIN/);
+    assert.match(frameSource, /window\.__AH2D_HOSTED__ = window\.parent !== window/);
+    assert.match(frameSource, /postMessage\([^\n]+EXPECTED_PARENT_ORIGIN\)/);
+    assert.match(frameSource, /AH2D_SAVE_REQUEST/);
+    assert.match(frameSource, /AH2D_EDITOR_COMMAND/);
 
     const routeProjectResponse = await createProjectRoute(new Request("http://localhost/api/projects", {
       method: "POST",

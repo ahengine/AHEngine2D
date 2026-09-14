@@ -4,7 +4,7 @@
 
 ## مدل اعتماد: Studio عمومی و محلی
 
-Studio در حالت **no-auth/open local-trusted** اجرا می‌شود. هیچ ورود، حساب، نشست، نقش یا عضویت پروژه‌ای وجود ندارد. هر client شبکه‌ای که بتواند به Studio برسد می‌تواند همهٔ پروژه‌ها را فهرست کند، بخواند، بسازد و تغییر دهد؛ همچنین می‌تواند هر comment را تغییر دهد یا حذف کند و به streamهای realtime متصل شود.
+این سند API اختیاری Collaboration را توضیح می‌دهد. UI اصلی AH2D اکنون local-first است و از `/` فایل `project.ah2d.json` را مستقیماً روی دستگاه کاربر باز می‌کند؛ routeهای `/projects` به `/` redirect می‌شوند. API در حالت **no-auth/open local-trusted** باقی مانده است: هر client شبکه‌ای که به آن برسد می‌تواند رکوردهای سروری را فهرست کند، بخواند، بسازد و تغییر دهد و به streamهای realtime متصل شود.
 
 این مدل فقط برای دستگاه محلی یا شبکهٔ کاملاً قابل‌اعتماد مناسب است. Same-Origin check درخواست‌های mutation مرورگر، sandbox مربوط به Editor و CSP همچنان برقرارند، اما هیچ‌کدام مجوز دسترسی به API نیستند. درخواست مستقیم بدون header `Origin` نیز قابل‌پذیرش است. اگر سرویس از شبکهٔ قابل‌اعتماد بیرون می‌رود، آن را پشت محدودسازی شبکه، VPN یا reverse proxy دارای کنترل دسترسی مستقل قرار دهید.
 
@@ -78,7 +78,7 @@ Prefab Assetهای canonical در `document.prefabs` و Instanceهای expandش�
 
 ## Editor bridge و Autosave
 
-صفحهٔ `/projects/:projectId` محتوای `/api/editor/frame` را بارگذاری می‌کند. این route و `/api/editor/engine` عمومی‌اند. iframe عمداً `allow-same-origin` ندارد و با `sandbox="allow-scripts allow-downloads allow-modals"` اجرا می‌شود؛ بنابراین document داخل Frame یک origin مبهم (`null`) دارد و به storage یا DOM صفحهٔ والد دسترسی مستقیم ندارد. form، popup، top-level navigation و object/plugin نیز مجاز نیستند.
+صفحهٔ `/` محتوای `/api/editor/frame` را بارگذاری می‌کند. این route و `/api/editor/engine` عمومی‌اند. iframe عمداً `allow-same-origin` ندارد و با `sandbox="allow-scripts allow-downloads allow-modals"` اجرا می‌شود؛ بنابراین document داخل Frame یک origin مبهم (`null`) دارد و به filesystem handle، storage یا DOM صفحهٔ والد دسترسی مستقیم ندارد. form، popup، top-level navigation و object/plugin نیز مجاز نیستند.
 
 Frame، PixiJS، polyfill رسمی CSP-safe آن، Planck، DataModel و Engine را inline می‌کند. polyfill با نام packageِ `unsafe-eval` مسیرهای generated `Function` را حذف می‌کند و CSP همچنان این مجوز را نمی‌دهد. CSP به `default-src 'none'`، script/style inline، تصویر `data:`/`blob:`، font از `data:` و `connect-src 'none'` محدود است؛ `object-src`، `base-uri` و `form-action` نیز `none` هستند و `frame-ancestors 'self'` embedding خارجی را رد می‌کند. پاسخ `Referrer-Policy: no-referrer` و `X-Content-Type-Options: nosniff` نیز دارد.
 
@@ -96,7 +96,7 @@ npm install
 npm run dev
 ```
 
-سپس `http://localhost:3000` را باز کنید. Studio مستقیم صفحهٔ Projects را نمایش می‌دهد و setup کاربر ندارد.
+سپس `http://localhost:3000` را باز کنید. Editor مستقیم Open Project / New Project را نمایش می‌دهد. endpointهای این سند برای integration اختیاری‌اند و در UI اصلی launcher ندارند.
 
 | متغیر | پیش‌فرض | کاربرد |
 | --- | ---: | --- |

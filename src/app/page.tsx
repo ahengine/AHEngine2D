@@ -1,5 +1,5 @@
-import { redirect } from "next/navigation";
+import { LocalProjectWorkspace } from "@/components/local-project-workspace";
 
 export default function HomePage() {
-  redirect("/projects");
+  return <LocalProjectWorkspace />;
 }

@@ -11,11 +11,12 @@
     "build": "next build",
     "start": "next start",
     "ah2d": "node engine/cli/ah2d.js",
-    "test": "node engine/AH2DDataModel.test.js && node engine/AH2DEngine.test.js && node AH2DEdtior.prefab.test.js && node engine/cli/AH2DCLI.test.js && tsx --test src/lib/collaboration/collaboration.test.ts",
+    "test": "node engine/AH2DDataModel.test.js && node engine/AH2DEngine.test.js && node AH2DEdtior.prefab.test.js && node engine/cli/AH2DCLI.test.js && tsx --test src/lib/collaboration/collaboration.test.ts && npm run test:local-project",
     "test:editor": "node AH2DEdtior.prefab.test.js",
     "test:engine": "node engine/AH2DDataModel.test.js && node engine/AH2DEngine.test.js",
     "test:cli": "node engine/cli/AH2DCLI.test.js",
     "test:server": "tsx --test src/lib/collaboration/collaboration.test.ts",
+    "test:local-project": "tsx --test src/lib/local-project/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "node --check engine/AH2DDataModel.js && node --check engine/AH2DEngine.js && node --check engine/cli/AH2DProject.js && node --check engine/cli/ah2d.js && tsc --noEmit"
   },

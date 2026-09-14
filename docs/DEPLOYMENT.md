@@ -1,12 +1,13 @@
 # Deploying AH2D Studio
 
-این راهنما برای پوستهٔ Next.js و سرویس Collaboration است. Studio در حالت **no-auth/open local-trusted** اجرا می‌شود: هر client شبکه‌ای که به آن برسد می‌تواند همهٔ پروژه‌ها و mutationها را اجرا کند. آن را اینترنتی یا روی شبکهٔ غیرقابل‌اعتماد منتشر نکنید مگر اینکه محدودسازی شبکه یا reverse proxy مستقل جلوی آن قرار گرفته باشد.
+این راهنما برای پوستهٔ Next.js، Editor local-first و سرویس اختیاری Collaboration است. UI اصلی فایل پروژه را با permission مرورگر مستقیماً روی دستگاه کاربر باز می‌کند و داده را در سرور نگه نمی‌دارد. API اختیاری Collaboration همچنان **no-auth/open local-trusted** است و در صورت expose شدن باید با شبکه یا reverse proxy مستقل محدود شود.
 
 ## نیازمندی‌ها
 
 - Node.js `24` یا جدیدتر
 - dependencyهای lockشده با npm
-- یک volume محلی پایدار و قابل‌نوشتن برای deployment تک-process فعلی
+- Chromium جدید و HTTPS (یا localhost) برای دسترسی مستقیم به پوشهٔ کاربر
+- یک volume محلی پایدار فقط در صورت استفاده از API اختیاری Collaboration
 - محدودسازی دسترسی شبکه به hostهای مورداعتماد
 - HTTPS در صورت عبور traffic از شبکه
 
@@ -36,7 +37,7 @@ AH2D_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 
 `AH2D_ALLOWED_ORIGINS` فقط originهای اضافهٔ مجاز برای mutation مرورگر را مشخص می‌کند. این allowlist هویت client را ثابت نمی‌کند و request مستقیم بدون `Origin` را مسدود نمی‌کند.
 
-Studio را در `http://localhost:3000` باز کنید؛ صفحهٔ Projects مستقیماً نمایش داده می‌شود.
+Editor را در `http://localhost:3000` باز کنید؛ صفحهٔ شروع `Open Project` و `New Project` را نمایش می‌دهد. فایل‌های انتخاب‌شده روی دستگاه مرورگر می‌مانند. مسیر `/projects` فقط برای سازگاری به `/` redirect می‌شود.
 
 ## Build و اجرای production
 
@@ -190,13 +191,11 @@ npm test
 
 سپس این مسیر را آزمایش کنید:
 
-1. بازشدن مستقیم `/projects` بدون setup کاربر.
-2. ساخت Project و بازشدن Workspace.
-3. بازکردن همان Project در tab دوم و مشاهدهٔ presence.
-4. تغییر سند و افزایش revision در هر دو tab.
-5. ایجاد، resolve و حذف comment.
-6. دیدن actor label و Action در History با این آگاهی که label قابل‌اعتماد نیست.
-7. reconnect کردن SSE و reconciliation با آخرین revision.
-8. ردشدن mutation مرورگر با `Origin` غیرمجاز.
+1. بازشدن مستقیم `/` و نمایش فقط جریان Open/New.
+2. ساخت پروژه و ایجاد `<Project>/project.ah2d.json` روی سیستم کاربر.
+3. Open همان پوشه، تغییر Scene و ذخیرهٔ مستقیم با `Ctrl/Cmd + S`.
+4. تغییر فایل با CLI و مشاهدهٔ conflict به‌جای overwrite خاموش.
+5. بازشدن تمام‌صفحهٔ Editor و باقی‌ماندن iframe بدون `allow-same-origin`.
+6. در صورت استفاده از API اختیاری: revision، comment، SSE/presence و ردشدن mutation مرورگر با Origin غیرمجاز.
 
 قرارداد routeها و نمونه‌های client در [`COLLABORATION.md`](./COLLABORATION.md) قرار دارد.

@@ -1,36 +1,39 @@
 # AH2D Editor & Engine
 
-AH2D یک محیط Authoring دوبعدی، یک Studio مشارکتی مبتنی بر Next.js و یک هستهٔ Runtime مستقل از Framework است. صحنه، hierarchy، componentها، فیزیک، prefab، animation، particle و Post Process در قالب JSON نگه‌داری می‌شوند و همان داده می‌تواند توسط Canvas سفارشی، PixiJS، PhaserJS یا یک Runtime اختصاصی مصرف شود.
+AH2D یک Editor دوبعدی local-first مبتنی بر Next.js و یک هستهٔ Runtime مستقل از Framework است. پروژه مستقیماً از پوشهٔ انتخاب‌شده روی سیستم کاربر باز می‌شود و همان‌جا ذخیره می‌ماند. صحنه، hierarchy، componentها، فیزیک، prefab، animation، particle و Post Process در قالب JSON نگه‌داری می‌شوند و همان داده می‌تواند توسط Canvas سفارشی، PixiJS، PhaserJS یا یک Runtime اختصاصی مصرف شود.
 
 نسخهٔ فعلی Engine و CLI برابر `0.3.0` و نسخهٔ Universal Project برابر `4` است.
 
 ## معماری
 
 ```text
-AH2D Studio (Next.js)
-├── Open local-trusted Project API
-├── Comments + Action History
-├── SSE Events + Presence
-└── Public sandboxed Spatial Editor
-    └── AH2D Engine
-        ├── Scene Graph + ECS
-        ├── Transform / Camera / Lighting / Shadow
-        ├── Animation / Post Process / Tilemap
-        ├── Native Box2D-compatible Physics (Planck) + explicit built-in fallback
-        ├── PixiJS / PhaserJS / Custom adapters
-        └── Agent-friendly CLI
+AH2D Editor (Next.js)
+├── Open Project / New Project (Local File System)
+├── project.ah2d.json + serialized autosave
+├── Sandboxed Spatial Editor bridge
+├── Optional headless Collaboration API
+└── AH2D Engine
+    ├── Scene Graph + ECS
+    ├── Transform / Camera / Lighting / Shadow
+    ├── Animation / Post Process / Tilemap
+    ├── Native Box2D-compatible Physics (Planck) + explicit built-in fallback
+    ├── PixiJS / PhaserJS / Custom adapters
+    └── Agent-friendly CLI
 ```
 
 فایل‌های اصلی:
 
 - `AH2DEdtior.html`: خود Editor و Preview.
-- `src/app`: پوستهٔ Next.js، صفحه‌های Projects/Workspace و Route Handlerها.
+- `src/app`: پوستهٔ Next.js، ورودی مستقیم Editor و Route Handlerهای bridge/template.
+- `src/components/local-project-workspace.tsx`: Open/New، مالک handle فایل و Autosave مستقیم روی دیسک.
+- `src/lib/local-project`: تشخیص manifest، validation اولیه و I/O فایل پروژه.
 - `src/lib/collaboration`: ذخیرهٔ پروژه، actor label نمایشی، comment، history، presence و event stream.
 - `engine/AH2DEngine.js`: هستهٔ Runtime، ECS، Scene Graph و Physics.
 - `engine/AH2DDataModel.js`: قرارداد واحد Entity/Component، رجیستری schema، validation، migration و codec سازگار با داده‌های قدیمی.
 - `engine/cli/ah2d.js`: CLI مناسب Agent و CI؛ عملیات سند lossless است و اجرای فیزیک از Planck نصب‌شده استفاده می‌کند.
 - `engine/CLI.md`: مرجع کامل فرمان‌های CLI.
 - `docs/COLLABORATION.md`: قرارداد API عمومی، revision، attribution و realtime.
+- `docs/LOCAL_PROJECTS.md`: قرارداد پوشهٔ پروژه، مرورگرهای پشتیبانی‌شده و رفتار Save.
 - `docs/DEPLOYMENT.md`: اجرای Production و محدودیت storage محلی.
 - `docs/PHYSICS.md`: قرارداد کامل Box2D، واحدها، fixtureها، contactها، Play Mode و API بومی.
 - `Agent.md`: راهنمای توسعهٔ بازی توسط Agent.
@@ -46,7 +49,7 @@ npm install
 npm run dev
 ```
 
-سپس `http://localhost:3000` را باز کنید؛ Studio مستقیماً صفحهٔ Projects را نمایش می‌دهد. این سرویس در حالت no-auth/open local-trusted است: هر client شبکه‌ای که به آن برسد می‌تواند همهٔ پروژه‌ها و mutationها را اجرا کند. آن را فقط روی دستگاه یا شبکهٔ مورداعتماد در دسترس بگذارید.
+سپس `http://localhost:3000` را باز کنید. صفحهٔ اول فقط `Open Project` و `New Project` را نشان می‌دهد؛ پس از انتخاب، Editor تمام صفحه باز می‌شود. برای دسترسی مستقیم به پوشه از Chrome/Edge یا مرورگر Chromium جدید روی `localhost` یا HTTPS استفاده کنید. جزئیات در [راهنمای پروژه‌های لوکال](./docs/LOCAL_PROJECTS.md) آمده است.
 
 Build و اجرای Production:
 
@@ -57,7 +60,7 @@ npm run start
 
 ### Docker
 
-فایل `Dockerfile` یک image چندمرحله‌ای مبتنی بر خروجی standalone می‌سازد و سرویس را با user غیر-root اجرا می‌کند. داده‌های Collaboration باید روی volume پایدار `/var/lib/ah2d` قرار بگیرند:
+فایل `Dockerfile` یک image چندمرحله‌ای مبتنی بر خروجی standalone می‌سازد و سرویس را با user غیر-root اجرا می‌کند. پروژه‌های انتخاب‌شده توسط File System Access API روی دستگاه مرورگر می‌مانند و داخل container کپی نمی‌شوند. volume زیر فقط زمانی لازم است که API اختیاری Collaboration را نیز استفاده کنید:
 
 ```bash
 docker build -t ah2d-studio:latest .
@@ -95,9 +98,11 @@ python -m http.server 4173
 
 سپس آدرس `http://127.0.0.1:4173/AH2DEdtior.html` را باز کنید.
 
-## Studio مشارکتی و مدل اعتماد
+## پروژهٔ لوکال و API اختیاری Collaboration
 
-Studio برای استفادهٔ محلی و قابل‌اعتماد طراحی شده و هیچ مرحلهٔ ورود، حساب، نقش یا عضویت پروژه‌ای ندارد. همهٔ routeهای پروژه و Editor عمومی‌اند. endpoint مدیریت member و پنل People نیز وجود ندارد. هر client شبکه‌ای که به سرور دسترسی دارد می‌تواند تمام پروژه‌ها را بخواند و تغییر دهد، commentها را مدیریت کند و به SSE/presence متصل شود؛ بنابراین `AH2D_ALLOWED_ORIGINS` جایگزین ایزوله‌سازی شبکه نیست.
+UI اصلی از API پروژه استفاده نمی‌کند: فایل `project.ah2d.json` مستقیماً از طریق permission مرورگر خوانده و نوشته می‌شود و هیچ launcher یا فهرست پروژهٔ سروری در مسیر `/` وجود ندارد. routeهای `/projects` قدیمی به `/` برمی‌گردند.
+
+APIهای `/api/projects/*` برای integration یا Collaboration اختیاری باقی مانده‌اند و هیچ مرحلهٔ ورود، حساب، نقش یا عضویت پروژه‌ای ندارند. هر client شبکه‌ای که به آن API دسترسی دارد می‌تواند رکوردهای سروری را بخواند و تغییر دهد؛ بنابراین در صورت استفاده از API، آن را فقط روی شبکهٔ مورداعتماد expose کنید.
 
 برای attribution اختیاری، requestها headerهای `x-ah2d-actor-id` و `x-ah2d-actor-name` و stream SSE queryهای `actorId` و `actorName` را می‌پذیرند. fallback برابر `Local User` است. این labelها قابل‌جعل‌اند و هرگز مجوز یا هویت معتبر محسوب نمی‌شوند.
 
@@ -107,15 +112,18 @@ Editor تعبیه‌شده عمومی است، اما در iframe با origin ا
 
 ## خروجی‌های Editor
 
-### Save، Load و Export
+### Open، Save و Export در Web Editor
 
-- `Save` و `Ctrl/Cmd + S` کل پروژه را در `localStorage` با کلید `AH2D.Project.v4` ذخیره می‌کنند.
-- `Recent Project` ابتدا دادهٔ نسخهٔ ۴ و سپس کلید قدیمی `AH2D.Project.v3` را بررسی می‌کند.
-- `Save Scene` صحنهٔ فعال را داخل پروژه commit می‌کند و سپس کل پروژه را در `localStorage` ذخیره می‌کند؛ فایل Scene جدا تولید نمی‌شود.
+- `Open Project` یک پوشه را انتخاب می‌کند و ابتدا `project.ah2d.json`، سپس نام‌های سازگار قدیمی و یک فایل AH2D یکتای ریشه را پیدا می‌کند.
+- `New Project` داخل محل انتخاب‌شده یک پوشهٔ نام‌گذاری‌شده و فایل canonical برابر `project.ah2d.json` می‌سازد.
+- تغییرات با صف write و Autosave در همان فایل ذخیره می‌شوند؛ `Save`، `Save Scene` و `Ctrl/Cmd + S` صف را فوراً flush می‌کنند.
+- قبل از overwrite، محتوای فعلی فایل با نسخهٔ آخر خوانده‌شده مقایسه می‌شود. تغییر بیرونی توسط Agent/CLI به‌صورت conflict با انتخاب `Reload disk` یا `Overwrite` نمایش داده می‌شود.
+- در مرورگری که File System Access API ندارد، Open با file input انجام و Save به‌صورت دانلود یک نسخهٔ جدید ارائه می‌شود؛ UI این حالت را با `Download mode` مشخص می‌کند.
+- نسخهٔ standalone فایل `AH2DEdtior.html` همچنان از `localStorage` با کلید `AH2D.Project.v4` استفاده می‌کند.
 - `Export Universal JSON` فایل `AH2D_Project.json` را دانلود می‌کند. این فایل منبع اصلی و قابل‌حمل پروژه است.
 - `Export Animation JSON` فایل `<clip>.animation.json` می‌سازد.
 - `Export Particle JSON` فایل `<effect>.particle.json` می‌سازد.
-- تصاویر Importشده به شکل Data URL/Base64 داخل JSON قرار می‌گیرند. این خروجی self-contained است، اما تصاویر بزرگ می‌توانند حجم فایل و مصرف `localStorage` را زیاد کنند.
+- تصاویر Importشده به شکل Data URL/Base64 داخل JSON قرار می‌گیرند. این خروجی self-contained است، اما تصاویر بزرگ حجم فایل را زیاد می‌کنند و در نسخهٔ standalone مصرف `localStorage` را نیز بالا می‌برند.
 - اگر هنگام Play ذخیره یا Export انجام شود، Editor وضعیت Authoring قبل از Play را می‌نویسد، نه Transformهای موقت حاصل از simulation.
 
 ### Universal Project در برابر ECS Snapshot

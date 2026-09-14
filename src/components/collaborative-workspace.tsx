@@ -494,7 +494,7 @@ export function CollaborativeWorkspace({
         src="/api/editor/frame"
         title="AH2D Editor"
         sandbox="allow-scripts allow-downloads allow-modals"
-        referrerPolicy="no-referrer"
+        referrerPolicy="origin"
         onLoad={() => postToEditor({ type: "AH2D_STUDIO_READY" })}
       />
 

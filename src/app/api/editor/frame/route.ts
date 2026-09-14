@@ -9,6 +9,12 @@ const WORKSPACE_BRIDGE = String.raw`
 (() => {
   const SOURCE_EDITOR = "ah2d-editor";
   const SOURCE_STUDIO = "ah2d-studio";
+  const REQUEST_ORIGIN = __AH2D_PARENT_ORIGIN__;
+  const EXPECTED_PARENT_ORIGIN = (() => {
+    try { return document.referrer ? new URL(document.referrer).origin : REQUEST_ORIGIN; }
+    catch { return REQUEST_ORIGIN; }
+  })();
+  window.__AH2D_HOSTED__ = window.parent !== window;
   let lastSnapshot = "";
   let ignoreChangesUntil = 0;
   let readySent = false;
@@ -97,7 +103,7 @@ const WORKSPACE_BRIDGE = String.raw`
 
   function send(type, detail) {
     if (window.parent === window) return;
-    window.parent.postMessage({ source: SOURCE_EDITOR, type, ...(detail || {}) }, "*");
+    window.parent.postMessage({ source: SOURCE_EDITOR, type, ...(detail || {}) }, EXPECTED_PARENT_ORIGIN);
   }
 
   function readProject() {
@@ -131,7 +137,7 @@ const WORKSPACE_BRIDGE = String.raw`
   }
 
   window.addEventListener("message", (event) => {
-    if (event.source !== window.parent) return;
+    if (event.source !== window.parent || event.origin !== EXPECTED_PARENT_ORIGIN) return;
     const message = event.data;
     if (!message || message.source !== SOURCE_STUDIO) return;
 
@@ -141,14 +147,22 @@ const WORKSPACE_BRIDGE = String.raw`
     }
 
     if (message.type === "AH2D_LOAD_PROJECT" && message.document && typeof window.loadProject === "function") {
+      const previousBaseProject = baseProject;
+      const previousSnapshot = lastSnapshot;
+      const previousIgnoreChangesUntil = ignoreChangesUntil;
       try {
         ignoreChangesUntil = Date.now() + 1000;
         baseProject = clone(message.document);
-        window.loadProject(message.document);
+        const loaded = window.loadProject(message.document);
+        if (loaded !== true) throw new Error("Stop Preview before opening another Project.");
         const current = mergeProject(readProject());
+        if (!current) throw new Error("The Editor did not produce a project snapshot after loading.");
         lastSnapshot = current ? JSON.stringify(current) : "";
         send("AH2D_PROJECT_LOADED", { requestId: message.requestId || null });
       } catch (error) {
+        baseProject = previousBaseProject;
+        lastSnapshot = previousSnapshot;
+        ignoreChangesUntil = previousIgnoreChangesUntil;
         send("AH2D_BRIDGE_ERROR", {
           requestId: message.requestId || null,
           message: error instanceof Error ? error.message : String(error),
@@ -158,6 +172,26 @@ const WORKSPACE_BRIDGE = String.raw`
     }
 
     if (message.type === "AH2D_REQUEST_PROJECT") publishIfChanged(true);
+    if (message.type === "AH2D_SAVE_RESULT" && typeof window.toast === "function") {
+      window.toast(message.ok ? "Project saved to disk" : (message.message || "Project save failed"));
+    }
+  });
+
+  window.addEventListener("ah2d:host-command", (event) => {
+    const detail = event && event.detail && typeof event.detail === "object" ? event.detail : {};
+    const command = String(detail.command || "");
+    if (command === "save") {
+      const editorDocument = detail.document || readProject();
+      if (!editorDocument) return;
+      const document = mergeProject(editorDocument);
+      lastSnapshot = JSON.stringify(document);
+      baseProject = clone(document);
+      send("AH2D_SAVE_REQUEST", { document });
+      return;
+    }
+    if (["new", "open", "recent"].includes(command)) {
+      send("AH2D_EDITOR_COMMAND", { command });
+    }
   });
 
   let lastPresence = "";
@@ -194,7 +228,7 @@ const WORKSPACE_BRIDGE = String.raw`
 })();
 </script>`;
 
-export async function GET() {
+export async function GET(request: Request) {
   const [editorSource, pixiSource, pixiCspSource, planckSource, dataModelSource, engineSource] = await Promise.all([
     readFile(path.join(process.cwd(), "AH2DEdtior.html"), "utf8"),
     readFile(path.join(process.cwd(), "node_modules", "pixi.js", "dist", "pixi.min.js"), "utf8"),
@@ -222,7 +256,8 @@ export async function GET() {
       () => `<script>${dataModelSource.replace(/<\/script/gi, "<\\/script")}</script>\n` +
         `<script>${engineSource.replace(/<\/script/gi, "<\\/script")}</script>`,
     );
-  html = html.replace("</body>", `${WORKSPACE_BRIDGE}\n</body>`);
+  const bridge = WORKSPACE_BRIDGE.replace("__AH2D_PARENT_ORIGIN__", JSON.stringify(new URL(request.url).origin));
+  html = html.replace("</body>", `${bridge}\n</body>`);
 
   return new Response(html, {
     headers: {

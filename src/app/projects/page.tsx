@@ -1,7 +1,5 @@
-import { ProjectDashboard } from "@/components/project-dashboard";
-
-export const dynamic = "force-dynamic";
+import { redirect } from "next/navigation";
 
 export default function ProjectsPage() {
-  return <ProjectDashboard />;
+  redirect("/");
 }
