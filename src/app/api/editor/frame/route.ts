@@ -195,9 +195,11 @@ const WORKSPACE_BRIDGE = String.raw`
 </script>`;
 
 export async function GET() {
-  const [editorSource, pixiSource, dataModelSource, engineSource] = await Promise.all([
+  const [editorSource, pixiSource, pixiCspSource, planckSource, dataModelSource, engineSource] = await Promise.all([
     readFile(path.join(process.cwd(), "AH2DEdtior.html"), "utf8"),
     readFile(path.join(process.cwd(), "node_modules", "pixi.js", "dist", "pixi.min.js"), "utf8"),
+    readFile(path.join(process.cwd(), "node_modules", "pixi.js", "dist", "packages", "unsafe-eval.min.js"), "utf8"),
+    readFile(path.join(process.cwd(), "node_modules", "planck", "dist", "planck.min.js"), "utf8"),
     readFile(path.join(process.cwd(), "engine", "AH2DDataModel.js"), "utf8"),
     readFile(path.join(process.cwd(), "engine", "AH2DEngine.js"), "utf8"),
   ]);
@@ -205,6 +207,14 @@ export async function GET() {
     .replace(
       '<script src="./node_modules/pixi.js/dist/pixi.min.js"></script>',
       () => `<script>${pixiSource.replace(/<\/script/gi, "<\\/script")}</script>`,
+    )
+    .replace(
+      '<script src="./node_modules/pixi.js/dist/packages/unsafe-eval.min.js"></script>',
+      () => `<script>${pixiCspSource.replace(/<\/script/gi, "<\\/script")}</script>`,
+    )
+    .replace(
+      '<script src="./node_modules/planck/dist/planck.min.js"></script>',
+      () => `<script>${planckSource.replace(/<\/script/gi, "<\\/script")}</script>`,
     )
     .replace('<script src="./engine/AH2DDataModel.js"></script>', "")
     .replace(

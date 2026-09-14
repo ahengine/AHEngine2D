@@ -78,7 +78,7 @@ Componentهای document با profile `authoring` و در حالت strict اعت
 
 صفحهٔ `/projects/:projectId` محتوای `/api/editor/frame` را بارگذاری می‌کند. این route و `/api/editor/engine` عمومی‌اند. iframe عمداً `allow-same-origin` ندارد و با `sandbox="allow-scripts allow-downloads allow-modals"` اجرا می‌شود؛ بنابراین document داخل Frame یک origin مبهم (`null`) دارد و به storage یا DOM صفحهٔ والد دسترسی مستقیم ندارد. form، popup، top-level navigation و object/plugin نیز مجاز نیستند.
 
-Frame، DataModel و Engine را inline می‌کند. CSP آن به `default-src 'none'`، script/style inline، تصویر `data:`/`blob:`، font از `data:` و `connect-src 'none'` محدود است؛ `object-src`، `base-uri` و `form-action` نیز `none` هستند و `frame-ancestors 'self'` embedding خارجی را رد می‌کند. پاسخ `Referrer-Policy: no-referrer` و `X-Content-Type-Options: nosniff` نیز دارد.
+Frame، PixiJS، polyfill رسمی CSP-safe آن، Planck، DataModel و Engine را inline می‌کند. polyfill با نام packageِ `unsafe-eval` مسیرهای generated `Function` را حذف می‌کند و CSP همچنان این مجوز را نمی‌دهد. CSP به `default-src 'none'`، script/style inline، تصویر `data:`/`blob:`، font از `data:` و `connect-src 'none'` محدود است؛ `object-src`، `base-uri` و `form-action` نیز `none` هستند و `frame-ancestors 'self'` embedding خارجی را رد می‌کند. پاسخ `Referrer-Policy: no-referrer` و `X-Content-Type-Options: nosniff` نیز دارد.
 
 bridge محدود `postMessage` را حفظ کنید. Receiver والد باید `event.source === iframe.contentWindow`، origin موردانتظار و marker `source: "ah2d-editor"` را باهم بررسی کند. Receiver داخل Frame فقط پیام همان `window.parent` با marker `source: "ah2d-studio"` را می‌پذیرد. marker به‌تنهایی کافی نیست.
 
@@ -86,7 +86,7 @@ Workspace سند versioned را با `AH2D_LOAD_PROJECT` داخل Editor می‌
 
 ## راه‌اندازی و تنظیمات
 
-حداقل Node.js برابر `20.9` است:
+حداقل Node.js برابر `24` است:
 
 ```powershell
 Copy-Item .env.example .env.local

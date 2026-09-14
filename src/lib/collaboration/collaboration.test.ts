@@ -386,24 +386,35 @@ async function main(): Promise<void> {
     const engineResponse = await getEditorEngineRoute();
     assert.equal(engineResponse.status, 200);
     const engineBundle = await engineResponse.text();
+    const enginePlanckIndex = engineBundle.indexOf("Planck.js v1.5.0");
     const engineDataModelIndex = engineBundle.indexOf("root.AH2DDataModel = api");
     const engineRuntimeIndex = engineBundle.indexOf("const DataModel = global.AH2DDataModel");
+    assert(enginePlanckIndex >= 0);
     assert(engineDataModelIndex >= 0);
+    assert(engineDataModelIndex > enginePlanckIndex);
     assert(engineRuntimeIndex > engineDataModelIndex);
 
     const frameResponse = await getEditorFrameRoute();
     assert.equal(frameResponse.status, 200);
-    assert.match(frameResponse.headers.get("content-security-policy") ?? "", /default-src 'none'/);
+    const frameCsp = frameResponse.headers.get("content-security-policy") ?? "";
+    assert.match(frameCsp, /default-src 'none'/);
+    assert.doesNotMatch(frameCsp, /script-src[^;]*'unsafe-eval'/);
     assert.equal(frameResponse.headers.get("referrer-policy"), "no-referrer");
     const frameSource = await frameResponse.text();
     const framePixiIndex = frameSource.indexOf("var PIXI=(function");
+    const framePixiCspIndex = frameSource.indexOf("generateUniformsSyncPolyfill");
+    const framePlanckIndex = frameSource.indexOf("Planck.js v1.5.0");
     const frameDataModelIndex = frameSource.indexOf("root.AH2DDataModel = api");
     const frameRuntimeIndex = frameSource.indexOf("const DataModel = global.AH2DDataModel");
     assert(framePixiIndex >= 0);
+    assert(framePixiCspIndex > framePixiIndex);
+    assert(framePlanckIndex > framePixiCspIndex);
     assert(frameDataModelIndex >= 0);
     assert(frameRuntimeIndex > frameDataModelIndex);
-    assert(frameDataModelIndex > framePixiIndex);
+    assert(frameDataModelIndex > framePlanckIndex);
     assert.equal(frameSource.includes('<script src="./node_modules/pixi.js/dist/pixi.min.js"></script>'), false);
+    assert.equal(frameSource.includes('<script src="./node_modules/pixi.js/dist/packages/unsafe-eval.min.js"></script>'), false);
+    assert.equal(frameSource.includes('<script src="./node_modules/planck/dist/planck.min.js"></script>'), false);
     assert.equal(frameSource.includes('<script src="./engine/AH2DEngine.js"></script>'), false);
     assert.equal(frameSource.includes('<script src="./engine/AH2DDataModel.js"></script>'), false);
 

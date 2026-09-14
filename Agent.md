@@ -358,14 +358,19 @@ Use `engine.destroyEntity(id, { childPolicy: 'reject' | 'cascade' | 'reparent' |
 
 ## Physics rules
 
+- `box2d` is the default requested backend and is executed by the bundled `planck` implementation. An unlocked `new Engine()` honors Universal Project `engine.physics`; a constructor `physics` option is an intentional fixed host override. Assert `engine.physics.backend === 'box2d'`, `implementation === 'planck'`, and `native === true` in physics-sensitive startup/tests.
 - Project coordinates are pixels; native Box2D/Planck conversion uses `pixelsPerMeter`.
 - Positive Y points down in the Editor convention.
 - Rotation and angular velocity are degrees and degrees per second.
 - An Entity with Collider but no Rigidbody is static.
+- A `Collider` may be one object, an array, or a wrapper containing `colliders`/`shapes`; keep a stable ID on every fixture and make every explicit fixture ID unique within its Entity.
+- Change scale with `engine.physics.setPixelsPerMeter(value)`, never by assigning `pixelsPerMeter` directly. Native bodies are rebuilt while their pixel-space state is preserved.
 - Call `engine.update(0)` after load/create when direct `engine.physics.*` methods must be available immediately.
 - Use fixed `dt` such as `1 / 60` in deterministic tests.
 - Use collision category/mask fields for filtering instead of filtering events after contact resolution.
 - Use Trigger colliders for pickups, exits, checkpoints, and damage zones.
+- Use `physics:collisionstart/stay/end` and `physics:triggerenter/stay/exit`; do not run a second overlap detector beside native contacts.
+- Select the dependency-independent solver only explicitly with Project `engine.physics: 'builtin'`, constructor `{ physics: 'builtin' }`, or CLI `--backend builtin`.
 
 ```js
 engine.update(0);
@@ -388,6 +393,8 @@ npm run ah2d -- simulate --file game.ah2d.json --scene level-1 --steps 600 --dt 
 
 Use `--commit --write` only when the user explicitly wants the simulated final transforms and velocities written into the authoring project.
 
+Planck-native escape hatches are `getNativeWorld()`, `getNativeBody(entityId)`, and `getNativeFixture(entityId, colliderId)`. Keep returned objects in Runtime code only; never serialize them into the Universal Project. The authored contract currently covers box/circle fixtures, not polygon/chain/joint definitions. Read [`docs/PHYSICS.md`](./docs/PHYSICS.md) before extending that contract.
+
 ## Renderer integration
 
 ### Custom Canvas
@@ -398,7 +405,7 @@ Skip Entities with the `Hidden` component. Keep loaded `Image`, `Texture`, and G
 
 ### PixiJS
 
-AH2D ships with PixiJS v8 as a dependency and its `pixijs` adapter owns the base ECS-to-display mapping. In a plain Browser page load the scripts in this order: `pixi.min.js`, `AH2DDataModel.js`, then `AH2DEngine.js`. With a bundler, import `pixi.js` and pass its namespace explicitly.
+AH2D ships with PixiJS v8 and Planck as dependencies. In a plain Browser page load the scripts in this order: `pixi.min.js`, Pixi's CSP-safe `dist/packages/unsafe-eval.min.js` polyfill, `planck.min.js`, `AH2DDataModel.js`, then `AH2DEngine.js`. Despite its package name, that Pixi polyfill replaces generated `Function` paths with static synchronizers so Play Mode works without granting CSP `unsafe-eval`. With a bundler, import `pixi.js` plus `pixi.js/unsafe-eval` and pass its namespace explicitly; Engine resolves Planck in Node or accepts it as `box2d`.
 
 ```js
 engine.useRuntime('pixijs', {
@@ -454,6 +461,10 @@ Browser bootstrap:
 ```html
 <!-- Required before the Engine when the native PixiJS runtime is selected. -->
 <script src="./node_modules/pixi.js/dist/pixi.min.js"></script>
+<!-- CSP-safe static synchronizers required when unsafe-eval is forbidden. -->
+<script src="./node_modules/pixi.js/dist/packages/unsafe-eval.min.js"></script>
+<!-- Required before the Engine for native Box2D-compatible physics. -->
+<script src="./node_modules/planck/dist/planck.min.js"></script>
 <script src="./engine/AH2DDataModel.js"></script>
 <script src="./engine/AH2DEngine.js"></script>
 ```
@@ -463,7 +474,9 @@ Node bootstrap:
 ```js
 global.window = global;
 require('./engine/AH2DEngine.js');
-const engine = new global.AH2D.Engine({ physics: 'builtin' });
+const engine = new global.AH2D.Engine(); // Resolves the installed `planck` package.
+
+if (!engine.physics.native) throw new Error('Native Box2D backend is required');
 ```
 
 Recommended test layers:

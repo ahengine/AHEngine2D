@@ -284,6 +284,50 @@
     shapes: { type: 'array', items: COLLIDER_ITEM_SCHEMA }
   });
   const COLLIDER_SCHEMA = { anyOf: [COLLIDER_RECORD_SCHEMA, { type: 'array', items: COLLIDER_RECORD_SCHEMA }] };
+  const COLLIDER_COMPONENT_TYPES = Object.freeze([
+    'Collider', 'BoxCollider', 'BoxCollider2D', 'CircleCollider', 'CircleCollider2D'
+  ]);
+  const COLLIDER_COMPONENT_TYPE_SET = new Set(COLLIDER_COMPONENT_TYPES);
+
+  function colliderFixtureEntries(value, pointer = '') {
+    const fixtures = [];
+    const visit = (entry, entryPointer) => {
+      if (!isPlainObject(entry)) return;
+      const nested = Array.isArray(entry.colliders)
+        ? { key: 'colliders', value: entry.colliders }
+        : (Array.isArray(entry.shapes) ? { key: 'shapes', value: entry.shapes } : null);
+      if (nested) {
+        const nestedPointer = joinPointer(entryPointer, nested.key);
+        nested.value.forEach((fixture, index) => visit(fixture, joinPointer(nestedPointer, index)));
+        return;
+      }
+      fixtures.push({ value: entry, pointer: entryPointer });
+    };
+    if (Array.isArray(value)) value.forEach((entry, index) => visit(entry, joinPointer(pointer, index)));
+    else visit(value, pointer);
+    return fixtures;
+  }
+
+  function colliderIdDiagnostics(value, pointer = '') {
+    const diagnostics = [];
+    const seen = new Map();
+    for (const fixture of colliderFixtureEntries(value, pointer)) {
+      const id = fixture.value.id;
+      // Missing and empty ids receive deterministic per-Entity runtime ids, so
+      // only explicit ids can collide in the native fixture lookup.
+      if (typeof id !== 'string' || !id) continue;
+      const idPointer = joinPointer(fixture.pointer, 'id');
+      if (seen.has(id)) {
+        diagnostics.push(diagnostic(
+          'E_COLLIDER_ID_DUPLICATE',
+          `Duplicate Collider id within Entity: ${id}`,
+          idPointer,
+          { colliderId: id, firstPointer: seen.get(id) }
+        ));
+      } else seen.set(id, idPointer);
+    }
+    return diagnostics;
+  }
   const PREFAB_SCHEMA = object({ assetId: nullableString(), prefabId: nullableString(), overrides: object() });
   const CAMERA_SCHEMA = object({
     active: boolean(), zoom: number({ exclusiveMinimum: 0 }), viewportWidth: number({ minimum: 0 }), viewportHeight: number({ minimum: 0 }),
@@ -554,7 +598,9 @@
       }
       const definition = this._definitions.get(canonical);
       const schema = definition ? definition.schemas[profileName(options.profile)] : genericDescriptor(canonical).schemas[profileName(options.profile)];
-      return validateSchema(value, schema, pointer, [], options);
+      const diagnostics = validateSchema(value, schema, pointer, [], options);
+      if (definition && COLLIDER_COMPONENT_TYPE_SET.has(definition.type)) diagnostics.push(...colliderIdDiagnostics(value, pointer));
+      return diagnostics;
     }
 
     assert(type, value, options = {}) {
@@ -871,6 +917,30 @@
         const resolved = this.resolve(entity, type);
         for (const conflict of resolved.conflicts) {
           diagnostics.push(diagnostic('E_COMPONENT_CONFLICT', `${type} has conflicting values at ${resolved.storage} and ${conflict.storage}`, `${base}${pointerForStorage(resolved.storage)}`, { type, selected: resolved.storage, conflicting: conflict.storage }, options.strict ? 'error' : 'warning'));
+        }
+      }
+      const colliderIds = new Map();
+      for (const type of COLLIDER_COMPONENT_TYPES) {
+        if (!this.registry._definition(type)) continue;
+        const resolved = this.resolve(entity, type);
+        if (!resolved.found) continue;
+        const componentPointer = `${base}${pointerForStorage(resolved.storage)}`;
+        for (const fixture of colliderFixtureEntries(resolved.value, componentPointer)) {
+          const id = fixture.value.id;
+          if (typeof id !== 'string' || !id) continue;
+          const idPointer = joinPointer(fixture.pointer, 'id');
+          const first = colliderIds.get(id);
+          // Component validation already reports duplicates inside one Collider
+          // value. This entity-level pass covers ids reused by another Collider
+          // component type, matching the shared runtime fixture namespace.
+          if (first && first.type !== type) {
+            diagnostics.push(diagnostic(
+              'E_COLLIDER_ID_DUPLICATE',
+              `Duplicate Collider id within Entity: ${id}`,
+              idPointer,
+              { entityId: entity.id, colliderId: id, component: type, firstComponent: first.type, firstPointer: first.pointer }
+            ));
+          } else if (!first) colliderIds.set(id, { type, pointer: idPointer });
         }
       }
       return diagnostics;

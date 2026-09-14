@@ -16,7 +16,7 @@ AH2D Studio (Next.js)
         ├── Scene Graph + ECS
         ├── Transform / Camera / Lighting / Shadow
         ├── Animation / Post Process / Tilemap
-        ├── Box2D adapter + deterministic fallback
+        ├── Native Box2D-compatible Physics (Planck) + explicit built-in fallback
         ├── PixiJS / PhaserJS / Custom adapters
         └── Agent-friendly CLI
 ```
@@ -28,16 +28,17 @@ AH2D Studio (Next.js)
 - `src/lib/collaboration`: ذخیرهٔ پروژه، actor label نمایشی، comment، history، presence و event stream.
 - `engine/AH2DEngine.js`: هستهٔ Runtime، ECS، Scene Graph و Physics.
 - `engine/AH2DDataModel.js`: قرارداد واحد Entity/Component، رجیستری schema، validation، migration و codec سازگار با داده‌های قدیمی.
-- `engine/cli/ah2d.js`: CLI بدون dependency برای Agent و CI.
+- `engine/cli/ah2d.js`: CLI مناسب Agent و CI؛ عملیات سند lossless است و اجرای فیزیک از Planck نصب‌شده استفاده می‌کند.
 - `engine/CLI.md`: مرجع کامل فرمان‌های CLI.
 - `docs/COLLABORATION.md`: قرارداد API عمومی، revision، attribution و realtime.
 - `docs/DEPLOYMENT.md`: اجرای Production و محدودیت storage محلی.
+- `docs/PHYSICS.md`: قرارداد کامل Box2D، واحدها، fixtureها، contactها، Play Mode و API بومی.
 - `Agent.md`: راهنمای توسعهٔ بازی توسط Agent.
 - `AGENTS.md`: دستورالعمل کوتاه و استاندارد Agentهای کدنویسی.
 
 ## شروع سریع
 
-برای Studio به Node.js `20.9` یا جدیدتر نیاز دارید. ابتدا dependencyها و تنظیمات محلی را آماده کنید:
+برای Studio به Node.js `24` یا جدیدتر نیاز دارید. ابتدا dependencyها و تنظیمات محلی را آماده کنید:
 
 ```powershell
 Copy-Item .env.example .env.local
@@ -191,7 +192,8 @@ Registry پیش‌فرض این componentها را می‌شناسد: `Name`، `
     "runtime": "custom",
     "runtimeBackend": "custom",
     "physics": "box2d",
-    "physicsBackend": "builtin",
+    "physicsBackend": "box2d",
+    "physicsImplementation": "planck",
     "gravity": { "x": 0, "y": 980 },
     "pixelsPerMeter": 100,
     "compatibleRuntimes": ["pixijs", "phaserjs", "custom"]
@@ -422,6 +424,7 @@ my-game/
   </head>
   <body>
     <canvas id="game" width="1920" height="1080"></canvas>
+    <script src="./node_modules/planck/dist/planck.min.js"></script>
     <script src="./engine/AH2DDataModel.js"></script>
     <script src="./engine/AH2DEngine.js"></script>
     <script type="module" src="./src/main.js"></script>
@@ -438,15 +441,11 @@ const project = await fetch('../game.ah2d.json').then(response => {
 });
 
 const engine = new AH2D.Engine({
-  physics: 'builtin',
-  gravity: project.engine?.gravity ?? { x: 0, y: 980 },
-  physicsOptions: {
-    pixelsPerMeter: project.engine?.pixelsPerMeter ?? 100,
-    maxStep: 1 / 120
-  }
+  // Box2D/Planck انتخاب پیش‌فرض است.
+  physicsOptions: { maxStep: 1 / 120, maxSubSteps: 32 }
 });
 
-engine.load(project);
+engine.load(project); // gravity و pixelsPerMeter را از project.engine می‌خواند.
 const authoredScene = project.scenes.find(scene => scene.id === engine.activeSceneId);
 for (const object of authoredScene?.objects || []) {
   engine.ecs.add(object.id, 'RenderOrder', { layer: object.layer ?? 0 });
@@ -455,9 +454,10 @@ engine.update(0); // ساخت bodyهای Physics بدون جلو رفتن زما
 
 console.log('Scene:', engine.activeSceneId);
 console.log('Entities:', [...engine.ecs.entities]);
+console.log('Physics:', engine.physics.backend, engine.physics.implementation, engine.physics.native);
 ```
 
-در Browser، `AH2DDataModel.js` قرارداد را روی `window.AH2DDataModel` و `AH2DEngine.js` API اجرا را روی `window.AH2D` قرار می‌دهد؛ در Node، خود Engine وابستگی DataModel را با `require` بارگذاری می‌کند.
+در Browser، Planck باید پیش از Engine بارگذاری شود؛ `AH2DDataModel.js` قرارداد را روی `window.AH2DDataModel` و `AH2DEngine.js` API اجرا را روی `window.AH2D` قرار می‌دهد. در Node، Engine dependencyهای لازم را از package نصب‌شده resolve می‌کند.
 
 ### حلقهٔ بازی و Custom Canvas Renderer
 
@@ -737,12 +737,24 @@ Collider نمونه:
 }
 ```
 
+یک Entity می‌تواند چند fixture داشته باشد. `Collider` می‌تواند خودش array باشد یا array را در `colliders`/`shapes` نگه دارد. برای هر fixture یک `id` پایدار بگذارید:
+
+```js
+Collider: {
+  colliders: [
+    { id: 'body', shape: 'box', width: 48, height: 72, density: 1 },
+    { id: 'feet', shape: 'box', width: 30, height: 8, offsetY: 38, isTrigger: true }
+  ]
+}
+```
+
 Entity دارای Collider و بدون Rigidbody به‌صورت static رفتار می‌کند. API کنترل Physics:
 
 ```js
 engine.update(0); // bodyها را با ECS sync می‌کند
 
 engine.physics.setGravity({ x: 0, y: 980 });
+engine.physics.setPixelsPerMeter(100);
 engine.physics.setVelocity('player', 180, 0);
 engine.physics.setAngularVelocity('crate', 45);
 engine.physics.applyForce('player', { x: 500, y: 0 });
@@ -753,7 +765,9 @@ engine.physics.wake('player');
 engine.physics.sleep('crate');
 ```
 
-در صورت فراهم بودن API سازگار Box2D/Planck، `Box2DPhysicsAdapter` از آن استفاده می‌کند. در غیر این صورت backend داخلی deterministic فعال می‌شود. `engine.physics.backend` اجرای واقعی را گزارش می‌دهد.
+backend پیش‌فرض `box2d` است و با implementation بومی `planck` اجرا می‌شود. `engine.physics.backend === 'box2d'`، `implementation === 'planck'` و `native === true` را پیش از Play/Simulation حساس بررسی کنید. اگر dependency بومی موجود نباشد adapter وضعیت `fallback` را شفاف گزارش می‌کند. backend داخلی با `engine.physics: "builtin"` در Universal Project انتخاب می‌شود؛ `{ physics: 'builtin' }` در constructor نیز override ثابتی برای کد میزبان است.
+
+برای extensionهای خاص بازی، handleهای بومی با `getNativeWorld()`، `getNativeBody(entityId)` و `getNativeFixture(entityId, colliderId)` در دسترس‌اند. آن‌ها Runtime-only هستند و نباید در Universal JSON ذخیره شوند. جزئیات واحدها، lifecycle، contactها، substepها و CLI در [راهنمای Physics](./docs/PHYSICS.md) آمده است.
 
 ### Collision و Trigger
 
@@ -867,13 +881,18 @@ PixiJS v8 وابستگی Runtime است. در صفحهٔ Browser، bundle آن �
 
 ```html
 <script src="./node_modules/pixi.js/dist/pixi.min.js"></script>
+<script src="./node_modules/pixi.js/dist/packages/unsafe-eval.min.js"></script>
+<script src="./node_modules/planck/dist/planck.min.js"></script>
 <script src="./engine/AH2DDataModel.js"></script>
 <script src="./engine/AH2DEngine.js"></script>
 ```
 
-در یک bundler می‌توانید `import * as PIXI from 'pixi.js'` انجام دهید و namespace را صریح به adapter بدهید:
+فایل دوم polyfill رسمی CSP-safe خود Pixi است؛ برخلاف نام package، مسیرهای generated `Function` را با synchronizerهای ایستا جایگزین می‌کند و به مجوز CSP با نام `unsafe-eval` نیاز ندارد. در یک bundler، `pixi.js` و سپس `pixi.js/unsafe-eval` را import کنید و namespace را صریح به adapter بدهید:
 
 ```js
+import * as PIXI from 'pixi.js';
+import 'pixi.js/unsafe-eval';
+
 engine.useRuntime('pixijs', {
   PIXI,
   designWidth: 1920,
@@ -943,10 +962,7 @@ require('../engine/AH2DEngine.js');
 
 const fs = require('node:fs');
 const project = JSON.parse(fs.readFileSync('game.ah2d.json', 'utf8'));
-const engine = new global.AH2D.Engine({
-  physics: 'builtin',
-  gravity: project.engine?.gravity
-});
+const engine = new global.AH2D.Engine(); // package `planck` را resolve می‌کند.
 
 engine.load(project, { sceneId: 'level-1' });
 for (let frame = 0; frame < 600; frame += 1) {
@@ -961,7 +977,10 @@ CLI نیز simulation ثابت و تکرارپذیر ارائه می‌کند:
 
 ```powershell
 npm run ah2d -- simulate --file game.ah2d.json --scene level-1 --steps 600 --dt 0.0166666667 --pretty
+npm run ah2d -- simulate --file game.ah2d.json --scene level-1 --backend builtin --steps 600 --dt 0.0166666667 --pretty
 ```
+
+فرمان اول backend ذخیره‌شدهٔ Project را اجرا می‌کند؛ `--backend builtin` فقط یک override اجرایی برای تست solver داخلی است و Project را تغییر نمی‌دهد.
 
 ## API سریع
 
@@ -1035,7 +1054,7 @@ engine.events.emit(type, payload)
 - `prefab` فعلاً یک workspace سراسری و flat است، نه مجموعه‌ای کامل از definition/variant/overrideها.
 - Animation export فعلاً metadata و eventهای hard-coded clip را ذخیره می‌کند؛ frame image، curve و hitbox serialization کامل نیست و Project Load آن را مصرف نمی‌کند.
 - Particle export پارامترهای emitter را ذخیره می‌کند؛ texture، gradient، curve keyها و live particleها صادر نمی‌شوند.
-- Editor در UI برای هر Entity یک Rigidbody و یک Collider flat مدیریت می‌کند؛ Runtime می‌تواند componentهای سفارشی بیشتری داشته باشد.
+- Editor چند fixture مستقل box/circle را روی یک Entity مدیریت می‌کند. polygon/chain/joint هنوز قرارداد Authoring داخل Universal JSON ندارند؛ در صورت نیاز بازی از handle بومی Runtime استفاده کند.
 - دادهٔ `playing` در Particle export وضعیت Preview Editor است و نباید به‌تنهایی مبنای lifecycle Runtime قرار گیرد.
 
 این محدودیت‌ها باید هنگام نوشتن importer یا Runtime سفارشی لحاظ شوند؛ مستندات قابلیت‌هایی را که هنوز در خروجی وجود ندارند تضمین نمی‌کند.
@@ -1050,6 +1069,6 @@ npm test
 npm run ah2d -- validate --file game.ah2d.json --engine --pretty
 ```
 
-Test suite شامل hierarchy عمیق و چندریشه، local/world Transform، propagation، traversal، تشخیص cycle/ID تکراری، Reparent و Delete با preserve-world، rollback اتمیک برای shear/singular، Multi-Scene، Runtime selection، Rigidbody، colliderهای box/circle، trigger، collision filtering، auto mass، impulse، kinematic body، sleeping، snapshot/restore، مسیر Box2D و قرارداد Editor است.
+Test suite شامل hierarchy عمیق و چندریشه، local/world Transform، propagation، traversal، تشخیص cycle/ID تکراری، Reparent و Delete با preserve-world، rollback اتمیک برای shear/singular، Multi-Scene، Runtime selection، Rigidbody، multi-fixture box/circle، trigger، contact بومی، collision filtering، auto mass، force/torque/impulse، kinematic body، sleeping، snapshot/restore، substep، lifecycle و قرارداد Editor است.
 
 برای workflow استاندارد توسعه توسط Agent، [`Agent.md`](./Agent.md) را بخوانید.

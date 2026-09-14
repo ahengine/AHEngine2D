@@ -4,7 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const {
-  PROTOCOL, PROJECT_VERSION, EXIT, DomainError, clone, detectDialect, createProject,
+  PROTOCOL, PROJECT_VERSION, PHYSICS_BACKENDS, PHYSICS_IMPLEMENTATIONS, EXIT, DomainError, clone, detectDialect, createProject,
   DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES, componentRegistry,
   migrateDocument, syncActiveMirror, validateDocument, assertValid, resolveScene,
   resolveEntity, entityName, applyOperations, applyJsonPatch, mergePatch, getPointer,
@@ -178,31 +178,82 @@ function loadEngine() {
   } catch (error) { throw new DomainError('E_ENGINE_LOAD', `Unable to load AH2D Engine: ${error.message}`, { exitCode: EXIT.ENGINE, details: { enginePath: path.join(__dirname, '..', 'AH2DEngine.js') } }); }
 }
 
-function validateWithEngine(document) {
-  const AH2D = loadEngine(), diagnostics = [];
+function normalizePhysicsBackend(value, source = '--backend') {
+  const backend = String(value == null ? 'box2d' : value).toLowerCase();
+  if (!PHYSICS_BACKENDS.has(backend)) {
+    throw new DomainError('E_PHYSICS_BACKEND', `Unsupported physics backend: ${value}`, {
+      exitCode: EXIT.USAGE,
+      details: { source, allowed: [...PHYSICS_BACKENDS] }
+    });
+  }
+  return backend;
+}
+
+function configuredPhysics(document) {
+  const requested = String(document?.engine?.physics == null ? 'box2d' : document.engine.physics).toLowerCase();
+  const configuredBackend = document?.engine?.physicsBackend == null
+    ? requested
+    : String(document.engine.physicsBackend).toLowerCase();
+  return {
+    requested,
+    backend: configuredBackend,
+    implementation: document?.engine?.physicsImplementation ?? PHYSICS_IMPLEMENTATIONS[configuredBackend] ?? null,
+    native: configuredBackend === 'box2d'
+  };
+}
+
+function createPhysicsEngine(AH2D, document, options = {}) {
+  const hasOverride = options.backend != null;
+  const requested = normalizePhysicsBackend(options.backend ?? document?.engine?.physics ?? 'box2d', hasOverride ? '--backend' : '/engine/physics');
+  const physicsOptions = {
+    gravity: document?.engine?.gravity || { x: 0, y: 980 },
+    pixelsPerMeter: Number(document?.engine?.pixelsPerMeter) || 100,
+    ...(options.physicsOptions || {})
+  };
+  const adapter = requested === 'builtin'
+    ? new AH2D.PhysicsAdapter(physicsOptions)
+    : new AH2D.Box2DPhysicsAdapter(require('planck'), physicsOptions);
+  const engine = new AH2D.Engine({ physics: adapter });
+  const backend = normalizePhysicsBackend(adapter.backend || 'builtin', 'runtime adapter');
+  return {
+    engine,
+    physics: {
+      requested,
+      backend,
+      implementation: PHYSICS_IMPLEMENTATIONS[backend],
+      native: backend === 'box2d'
+    }
+  };
+}
+
+function validateWithEngine(document, options = {}) {
+  const AH2D = loadEngine(), diagnostics = [], executions = [];
+  const backend = options.backend == null ? undefined : normalizePhysicsBackend(options.backend);
   for (const scene of document.scenes || []) {
     try {
-      const gravity = document.engine?.gravity || { x: 0, y: 980 }, pixelsPerMeter = Number(document.engine?.pixelsPerMeter) || 100;
-      const engine = new AH2D.Engine({ physics: 'builtin', physicsOptions: { gravity, pixelsPerMeter } });
+      const { engine, physics } = createPhysicsEngine(AH2D, document, { backend });
       engine.load(document, { sceneId: scene.id });
+      engine.update(0);
+      executions.push({ sceneId: scene.id, ...physics });
     } catch (error) { diagnostics.push({ severity: 'error', code: 'E_ENGINE_LOAD', message: error.message, pointer: `/scenes/${document.scenes.indexOf(scene)}`, details: { sceneId: scene.id } }); }
   }
-  return diagnostics;
+  return { diagnostics, executions };
 }
 
 function validateCommand(context, options) {
   if (options.fix) {
     const migrated = migrateDocument(context.document, { allowFuture: options['allow-future'] });syncActiveMirror(migrated.document);
-    let diagnostics = validateDocument(migrated.document, { strict: options.strict });if (options.engine) diagnostics = diagnostics.concat(validateWithEngine(migrated.document));
+    let diagnostics = validateDocument(migrated.document, { strict: options.strict }), physics = null;if (options.engine) { const runtimeValidation = validateWithEngine(migrated.document, options);diagnostics = diagnostics.concat(runtimeValidation.diagnostics);physics = runtimeValidation.executions[0] || null; }
     const failures = diagnostics.filter(item => item.severity === 'error' || (options['warnings-as-errors'] && item.severity === 'warning'));
     if (failures.length && !options['allow-invalid']) throw new DomainError('E_PROJECT_INVALID', `Project validation failed with ${failures.length} issue${failures.length === 1 ? '' : 's'}`, { exitCode: EXIT.VALIDATION, details: { diagnostics } });
-    return { command: 'validate.fix', data: mutationMode(context, migrated.document, options, { valid: !failures.length, sourceDialect: migrated.dialect, migrated: migrated.migrated }), diagnostics };
+    return { command: 'validate.fix', data: mutationMode(context, migrated.document, options, { valid: !failures.length, sourceDialect: migrated.dialect, migrated: migrated.migrated, ...(physics ? { physics } : {}) }), diagnostics };
   }
   let diagnostics = validateDocument(context.document, { strict: options.strict });
-  if (options.engine && !diagnostics.some(item => item.severity === 'error')) diagnostics = diagnostics.concat(validateWithEngine(context.document));
+  let physics = null;
+  if (options.engine && !diagnostics.some(item => item.severity === 'error')) { const runtimeValidation = validateWithEngine(context.document, options);diagnostics = diagnostics.concat(runtimeValidation.diagnostics);physics = runtimeValidation.executions[0] || null; }
   const failures = diagnostics.filter(item => item.severity === 'error' || (options['warnings-as-errors'] && item.severity === 'warning'));
   if (failures.length) throw new DomainError('E_PROJECT_INVALID', `Project validation failed with ${failures.length} issue${failures.length === 1 ? '' : 's'}`, { exitCode: EXIT.VALIDATION, details: { diagnostics } });
-  return { command: 'validate', data: { file: context.file, valid: true, dialect: detectDialect(context.document), sha256: context.hash, sceneCount: context.document.scenes?.length || 0 }, diagnostics };
+  return { command: 'validate', data: { file: context.file, valid: true, dialect: detectDialect(context.document), sha256: context.hash, sceneCount: context.document.scenes?.length || 0, ...(physics ? { physics } : {}) }, diagnostics };
 }
 
 function inspectProject(context) {
@@ -213,7 +264,7 @@ function inspectProject(context) {
       file: context.file, sha256: context.hash, dialect: detectDialect(document), format: document.format, version: document.version,
       name: document.meta?.name || null, currentSceneId: document.currentSceneId || document.meta?.currentSceneId || null,
       runtime: document.engine?.runtime || document.engine?.renderer || null,
-      physics: { backend: document.engine?.physicsBackend || document.engine?.physics || null, gravity: document.engine?.gravity || null, pixelsPerMeter: document.engine?.pixelsPerMeter || null },
+      physics: { ...configuredPhysics(document), gravity: document.engine?.gravity || null, pixelsPerMeter: document.engine?.pixelsPerMeter || null },
       scenes: scenes.map(scene => ({ id: scene.id, name: scene.name, objectCount: scene.objects?.length || 0 })),
       resources: { assets: document.assets?.length || 0, folders: document.folders?.length || 0, prefabs: document.prefabs?.length || document.prefab?.length || 0, animations: document.animations?.length || 0, particles: document.particles?.length || 0 }
     }
@@ -224,13 +275,13 @@ function simulate(context, options) {
   const migrated = migrateDocument(context.document), selector = sceneSelector(options), scene = resolveScene(migrated.document, selector.sceneId || selector.scene, { allowName: Boolean(selector.sceneName) });
   const steps = integerOption(options.steps, 60, 1, 100000, 'steps'), dt = numberOption(options.dt, 1 / 60, Number.EPSILON, 0.25, 'dt');
   const AH2D = loadEngine(), gravity = migrated.document.engine?.gravity || { x: 0, y: 980 }, pixelsPerMeter = Number(migrated.document.engine?.pixelsPerMeter) || 100;
-  const engine = new AH2D.Engine({ physics: 'builtin', physicsOptions: { gravity, pixelsPerMeter, maxStep: Math.min(dt, 1 / 60) } });
+  const { engine, physics } = createPhysicsEngine(AH2D, migrated.document, { backend: options.backend, physicsOptions: { maxStep: Math.min(dt, 1 / 60) } });
   const events = [];let simulationStep = 0;
   for (const type of ['physics:collisionstart', 'physics:collisionend', 'physics:triggerenter', 'physics:triggerexit']) engine.events.on(type, event => events.push({ type, step: simulationStep, a: event.a, b: event.b, phase: event.phase }));
   engine.load(migrated.document, { sceneId: scene.id });
   for (simulationStep = 1; simulationStep <= steps; simulationStep += 1) engine.update(dt);
   const entities = [...engine.ecs.entities].map(id => ({ id, transform: clone(engine.ecs.get(id, 'Transform')), rigidbody: clone(engine.ecs.get(id, 'Rigidbody')) })).sort((a, b) => a.id.localeCompare(b.id));
-  const base = { sceneId: scene.id, steps, dt, duration: steps * dt, gravity: clone(gravity), pixelsPerMeter, entities, events };
+  const base = { sceneId: scene.id, steps, dt, duration: steps * dt, physics, gravity: clone(gravity), pixelsPerMeter, entities, events };
   if (!options.commit) return { command: 'simulate', data: { ...base, committed: false, file: context.file, sha256: context.hash } };
   const active = resolveScene(migrated.document, scene.id);
   for (const entity of active.objects) {
@@ -278,7 +329,14 @@ function capabilities() {
       runtime: ['get', 'set'], physics: ['get', 'set'], schema: ['list', 'show'],
       topLevel: ['init', 'inspect', 'validate', 'format', 'migrate', 'query', 'patch', 'apply', 'simulate', 'ecs export', 'doctor', 'version', 'capabilities']
     },
-    enums: { runtime: ['pixijs', 'phaserjs', 'custom'], rigidbodyType: ['static', 'dynamic', 'kinematic'], colliderShape: ['rectangle', 'box', 'circle'] },
+    enums: { runtime: ['pixijs', 'phaserjs', 'custom'], physicsBackend: [...PHYSICS_BACKENDS], rigidbodyType: ['static', 'dynamic', 'kinematic'], colliderShape: ['rectangle', 'box', 'circle'] },
+    options: {
+      physicsBackend: {
+        flag: '--backend', values: [...PHYSICS_BACKENDS],
+        commands: ['physics set', 'validate --engine', 'simulate', 'ecs export'],
+        default: 'engine.physics (box2d when absent)'
+      }
+    },
     selectors: {
       scene: { byId: ['--scene ID', '--scene-id ID'], byName: '--scene-name NAME' },
       entity: { byId: ['--entity ID', '--entity-id ID', 'positional ID'], byName: '--entity-name NAME' },
@@ -328,6 +386,7 @@ Agent discovery:
 Core:
   ah2d init --file game.ah2d.json --name Game
   ah2d inspect|validate|format|migrate --file game.ah2d.json
+  ah2d validate --engine [--backend box2d|builtin]
   ah2d query --file game.ah2d.json --pointer /scenes/0/objects
   ah2d patch --file game.ah2d.json --patch @change.json --write
   ah2d apply --file game.ah2d.json --ops @operations.json --write
@@ -338,9 +397,9 @@ Domain commands:
   ah2d component list|get|put|set|patch|delete
   ah2d resource list|get|put|delete
   ah2d runtime get|set
-  ah2d physics get|set
-  ah2d simulate [--steps 60 --dt 0.0166667] [--commit --write]
-  ah2d ecs export --out active.ecs.json
+  ah2d physics get|set [--backend box2d|builtin]
+  ah2d simulate [--backend box2d|builtin] [--steps 60 --dt 0.0166667] [--commit --write]
+  ah2d ecs export [--backend box2d|builtin] --out active.ecs.json
 
 Mutations are safe by default and require --write, --out, --print-document, or --dry-run.
 Selectors use IDs. Use --scene-name or --entity-name for explicit name lookup.
@@ -487,20 +546,23 @@ function runtimeCommand(context, positionals, options) {
 
 function physicsCommand(context, positionals, options) {
   const action = (positionals.shift() || 'get').toLowerCase();
-  if (action === 'get') return { command: 'physics.get', data: { file: context.file, physics: context.document.engine?.physics || 'box2d', backend: context.document.engine?.physicsBackend || null, gravity: clone(context.document.engine?.gravity || null), pixelsPerMeter: context.document.engine?.pixelsPerMeter || null } };
+  if (action === 'get') {
+    const configured = configuredPhysics(context.document);
+    return { command: 'physics.get', data: { file: context.file, physics: configured.requested, ...configured, gravity: clone(context.document.engine?.gravity || null), pixelsPerMeter: context.document.engine?.pixelsPerMeter || null } };
+  }
   if (action === 'set') {
-    const gravityX = options['gravity-x'], gravityY = options['gravity-y'], pixelsPerMeter = options['pixels-per-meter'];
-    if (gravityX === undefined && gravityY === undefined && pixelsPerMeter === undefined) {
-      throw new DomainError('E_REQUIRED_VALUE', 'physics set requires --gravity-x, --gravity-y, or --pixels-per-meter', { exitCode: EXIT.USAGE });
+    const gravityX = options['gravity-x'], gravityY = options['gravity-y'], pixelsPerMeter = options['pixels-per-meter'], backend = options.backend;
+    if (gravityX === undefined && gravityY === undefined && pixelsPerMeter === undefined && backend === undefined) {
+      throw new DomainError('E_REQUIRED_VALUE', 'physics set requires --backend, --gravity-x, --gravity-y, or --pixels-per-meter', { exitCode: EXIT.USAGE });
     }
-    return operationResult(context, [{ op: 'physics.set', gravityX, gravityY, pixelsPerMeter }], options, 'physics.set');
+    return operationResult(context, [{ op: 'physics.set', backend, gravityX, gravityY, pixelsPerMeter }], options, 'physics.set');
   }
   throw new DomainError('E_COMMAND', `Unknown physics command: ${action}`, { exitCode: EXIT.USAGE });
 }
 
 function ecsCommand(context, positionals, options) {
   const action = (positionals.shift() || 'export').toLowerCase();if (action !== 'export') throw new DomainError('E_COMMAND', `Unknown ecs command: ${action}`, { exitCode: EXIT.USAGE });
-  const migrated = migrateDocument(context.document), selector = sceneSelector(options), scene = resolveScene(migrated.document, selector.sceneId || selector.scene, { allowName: Boolean(selector.sceneName) }), AH2D = loadEngine(), engine = new AH2D.Engine({ physics: 'builtin', physicsOptions: { gravity: migrated.document.engine?.gravity, pixelsPerMeter: migrated.document.engine?.pixelsPerMeter } });engine.load(migrated.document, { sceneId: scene.id });const document = engine.export();document.sceneId = scene.id;document.sceneName = scene.name;if (options.out) writeAtomic(resolveFile(options.out), jsonText(document), options);return { command: 'ecs.export', data: { sceneId: scene.id, file: options.out ? resolveFile(options.out) : null, document: options.out && !options['print-document'] ? undefined : document } };
+  const migrated = migrateDocument(context.document), selector = sceneSelector(options), scene = resolveScene(migrated.document, selector.sceneId || selector.scene, { allowName: Boolean(selector.sceneName) }), AH2D = loadEngine(), runtime = createPhysicsEngine(AH2D, migrated.document, { backend: options.backend }), engine = runtime.engine;engine.load(migrated.document, { sceneId: scene.id });engine.update(0);const document = engine.export();document.sceneId = scene.id;document.sceneName = scene.name;if (options.out) writeAtomic(resolveFile(options.out), jsonText(document), options);return { command: 'ecs.export', data: { sceneId: scene.id, physics: runtime.physics, file: options.out ? resolveFile(options.out) : null, document: options.out && !options['print-document'] ? undefined : document } };
 }
 
 function isObjectValue(value) {

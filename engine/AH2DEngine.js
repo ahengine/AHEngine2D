@@ -732,6 +732,19 @@
     const prototype = Object.getPrototypeOf(value);
     return prototype === Object.prototype || prototype === null;
   };
+  const resolveDefaultBox2D = explicit => {
+    if (explicit !== undefined) return explicit;
+    if (global.planck) return global.planck;
+    if (global.Box2D) return global.Box2D;
+    if (typeof module === 'object' && module.exports && typeof require === 'function') {
+      try { return require('planck'); } catch (_) { /* The deterministic adapter remains available. */ }
+    }
+    return null;
+  };
+  const isPlanckAPI = api => Boolean(
+    api && typeof api.World === 'function' && typeof api.Vec2 === 'function' &&
+    typeof api.Box === 'function' && typeof api.Circle === 'function'
+  );
   const assertDataModelCompatibility = document => {
     if (!Object.prototype.hasOwnProperty.call(document, 'dataModel')) return;
     const descriptor = document.dataModel;
@@ -810,6 +823,9 @@
     constructor(options = {}) {
       this.name = 'builtin';
       this.backend = 'builtin';
+      this.implementation = 'ah2d-builtin';
+      this.status = 'ready';
+      this.native = false;
       this.authoritative = true;
       this.bodies = new Map();
       this.contacts = new Map();
@@ -824,6 +840,7 @@
       this.pixelsPerMeter = Math.max(PHYSICS_EPSILON, finite(options.pixelsPerMeter, this.pixelsPerMeter || 100));
       this.maxStep = Math.max(1 / 1000, finite(options.maxStep, 1 / 60));
       this.velocityIterations = Math.max(1, Math.floor(finite(options.velocityIterations, 8)));
+      this.positionIterations = Math.max(1, Math.floor(finite(options.positionIterations, 3)));
       this.positionCorrection = clamp(finite(options.positionCorrection, 0.8), 0, 1);
       this.positionSlop = Math.max(0, finite(options.positionSlop, 0.01));
       this.restitutionThreshold = Math.max(0, finite(options.restitutionThreshold, Math.hypot(this.gravity.x, this.gravity.y) * this.maxStep * 2));
@@ -837,6 +854,13 @@
       this.gravity = typeof x === 'object' ? vector(x, this.gravity.x, this.gravity.y) : { x: finite(x, 0), y: finite(y, 9.8) };
       if (this.options.restitutionThreshold == null) this.restitutionThreshold = Math.hypot(this.gravity.x, this.gravity.y) * this.maxStep * 2;
       this.bodies.forEach(body => this.wake(body.entityId));
+      return this;
+    }
+    setPixelsPerMeter(value) {
+      const next = Math.max(PHYSICS_EPSILON, finite(value, this.pixelsPerMeter || 100));
+      if (Math.abs(next - this.pixelsPerMeter) <= PHYSICS_EPSILON) return this;
+      this.pixelsPerMeter = next;
+      this.bodies.forEach(body => { this._updateMass(body); this.wake(body); });
       return this;
     }
     createBody(entityId, descriptor = {}) {
@@ -962,6 +986,7 @@
     snapshot() {
       return {
         gravity: { ...this.gravity },
+        pixelsPerMeter: this.pixelsPerMeter,
         bodies: [...this.bodies].map(([id, body]) => [id, {
           position: { ...body.position }, rotation: body.rotation, velocity: { ...body.velocity },
           angularVelocity: body.angularVelocity, sleeping: body.sleeping, sleepTime: body.sleepTime
@@ -970,6 +995,9 @@
     }
     restore(snapshot) {
       if (!snapshot) return false;
+      if (Number.isFinite(snapshot.pixelsPerMeter) && snapshot.pixelsPerMeter > 0) {
+        this.setPixelsPerMeter(snapshot.pixelsPerMeter);
+      }
       if (snapshot.gravity) this.setGravity(snapshot.gravity);
       (snapshot.bodies || []).forEach(([id, value]) => {
         const body = this.bodies.get(id); if (!body) return;
@@ -1494,48 +1522,229 @@
   }
 
   class Box2DPhysicsAdapter extends PhysicsAdapter {
-    constructor(box2d = global.Box2D || global.planck, options = {}) {
-      if (box2d && !box2d.World && typeof box2d === 'object' && arguments.length === 1) { options = box2d; box2d = global.Box2D || global.planck; }
-      super(options); this.name = 'box2d'; this.api = box2d || null; this.world = null; this.nativeBodies = new Map(); this.usingNative = false; this.initialize(options);
+    constructor(box2d, options = {}) {
+      let selected = box2d;
+      const looksLikeAPI = isPlainObject(box2d) && ['World', 'Vec2', 'Box', 'Circle'].some(key => key in box2d);
+      if (arguments.length === 1 && isPlainObject(box2d) && !looksLikeAPI) {
+        options = box2d;
+        selected = undefined;
+      }
+      super(options);
+      this.name = 'box2d';
+      this.requestedImplementation = 'planck';
+      this.api = resolveDefaultBox2D(selected);
+      this.world = null;
+      this.nativeBodies = new Map();
+      this.nativeFixtures = new Map();
+      this.nativeFixtureMetadata = new WeakMap();
+      this.nativeListeners = [];
+      this.nativeBegins = new Map();
+      this.nativeEnds = new Map();
+      this.usingNative = false;
+      this.nativeError = null;
+      this.initialize(options);
     }
     initialize(options = {}) {
       super.initialize(options);
-      this.pixelsPerMeter = Math.max(PHYSICS_EPSILON, finite(options.pixelsPerMeter, 100));
-      if (!this.api?.World) { this.backend = 'builtin'; return this; }
+      this.pixelsPerMeter = Math.max(PHYSICS_EPSILON, finite(options.pixelsPerMeter, this.pixelsPerMeter || 100));
+      this.nativeBodies ||= new Map();
+      this.nativeFixtures ||= new Map();
+      this.nativeFixtureMetadata ||= new WeakMap();
+      this.nativeListeners ||= [];
+      this.nativeBegins ||= new Map();
+      this.nativeEnds ||= new Map();
+      if (!isPlanckAPI(this.api)) {
+        this.world = null;
+        this.usingNative = false;
+        this.backend = 'builtin';
+        this.implementation = 'ah2d-builtin';
+        this.status = 'fallback';
+        this.native = false;
+        return this;
+      }
       try {
-        const gravity = this._nativeVector(this.gravity.x / this.pixelsPerMeter, this.gravity.y / this.pixelsPerMeter);
-        try { this.world = new this.api.World(gravity); } catch (_) { this.world = this.api.World(gravity); }
-        this.usingNative = Boolean(this.world && (this.world.step || this.world.Step) && (this.world.createBody || this.world.CreateBody));
-        this.backend = this.usingNative ? 'box2d' : 'builtin';
-      } catch (_) { this.world = null; this.usingNative = false; this.backend = 'builtin'; }
+        this._createNativeWorld();
+      } catch (error) {
+        this.nativeError = error;
+        this.world = null;
+        this.usingNative = false;
+        this.backend = 'builtin';
+        this.implementation = 'ah2d-builtin';
+        this.status = 'fallback';
+        this.native = false;
+      }
       return this;
+    }
+    _createNativeWorld() {
+      this._disposeNativeWorld();
+      const gravity = this._nativeVector(this.gravity.x / this.pixelsPerMeter, this.gravity.y / this.pixelsPerMeter);
+      let world;
+      try { world = new this.api.World(gravity); } catch (_) { world = this.api.World(gravity); }
+      if (!world || typeof world.step !== 'function' || typeof world.createBody !== 'function' ||
+          typeof world.destroyBody !== 'function' || typeof world.on !== 'function') {
+        throw new Error('Planck-shaped World API is unavailable');
+      }
+      this.world = world;
+      this.usingNative = true;
+      this.backend = 'box2d';
+      this.implementation = 'planck';
+      this.status = 'ready';
+      this.native = true;
+      this.nativeError = null;
+      this.world.setAutoClearForces?.(false);
+      this._bindNativeContacts();
+      return world;
+    }
+    _bindNativeContacts() {
+      this.nativeListeners = [];
+      const bind = (name, listener) => {
+        this.world.on(name, listener);
+        this.nativeListeners.push([name, listener]);
+      };
+      bind('begin-contact', contact => {
+        const value = this._nativeContactDescriptor(contact);
+        if (value) this.nativeBegins.set(value.key, value);
+      });
+      bind('end-contact', contact => {
+        const value = this._nativeContactDescriptor(contact);
+        if (value) this.nativeEnds.set(value.key, value);
+      });
+    }
+    _disposeNativeWorld() {
+      if (this.world && typeof this.world.off === 'function') {
+        for (const [name, listener] of this.nativeListeners || []) {
+          try { this.world.off(name, listener); } catch (_) { /* The old World is being discarded. */ }
+        }
+      }
+      this.nativeListeners = [];
+      this.nativeBodies?.clear();
+      this.nativeFixtures?.clear();
+      this.nativeBegins?.clear();
+      this.nativeEnds?.clear();
+      this.nativeFixtureMetadata = new WeakMap();
+      this.world = null;
     }
     setGravity(x, y) {
       super.setGravity(x, y);
       if (this.usingNative) {
-        const value = this._nativeVector(this.gravity.x / this.pixelsPerMeter, this.gravity.y / this.pixelsPerMeter);
-        this.world.setGravity?.(value); this.world.SetGravity?.(value);
+        this.world.setGravity(this._nativeVector(
+          this.gravity.x / this.pixelsPerMeter,
+          this.gravity.y / this.pixelsPerMeter
+        ));
       }
       return this;
+    }
+    getNativeWorld() { return this.usingNative ? this.world : null; }
+    getNativeBody(entityId) { return this.usingNative ? this.nativeBodies.get(entityId) || null : null; }
+    getNativeFixture(entityId, colliderId) {
+      if (!this.usingNative) return null;
+      return this.nativeFixtures.get(this._fixtureKey(entityId, colliderId)) || null;
+    }
+    setPixelsPerMeter(value) {
+      const previous = this.pixelsPerMeter;
+      const next = Math.max(PHYSICS_EPSILON, finite(value, previous || 100));
+      if (Math.abs(next - previous) <= PHYSICS_EPSILON) return this;
+      this.bodies.forEach(body => this._restoreNativeQueuedForces(body));
+      this.pixelsPerMeter = next;
+      this.bodies.forEach(body => this._updateMass(body));
+      if (!isPlanckAPI(this.api)) return this;
+      try {
+        this._createNativeWorld();
+        this.contacts.clear();
+        this.bodies.forEach(body => this._writeNativeBody(body, true));
+      } catch (error) {
+        this._fallback(error);
+      }
+      return this;
+    }
+    restore(snapshot) {
+      const restored = super.restore(snapshot);
+      if (!restored || !this.usingNative) return restored;
+      try {
+        this.bodies.forEach(body => this._writeNativeBody(body, false));
+      } catch (error) {
+        this._fallback(error);
+      }
+      return restored;
+    }
+    wake(entityId) {
+      const result = super.wake(entityId);
+      const id = typeof entityId === 'object' ? entityId.entityId : entityId;
+      if (result) this.nativeBodies?.get(id)?.setAwake?.(true);
+      return result;
+    }
+    sleep(entityId) {
+      const result = super.sleep(entityId);
+      const id = typeof entityId === 'object' ? entityId.entityId : entityId;
+      const nativeBody = this.nativeBodies?.get(id);
+      if (result && nativeBody) {
+        nativeBody.setLinearVelocity?.(this._nativeVector(0, 0));
+        nativeBody.setAngularVelocity?.(0);
+        nativeBody.setAwake?.(false);
+      }
+      return result;
+    }
+    setTransform(entityId, x, y, rotation) {
+      const result = super.setTransform(entityId, x, y, rotation);
+      const body = this.bodies.get(entityId), nativeBody = this.nativeBodies?.get(entityId);
+      if (result && body && nativeBody) nativeBody.setTransform(
+        this._nativeVector(body.position.x / this.pixelsPerMeter, body.position.y / this.pixelsPerMeter),
+        body.rotation * DEG_TO_RAD
+      );
+      return result;
+    }
+    setVelocity(entityId, x, y) {
+      const result = super.setVelocity(entityId, x, y);
+      const body = this.bodies.get(entityId), nativeBody = this.nativeBodies?.get(entityId);
+      if (result && body && nativeBody) nativeBody.setLinearVelocity(this._nativeVector(
+        body.velocity.x / this.pixelsPerMeter,
+        body.velocity.y / this.pixelsPerMeter
+      ));
+      return result;
+    }
+    setAngularVelocity(entityId, degreesPerSecond) {
+      const result = super.setAngularVelocity(entityId, degreesPerSecond);
+      const body = this.bodies.get(entityId), nativeBody = this.nativeBodies?.get(entityId);
+      if (result && body && nativeBody) nativeBody.setAngularVelocity(body.angularVelocity * DEG_TO_RAD);
+      return result;
+    }
+    applyImpulse(entityId, x, y, point = null) {
+      const body = this.bodies.get(entityId), nativeBody = this.nativeBodies?.get(entityId);
+      if (!this.usingNative || !body || !nativeBody || body.type !== BODY_TYPES.DYNAMIC || typeof nativeBody.applyLinearImpulse !== 'function') {
+        return super.applyImpulse(entityId, x, y, point);
+      }
+      const impulse = typeof x === 'object' ? vector(x) : { x: finite(x, 0), y: finite(y, 0) };
+      const worldPoint = point
+        ? this._nativeVector(finite(point.x, body.position.x) / this.pixelsPerMeter, finite(point.y, body.position.y) / this.pixelsPerMeter)
+        : nativeBody.getWorldCenter();
+      nativeBody.applyLinearImpulse(
+        this._nativeVector(impulse.x / this.pixelsPerMeter, impulse.y / this.pixelsPerMeter),
+        worldPoint,
+        true
+      );
+      this._readNativeBody(body);
+      return true;
     }
     destroyBody(entityId, options = {}) {
       const nativeBody = this.nativeBodies.get(entityId);
       if (nativeBody && this.world) {
-        try { if (this.world.destroyBody) this.world.destroyBody(nativeBody); else this.world.DestroyBody?.(nativeBody); } catch (_) { /* Already removed. */ }
+        try { this.world.destroyBody(nativeBody); } catch (_) { /* Already removed. */ }
       }
+      this._forgetNativeFixtures(entityId);
       this.nativeBodies.delete(entityId);
+      this._purgeNativePending(entityId);
+      const body = this.bodies.get(entityId);
+      if (body) this._discardNativeQueuedForces(body);
       return super.destroyBody(entityId, options);
     }
     clear(options = {}) {
       let eventError = null;
       try { super.clear(options); } catch (error) { eventError = error; }
-      if (this.world) {
-        for (const nativeBody of this.nativeBodies.values()) {
-          try { if (this.world.destroyBody) this.world.destroyBody(nativeBody); else this.world.DestroyBody?.(nativeBody); }
-          catch (_) { /* A native adapter must not leave the Engine half-cleared. */ }
-        }
-      }
       this.nativeBodies.clear();
+      this.nativeFixtures.clear();
+      this.nativeBegins.clear();
+      this.nativeEnds.clear();
+      this.nativeFixtureMetadata = new WeakMap();
       if (eventError) throw eventError;
       return this;
     }
@@ -1545,7 +1754,7 @@
       let inheritedBodyChanged = false;
       if (phase !== 'after') {
         super.sync(engine, 'before');
-        try { this.bodies.forEach(body => this._writeNativeBody(body)); } catch (error) { this._fallback(error); }
+        try { this.bodies.forEach(body => this._writeNativeBody(body, true)); } catch (error) { this._fallback(error); }
       }
       if (phase !== 'before') {
         if (this.usingNative) {
@@ -1553,26 +1762,40 @@
         }
         inheritedBodyChanged = super.sync(engine, 'after');
         if (inheritedBodyChanged && this.usingNative) {
-          try { this.bodies.forEach(body => this._writeNativeBody(body)); } catch (error) { this._fallback(error); }
+          try { this.bodies.forEach(body => this._writeNativeBody(body, false)); } catch (error) { this._fallback(error); }
         }
       }
       return inheritedBodyChanged;
     }
     step(dt, engine = this.engine) {
       if (!this.usingNative) return super.step(dt, engine);
-      dt = clamp(finite(dt, 0), 0, 0.25); if (dt <= 0) return;
+      dt = clamp(finite(dt, 0), 0, 0.25);
+      if (dt <= 0) return;
+      let contacts;
       try {
-        if (this.world.step) this.world.step(dt); else this.world.Step(dt, this.velocityIterations, 3);
-        this.bodies.forEach(body => this._readNativeBody(body));
-        const contacts = this._detectContacts();
-        this._updateSleeping(dt, contacts); this._emitContactChanges(contacts, engine);
-      } catch (error) { this._fallback(error); super.step(dt, engine); }
+        const requested = Math.max(1, Math.ceil(dt / this.maxStep));
+        const maximum = Math.max(1, Math.floor(finite(this.options.maxSubSteps, 32)));
+        const count = Math.min(requested, maximum);
+        const stepTime = dt / count;
+        for (let index = 0; index < count; index += 1) {
+          this.world.step(stepTime, this.velocityIterations, this.positionIterations);
+        }
+        this.world.clearForces?.();
+        this.bodies.forEach(body => {
+          this._discardNativeQueuedForces(body);
+          this._readNativeBody(body);
+        });
+        contacts = this._collectNativeContacts();
+      } catch (error) {
+        try { this.world?.clearForces?.(); } catch (_) { /* Preserve the physics error. */ }
+        this.bodies.forEach(body => this._restoreNativeQueuedForces(body));
+        this._fallback(error);
+        return super.step(dt, engine);
+      }
+      this._emitNativeContactChanges(contacts, engine);
     }
     _nativeVector(x, y) {
-      if (this.api?.Vec2) {
-        try { return this.api.Vec2(x, y); } catch (_) { return new this.api.Vec2(x, y); }
-      }
-      return { x, y };
+      try { return this.api.Vec2(x, y); } catch (_) { return new this.api.Vec2(x, y); }
     }
     _nativeFixtureGeometry(body, collider) {
       const worldShape = this._worldShape(body, collider);
@@ -1594,7 +1817,23 @@
       }
       return geometry;
     }
-    _writeNativeBody(body) {
+    _fixtureKey(entityId, colliderId) { return `${entityId}\u0000${colliderId}`; }
+    _forgetNativeFixtures(entityId) {
+      for (const [key, fixture] of [...this.nativeFixtures]) {
+        const metadata = this.nativeFixtureMetadata.get(fixture);
+        if (metadata?.entityId === entityId) this.nativeFixtures.delete(key);
+      }
+    }
+    _purgeNativePending(entityId) {
+      const purge = values => {
+        for (const [key, value] of values) {
+          if (value.bodyA?.entityId === entityId || value.bodyB?.entityId === entityId) values.delete(key);
+        }
+      };
+      purge(this.nativeBegins);
+      purge(this.nativeEnds);
+    }
+    _writeNativeBody(body, applyQueuedForces = true) {
       let nativeBody = this.nativeBodies.get(body.entityId);
       const fixtures = body.colliders
         .filter(collider => collider.enabled)
@@ -1603,6 +1842,7 @@
       const signature = JSON.stringify({
         type: body.type,
         mass: signatureNumber(body.mass),
+        useAutoMass: body.useAutoMass,
         enabled: body.enabled,
         allowSleep: body.allowSleep,
         bullet: body.bullet,
@@ -1627,76 +1867,251 @@
         }))
       });
       if (nativeBody && nativeBody.__ah2dColliderSignature !== signature) {
-        try { if (this.world.destroyBody) this.world.destroyBody(nativeBody); else this.world.DestroyBody?.(nativeBody); } catch (_) { /* Recreated below. */ }
-        this.nativeBodies.delete(body.entityId); nativeBody = null;
+        this._restoreNativeQueuedForces(body);
+        try { this.world.destroyBody(nativeBody); } catch (_) { /* Recreated below. */ }
+        this._forgetNativeFixtures(body.entityId);
+        this.nativeBodies.delete(body.entityId);
+        nativeBody = null;
       }
       if (!nativeBody) {
         const definition = {
-          type: body.type, position: this._nativeVector(body.position.x / this.pixelsPerMeter, body.position.y / this.pixelsPerMeter),
-          angle: body.rotation * DEG_TO_RAD, linearDamping: body.linearDamping, angularDamping: body.angularDamping,
-          fixedRotation: body.fixedRotation, allowSleep: body.allowSleep, awake: !body.sleeping,
-          bullet: body.bullet, active: body.enabled, enabled: body.enabled, userData: body.entityId
+          type: body.type,
+          position: this._nativeVector(body.position.x / this.pixelsPerMeter, body.position.y / this.pixelsPerMeter),
+          angle: body.rotation * DEG_TO_RAD,
+          linearDamping: body.linearDamping,
+          angularDamping: body.angularDamping,
+          gravityScale: body.gravityScale,
+          fixedRotation: body.fixedRotation,
+          allowSleep: body.allowSleep,
+          awake: !body.sleeping,
+          bullet: body.bullet,
+          active: body.enabled,
+          userData: body.entityId
         };
-        nativeBody = this.world.createBody ? this.world.createBody(definition) : this.world.CreateBody(definition);
+        nativeBody = this.world.createBody(definition);
         nativeBody.__ah2dColliderSignature = signature;
-        nativeBody.setUserData?.(body.entityId); nativeBody.SetUserData?.(body.entityId);
+        nativeBody.setUserData?.(body.entityId);
         this.nativeBodies.set(body.entityId, nativeBody);
-        const totalArea = fixtures.reduce((sum, fixture) => {
+        const weightedArea = fixtures.reduce((sum, fixture) => {
+          if (fixture.collider.isTrigger) return sum;
           const geometry = fixture.geometry;
-          return sum + (geometry.shape === COLLIDER_SHAPES.CIRCLE
+          const area = (geometry.shape === COLLIDER_SHAPES.CIRCLE
             ? Math.PI * geometry.radius * geometry.radius
-            : geometry.halfX * geometry.halfY * 4);
-        }, 0) / (this.pixelsPerMeter * this.pixelsPerMeter);
+            : geometry.halfX * geometry.halfY * 4) / (this.pixelsPerMeter * this.pixelsPerMeter);
+          return sum + area * fixture.collider.density;
+        }, 0);
+        const densityScale = body.type === BODY_TYPES.DYNAMIC && !body.useAutoMass
+          ? body.mass / Math.max(PHYSICS_EPSILON, weightedArea)
+          : 1;
         fixtures.forEach(({ collider, geometry }) => {
-          let shape;
           const offset = this._nativeVector(geometry.offsetX / this.pixelsPerMeter, geometry.offsetY / this.pixelsPerMeter);
-          if (geometry.shape === COLLIDER_SHAPES.CIRCLE && this.api.Circle) {
-            shape = this.api.Circle(offset, geometry.radius / this.pixelsPerMeter);
-          } else if (geometry.shape === COLLIDER_SHAPES.BOX && this.api.Box) {
-            shape = this.api.Box(
-              geometry.halfX / this.pixelsPerMeter,
-              geometry.halfY / this.pixelsPerMeter,
-              offset,
-              geometry.rotation
-            );
-          }
-          if (!shape || !nativeBody.createFixture) return;
+          const shape = geometry.shape === COLLIDER_SHAPES.CIRCLE
+            ? this.api.Circle(offset, geometry.radius / this.pixelsPerMeter)
+            : this.api.Box(
+                geometry.halfX / this.pixelsPerMeter,
+                geometry.halfY / this.pixelsPerMeter,
+                offset,
+                geometry.rotation
+              );
           const fixture = nativeBody.createFixture(shape, {
-            density: body.type === 'dynamic' ? body.mass / Math.max(PHYSICS_EPSILON, totalArea) : 0,
-            friction: collider.friction, restitution: collider.restitution, isSensor: collider.isTrigger,
-            filterCategoryBits: collider.categoryBits, filterMaskBits: collider.maskBits, filterGroupIndex: collider.groupIndex
+            density: body.type === BODY_TYPES.DYNAMIC && !collider.isTrigger ? collider.density * densityScale : 0,
+            friction: collider.friction,
+            restitution: collider.restitution,
+            isSensor: collider.isTrigger,
+            filterCategoryBits: collider.categoryBits,
+            filterMaskBits: collider.maskBits,
+            filterGroupIndex: collider.groupIndex
           });
-          fixture?.setUserData?.({ entityId: body.entityId, colliderId: collider.id });
+          const metadata = { entityId: body.entityId, colliderId: collider.id };
+          fixture.setUserData?.(metadata);
+          this.nativeFixtureMetadata.set(fixture, metadata);
+          this.nativeFixtures.set(this._fixtureKey(body.entityId, collider.id), fixture);
         });
+        nativeBody.resetMassData?.();
+        if (body.type === BODY_TYPES.DYNAMIC && weightedArea <= PHYSICS_EPSILON && typeof nativeBody.setMassData === 'function') {
+          nativeBody.setMassData({
+            mass: body.mass,
+            center: this._nativeVector(0, 0),
+            I: body.fixedRotation ? 0 : Math.max(
+              PHYSICS_EPSILON,
+              body.inertia / (this.pixelsPerMeter * this.pixelsPerMeter)
+            )
+          });
+        }
       }
       const position = this._nativeVector(body.position.x / this.pixelsPerMeter, body.position.y / this.pixelsPerMeter);
-      nativeBody.setTransform?.(position, body.rotation * DEG_TO_RAD); nativeBody.SetTransform?.(position, body.rotation * DEG_TO_RAD);
+      nativeBody.setTransform(position, body.rotation * DEG_TO_RAD);
       const velocity = this._nativeVector(body.velocity.x / this.pixelsPerMeter, body.velocity.y / this.pixelsPerMeter);
-      nativeBody.setLinearVelocity?.(velocity); nativeBody.SetLinearVelocity?.(velocity);
-      nativeBody.setAngularVelocity?.(body.angularVelocity * DEG_TO_RAD); nativeBody.SetAngularVelocity?.(body.angularVelocity * DEG_TO_RAD);
-      nativeBody.setGravityScale?.(body.gravityScale); nativeBody.setFixedRotation?.(body.fixedRotation);
-      nativeBody.setActive?.(body.enabled); nativeBody.SetActive?.(body.enabled);
-      nativeBody.setEnabled?.(body.enabled); nativeBody.SetEnabled?.(body.enabled);
-      nativeBody.setAwake?.(!body.sleeping); nativeBody.SetAwake?.(!body.sleeping);
+      nativeBody.setLinearVelocity(velocity);
+      nativeBody.setAngularVelocity(body.angularVelocity * DEG_TO_RAD);
+      nativeBody.setGravityScale?.(body.gravityScale);
+      nativeBody.setFixedRotation?.(body.fixedRotation);
+      nativeBody.setActive?.(body.enabled);
+      nativeBody.setEnabled?.(body.enabled);
+      nativeBody.setAwake?.(!body.sleeping);
+      if (applyQueuedForces) this._applyNativeQueuedForces(body, nativeBody);
+    }
+    _applyNativeQueuedForces(body, nativeBody) {
       if (body.force.x || body.force.y) {
-        const force = this._nativeVector(body.force.x / this.pixelsPerMeter, body.force.y / this.pixelsPerMeter);
-        nativeBody.applyForceToCenter?.(force, true); nativeBody.ApplyForce?.(force, nativeBody.GetWorldCenter?.());
+        body._nativeAppliedForce ||= { x: 0, y: 0 };
+        body._nativeAppliedForce.x += body.force.x;
+        body._nativeAppliedForce.y += body.force.y;
+        nativeBody.applyForceToCenter(
+          this._nativeVector(body.force.x / this.pixelsPerMeter, body.force.y / this.pixelsPerMeter),
+          true
+        );
+        body.force.x = 0;
+        body.force.y = 0;
+      }
+      if (body.torque) {
+        body._nativeAppliedTorque = finite(body._nativeAppliedTorque, 0) + body.torque;
+        nativeBody.applyTorque?.(body.torque / (this.pixelsPerMeter * this.pixelsPerMeter), true);
+        body.torque = 0;
       }
     }
+    _restoreNativeQueuedForces(body) {
+      if (body._nativeAppliedForce) {
+        body.force.x += body._nativeAppliedForce.x;
+        body.force.y += body._nativeAppliedForce.y;
+      }
+      if (body._nativeAppliedTorque) body.torque += body._nativeAppliedTorque;
+      this._discardNativeQueuedForces(body);
+    }
+    _discardNativeQueuedForces(body) {
+      delete body._nativeAppliedForce;
+      delete body._nativeAppliedTorque;
+    }
     _readNativeBody(body) {
-      const nativeBody = this.nativeBodies.get(body.entityId); if (!nativeBody) return;
-      const position = nativeBody.getPosition?.() || nativeBody.GetPosition?.();
-      const velocity = nativeBody.getLinearVelocity?.() || nativeBody.GetLinearVelocity?.();
-      const angle = nativeBody.getAngle?.() ?? nativeBody.GetAngle?.();
-      const angularVelocity = nativeBody.getAngularVelocity?.() ?? nativeBody.GetAngularVelocity?.();
-      if (position) { body.position.x = finite(position.x, 0) * this.pixelsPerMeter; body.position.y = finite(position.y, 0) * this.pixelsPerMeter; }
-      if (velocity) { body.velocity.x = finite(velocity.x, 0) * this.pixelsPerMeter; body.velocity.y = finite(velocity.y, 0) * this.pixelsPerMeter; }
-      if (angle != null) body.rotation = finite(angle, 0) * RAD_TO_DEG;
-      if (angularVelocity != null) body.angularVelocity = finite(angularVelocity, 0) * RAD_TO_DEG;
-      const awake = nativeBody.isAwake?.() ?? nativeBody.IsAwake?.(); if (awake != null) body.sleeping = !awake;
+      const nativeBody = this.nativeBodies.get(body.entityId);
+      if (!nativeBody) return;
+      const position = nativeBody.getPosition();
+      const velocity = nativeBody.getLinearVelocity();
+      if (position) {
+        body.position.x = finite(position.x, 0) * this.pixelsPerMeter;
+        body.position.y = finite(position.y, 0) * this.pixelsPerMeter;
+      }
+      if (velocity) {
+        body.velocity.x = finite(velocity.x, 0) * this.pixelsPerMeter;
+        body.velocity.y = finite(velocity.y, 0) * this.pixelsPerMeter;
+      }
+      body.rotation = finite(nativeBody.getAngle(), 0) * RAD_TO_DEG;
+      body.angularVelocity = finite(nativeBody.getAngularVelocity(), 0) * RAD_TO_DEG;
+      const nativeMass = nativeBody.getMass?.();
+      const nativeInertia = nativeBody.getInertia?.();
+      if (body.type === BODY_TYPES.DYNAMIC && Number.isFinite(nativeMass) && nativeMass > 0) body.mass = nativeMass;
+      if (Number.isFinite(nativeInertia)) body.inertia = nativeInertia * this.pixelsPerMeter * this.pixelsPerMeter;
+      body.inverseMass = body.type === BODY_TYPES.DYNAMIC ? 1 / Math.max(PHYSICS_EPSILON, body.mass) : 0;
+      body.inverseInertia = body.type === BODY_TYPES.DYNAMIC && !body.fixedRotation
+        ? 1 / Math.max(PHYSICS_EPSILON, body.inertia || body.mass)
+        : 0;
+      body.sleeping = !nativeBody.isAwake();
+    }
+    _fixtureMetadata(fixture) {
+      const value = this.nativeFixtureMetadata.get(fixture) || fixture?.getUserData?.();
+      return value && typeof value.entityId === 'string' && typeof value.colliderId === 'string' ? value : null;
+    }
+    _nativeContactDescriptor(contact) {
+      if (!contact) return null;
+      let fixtureA = contact.getFixtureA?.(), fixtureB = contact.getFixtureB?.();
+      let metadataA = this._fixtureMetadata(fixtureA), metadataB = this._fixtureMetadata(fixtureB);
+      if (!metadataA || !metadataB) return null;
+      let bodyA = this.bodies.get(metadataA.entityId), bodyB = this.bodies.get(metadataB.entityId);
+      if (!bodyA || !bodyB) return null;
+      let colliderA = bodyA.colliders.find(value => value.id === metadataA.colliderId);
+      let colliderB = bodyB.colliders.find(value => value.id === metadataB.colliderId);
+      if (!colliderA || !colliderB) return null;
+      let normal = { x: 1, y: 0 };
+      let point = {
+        x: (bodyA.position.x + bodyB.position.x) * 0.5,
+        y: (bodyA.position.y + bodyB.position.y) * 0.5
+      };
+      let penetration = 0;
+      try {
+        const manifold = contact.getWorldManifold?.(null);
+        if (manifold?.normal) normal = vector(manifold.normal, 1, 0);
+        const nativePoint = manifold?.points?.find(value => value && Number.isFinite(value.x) && Number.isFinite(value.y));
+        if (nativePoint) point = { x: nativePoint.x * this.pixelsPerMeter, y: nativePoint.y * this.pixelsPerMeter };
+        const separations = (manifold?.separations || []).filter(Number.isFinite);
+        if (separations.length) penetration = Math.max(0, -Math.min(...separations) * this.pixelsPerMeter);
+      } catch (_) { /* End-contact may no longer expose a populated manifold. */ }
+      let keyA = this._fixtureKey(metadataA.entityId, metadataA.colliderId);
+      let keyB = this._fixtureKey(metadataB.entityId, metadataB.colliderId);
+      if (keyA > keyB) {
+        [keyA, keyB] = [keyB, keyA];
+        [bodyA, bodyB] = [bodyB, bodyA];
+        [colliderA, colliderB] = [colliderB, colliderA];
+        [fixtureA, fixtureB] = [fixtureB, fixtureA];
+        normal = { x: -normal.x, y: -normal.y };
+      }
+      return {
+        key: `${keyA}|${keyB}`,
+        bodyA,
+        bodyB,
+        colliderA,
+        colliderB,
+        fixtureA,
+        fixtureB,
+        normal: normalize(normal),
+        penetration,
+        point,
+        trigger: Boolean(colliderA.isTrigger || colliderB.isTrigger || fixtureA?.isSensor?.() || fixtureB?.isSensor?.())
+      };
+    }
+    _collectNativeContacts() {
+      const contacts = new Map();
+      let contact = this.world.getContactList?.() || null;
+      while (contact) {
+        if ((contact.isEnabled?.() ?? true) && (contact.isTouching?.() ?? true)) {
+          const value = this._nativeContactDescriptor(contact);
+          if (value) contacts.set(value.key, value);
+        }
+        contact = contact.getNext?.() || null;
+      }
+      return contacts;
+    }
+    _emitNativeContactChanges(next, engine = this.engine) {
+      const previous = this.contacts;
+      const operations = [];
+      next.forEach((contact, key) => {
+        const before = previous.get(key);
+        if (before && before.trigger === contact.trigger) {
+          if (this.nativeEnds.has(key) && this.nativeBegins.has(key)) operations.push([before, 'end'], [contact, 'start']);
+          else operations.push([contact, 'stay']);
+        } else {
+          if (before) operations.push([before, 'end']);
+          operations.push([this.nativeBegins.get(key) || contact, 'start']);
+        }
+      });
+      previous.forEach((contact, key) => {
+        if (!next.has(key)) operations.push([this.nativeEnds.get(key) || contact, 'end']);
+      });
+      this.nativeBegins.forEach((contact, key) => {
+        if (!previous.has(key) && !next.has(key)) {
+          operations.push([contact, 'start']);
+          const ended = this.nativeEnds.get(key);
+          if (ended) operations.push([ended, 'end']);
+        }
+      });
+      this.contacts = next;
+      this.nativeBegins.clear();
+      this.nativeEnds.clear();
+      let eventError = null;
+      for (const [contact, phase] of operations) {
+        try { this._emitContactEvent(engine?.events, contact, phase); }
+        catch (error) { if (!eventError) eventError = error; }
+      }
+      if (eventError) throw eventError;
     }
     _fallback(error) {
-      this.world = null; this.nativeBodies.clear(); this.usingNative = false; this.backend = 'builtin';
+      this.nativeError = error;
+      try { this.bodies.forEach(body => this._readNativeBody(body)); } catch (_) { /* Retain the last readable state. */ }
+      this._disposeNativeWorld();
+      this.bodies.forEach(body => this._restoreNativeQueuedForces(body));
+      this.usingNative = false;
+      this.native = false;
+      this.backend = 'builtin';
+      this.implementation = 'ah2d-builtin';
+      this.status = 'fallback';
       this.engine?.events.emit('physics:fallback', { adapter: this, error });
     }
   }
@@ -2202,7 +2617,14 @@
     }
     _destroyPixiApplication(app) {
       if (!app) return;
-      const canvas = app.canvas || app.view || null;
+      // Pixi v8's canvas/view accessors dereference renderer. During a failed
+      // async init the renderer does not exist yet, so cleanup must not mask
+      // the original initialization error with an accessor exception.
+      let canvas = null;
+      try { canvas = app.canvas || null; } catch (_) { /* Application.init did not finish. */ }
+      if (!canvas) {
+        try { canvas = app.view || null; } catch (_) { /* Legacy accessor can fail for the same reason. */ }
+      }
       try { app.destroy?.(true, { children: true, texture: false, textureSource: false, baseTexture: false }); }
       catch (_) { try { app.destroy?.({ removeView: true }, { children: true, texture: false, textureSource: false, baseTexture: false }); } catch (_) { /* Best-effort across Pixi versions. */ } }
       if (canvas?.parentNode && typeof canvas.parentNode.removeChild === 'function') canvas.parentNode.removeChild(canvas);
@@ -2298,6 +2720,9 @@
       this.tilemap = new TilemapSystem(this);
       const physicsOptions = { ...(options.physicsOptions || {}) };
       if (options.gravity && !physicsOptions.gravity) physicsOptions.gravity = options.gravity;
+      this._physicsOptions = { ...physicsOptions };
+      this._box2d = options.box2d;
+      this._physicsSelectionLocked = options.physics instanceof PhysicsAdapter || typeof options.physics === 'string';
       if (options.physics instanceof PhysicsAdapter) {
         this.physics = options.physics;
         if (!this.physics.initialized) this.physics.initialize(physicsOptions);
@@ -2419,6 +2844,34 @@
         this._destroyInProgress = false;
       }
     }
+    _selectDocumentPhysics(requested) {
+      if (this._physicsSelectionLocked || !requested) return this.physics;
+      const target = requested === 'builtin' || requested === 'ah2d-builtin' ? 'builtin' : 'box2d';
+      if (this.physics?.name === target) return this.physics;
+      const previous = this.physics;
+      const options = {
+        ...this._physicsOptions,
+        ...(previous?.options || {}),
+        gravity: previous?.gravity ? { ...previous.gravity } : this._physicsOptions.gravity,
+        pixelsPerMeter: previous?.pixelsPerMeter ?? this._physicsOptions.pixelsPerMeter
+      };
+      this.physics = target === 'builtin'
+        ? new PhysicsAdapter(options)
+        : new Box2DPhysicsAdapter(this._box2d, options);
+      this.physics.engine = this;
+      return this.physics;
+    }
+    _configurePhysicsFromDocument(document) {
+      const config = isPlainObject(document?.engine) ? document.engine : {};
+      const requested = String(config.physics || 'box2d').trim().toLowerCase();
+      if (requested && !['box2d', 'planck', 'builtin', 'ah2d-builtin'].includes(requested)) return;
+      this._selectDocumentPhysics(requested);
+      const pixelsPerMeter = Number(config.pixelsPerMeter);
+      if (Number.isFinite(pixelsPerMeter) && pixelsPerMeter > 0) this.physics.setPixelsPerMeter?.(pixelsPerMeter);
+      if (isPlainObject(config.gravity) && Number.isFinite(Number(config.gravity.x)) && Number.isFinite(Number(config.gravity.y))) {
+        this.physics.setGravity?.({ x: Number(config.gravity.x), y: Number(config.gravity.y) });
+      }
+    }
     load(document, options = {}) {
       if (typeof options === 'string') options = { sceneId: options };
       if (!isPlainObject(document)) {
@@ -2511,6 +2964,7 @@
       let eventError = null;
       const retainFirstError = error => { if (!eventError) eventError = error; };
       try { this.physics.clear({ eventQueue: physicsEvents }); } catch (error) { retainFirstError(error); }
+      if (!options.preservePhysicsAdapter) this._configurePhysicsFromDocument(source);
       this.ecs.clear(); this.graph.clear({ [GRAPH_INTERNAL]: true });
       stagedEcs.entities.forEach(id => this.ecs.entities.add(id));
       stagedEcs.components.forEach((store, type) => this.ecs.components.set(type, store));
@@ -2582,6 +3036,7 @@
         document: clone(this.document || this.export()),
         runtime: clone(this.export()),
         physics: clone(this.physics.snapshot()),
+        physicsAdapter: this.physics.name,
         animationTime: this.animation.time,
         activeCamera: this.camera.active,
         activeSceneId: this.activeSceneId
@@ -2591,7 +3046,9 @@
       if (!snapshot) return false;
       const runtime = snapshot.runtime || snapshot.document || snapshot;
       const authoringDocument = snapshot.runtime && snapshot.document ? clone(snapshot.document) : null;
-      this.load(clone(runtime));
+      const snapshotAdapter = snapshot.physicsAdapter || authoringDocument?.engine?.physics;
+      if (snapshotAdapter) this._selectDocumentPhysics(String(snapshotAdapter).toLowerCase());
+      this.load(clone(runtime), { preservePhysicsAdapter: true });
       if (authoringDocument) {
         this.document = authoringDocument;
         this.activeSceneId = snapshot.activeSceneId || authoringDocument.currentSceneId || null;
@@ -2685,10 +3142,11 @@
     sync(editorState) {
       const scene = editorState?.scene || [];
       const postProcess = editorState?.postProcess;
-      const signature = JSON.stringify({ scene, postProcess });
+      const engine = isPlainObject(editorState?.engine) ? editorState.engine : undefined;
+      const signature = JSON.stringify({ scene, postProcess, engine });
       if (signature === this.lastSignature) return false;
       this.lastSignature = signature;
-      this.engine.load({ scene, postProcess });
+      this.engine.load({ scene, postProcess, ...(engine ? { engine } : {}) });
       return true;
     }
   }

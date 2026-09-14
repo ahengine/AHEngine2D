@@ -9,6 +9,8 @@ const {
 const PROTOCOL = 'ah2d.cli/v1';
 const PROJECT_VERSION = 4;
 const RUNTIMES = new Set(['pixijs', 'phaserjs', 'custom']);
+const PHYSICS_BACKENDS = new Set(['box2d', 'builtin']);
+const PHYSICS_IMPLEMENTATIONS = Object.freeze({ box2d: 'planck', builtin: 'ah2d-builtin' });
 const BODY_TYPES = new Set(['static', 'dynamic', 'kinematic']);
 const COLLIDER_SHAPES = new Set(['rectangle', 'box', 'circle']);
 const EXIT = Object.freeze({ OK: 0, USAGE: 2, IO: 3, VALIDATION: 4, NOT_FOUND: 5, CONFLICT: 6, ENGINE: 7, INTERNAL: 70 });
@@ -126,7 +128,7 @@ function createProject(options = {}) {
     engine: {
       name: 'AH2D Engine', version: options.engineVersion || '0.3.0',
       renderer: options.runtime || 'custom', runtime: options.runtime || 'custom',
-      physics: 'box2d', physicsBackend: 'builtin',
+      physics: 'box2d', physicsBackend: 'box2d', physicsImplementation: PHYSICS_IMPLEMENTATIONS.box2d,
       gravity: { x: 0, y: 980 }, pixelsPerMeter: 100,
       compatibleRuntimes: ['pixijs', 'phaserjs', 'custom']
     },
@@ -164,7 +166,7 @@ function migrateDocument(input, options = {}) {
   if (typeof document.engine === 'string') {
     document.engine = {
       name: 'AH2D Engine', version: document.engine, renderer: 'custom', runtime: 'custom',
-      physics: 'box2d', physicsBackend: 'builtin', gravity: { x: 0, y: 980 }, pixelsPerMeter: 100,
+      physics: 'box2d', physicsBackend: 'box2d', physicsImplementation: PHYSICS_IMPLEMENTATIONS.box2d, gravity: { x: 0, y: 980 }, pixelsPerMeter: 100,
       compatibleRuntimes: ['pixijs', 'phaserjs', 'custom']
     };
     migrated = true;
@@ -315,6 +317,11 @@ function validateDocument(document, options = {}) {
   }
   const runtime = document.engine?.runtime || document.engine?.renderer;
   if (runtime != null && !RUNTIMES.has(String(runtime).toLowerCase())) diagnostics.push(diagnostic('error', 'E_RUNTIME', `Unsupported runtime: ${runtime}`, '/engine/runtime'));
+  const requestedPhysics = document.engine?.physics;
+  if (requestedPhysics != null && !PHYSICS_BACKENDS.has(String(requestedPhysics).toLowerCase())) diagnostics.push(diagnostic('error', 'E_PHYSICS_BACKEND', `Unsupported physics backend: ${requestedPhysics}`, '/engine/physics'));
+  const recordedPhysicsBackend = document.engine?.physicsBackend;
+  if (recordedPhysicsBackend != null && !PHYSICS_BACKENDS.has(String(recordedPhysicsBackend).toLowerCase())) diagnostics.push(diagnostic('error', 'E_PHYSICS_BACKEND', `Unsupported physics backend: ${recordedPhysicsBackend}`, '/engine/physicsBackend'));
+  if (document.engine?.physicsImplementation != null && (typeof document.engine.physicsImplementation !== 'string' || !document.engine.physicsImplementation.trim())) diagnostics.push(diagnostic('error', 'E_PHYSICS_IMPLEMENTATION', 'physicsImplementation must be a non-empty string', '/engine/physicsImplementation'));
   const gravity = document.engine?.gravity;
   if (gravity && (!finite(gravity.x) || !finite(gravity.y))) diagnostics.push(diagnostic('error', 'E_GRAVITY', 'Gravity x and y must be finite', '/engine/gravity'));
   if (document.engine?.pixelsPerMeter != null && (!finite(document.engine.pixelsPerMeter) || Number(document.engine.pixelsPerMeter) <= 0)) diagnostics.push(diagnostic('error', 'E_PIXELS_PER_METER', 'pixelsPerMeter must be greater than zero', '/engine/pixelsPerMeter'));
@@ -747,8 +754,17 @@ function applyOperationMutable(document, operation) {
   if (op === 'physics.set') {
     document.engine = isObject(document.engine) ? document.engine : {};
     document.engine.gravity = isObject(document.engine.gravity) ? document.engine.gravity : { x: 0, y: 980 };
+    if (operation.backend != null) {
+      const backend = String(operation.backend).toLowerCase();
+      if (!PHYSICS_BACKENDS.has(backend)) throw new DomainError('E_PHYSICS_BACKEND', `Unsupported physics backend: ${operation.backend}`, { exitCode: EXIT.USAGE, pointer: '/engine/physics' });
+      document.engine.physics = backend;
+      document.engine.physicsBackend = backend;
+      document.engine.physicsImplementation = PHYSICS_IMPLEMENTATIONS[backend];
+    }
     if (operation.gravityX != null) document.engine.gravity.x = Number(operation.gravityX);if (operation.gravityY != null) document.engine.gravity.y = Number(operation.gravityY);if (operation.pixelsPerMeter != null) document.engine.pixelsPerMeter = Number(operation.pixelsPerMeter);
-    return { gravity: clone(document.engine.gravity), pixelsPerMeter: document.engine.pixelsPerMeter };
+    const requested = String(document.engine.physics || 'box2d').toLowerCase();
+    const backend = String(document.engine.physicsBackend || requested).toLowerCase();
+    return { requested, backend, implementation: document.engine.physicsImplementation || PHYSICS_IMPLEMENTATIONS[backend], native: backend === 'box2d', gravity: clone(document.engine.gravity), pixelsPerMeter: document.engine.pixelsPerMeter };
   }
   if (op === 'project.patch') { const patched = mergePatch(document, requireObjectPatch(operation.patch, op));Object.keys(document).forEach(key => delete document[key]);Object.assign(document, patched);return { patched: true }; }
   if (op === 'resource.put' || op === 'resource.delete') {
@@ -885,7 +901,7 @@ function documentHash(value) {
 }
 
 module.exports = {
-  PROTOCOL, PROJECT_VERSION, RUNTIMES, BODY_TYPES, COLLIDER_SHAPES, EXIT, DomainError,
+  PROTOCOL, PROJECT_VERSION, RUNTIMES, PHYSICS_BACKENDS, PHYSICS_IMPLEMENTATIONS, BODY_TYPES, COLLIDER_SHAPES, EXIT, DomainError,
   DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES: PROFILE_NAMES, componentRegistry, entityCodec,
   clone, generateId, detectDialect, createProject, createDefaultPostProcess, migrateDocument, syncActiveMirror,
   validateDocument, assertValid, resolveScene, resolveEntity, entityName,

@@ -1,10 +1,10 @@
 # AH2D Engine CLI
 
-The AH2D CLI is designed for both coding agents and humans. It edits Universal AH2D project JSON directly and losslessly. The Engine is loaded only for runtime validation, deterministic physics simulation, and explicit ECS snapshot export.
+The AH2D CLI is designed for both coding agents and humans. It edits Universal AH2D project JSON directly and losslessly. The Engine is loaded only for runtime validation, physics simulation, and explicit ECS snapshot export. Native Box2D execution is provided by the bundled Planck implementation; the AH2D deterministic solver remains available as an explicit fallback.
 
 ## Start
 
-No dependency install is required; Node.js 18 or newer is enough.
+Install the repository dependencies first and use the Node.js version declared by `package.json`.
 
 ```text
 npm run ah2d -- capabilities --pretty
@@ -37,7 +37,7 @@ stdout is JSON by default:
 
 Errors use the same protocol on stderr and a non-zero, categorized exit code. `capabilities` is the machine-readable discovery contract. It reports `dataModel`, the three component-schema profiles, registry types, `unknownComponents: "preserve"`, and `precedence: "components"`. Human-readable output is opt-in with `--format text`.
 
-The `sceneGraph` capability declares `parentId` storage, local authoring Transform space, the derived world-matrix shape, the default Reparent mode, both preservation flags, and the tree/world inspection command. Agents should discover these fields instead of assuming Editor behavior.
+The `sceneGraph` capability declares `parentId` storage, local authoring Transform space, the derived world-matrix shape, the default Reparent mode, both preservation flags, and the tree/world inspection command. `enums.physicsBackend` and `options.physicsBackend` expose the supported Physics execution backends and the commands accepting `--backend`. Agents should discover these fields instead of assuming Editor behavior.
 
 Exit codes:
 
@@ -161,14 +161,31 @@ npm run ah2d -- runtime get --file game.ah2d.json
 npm run ah2d -- runtime set --file game.ah2d.json --runtime phaserjs --write
 npm run ah2d -- physics get --file game.ah2d.json
 npm run ah2d -- physics set --file game.ah2d.json --gravity-x 0 --gravity-y 980 --pixels-per-meter 100 --write
+npm run ah2d -- physics set --file game.ah2d.json --backend box2d --write
 ```
 
-## Deterministic simulation
+New projects request `box2d`, record the native `box2d` backend, and identify `planck` as the implementation. `physics get` reports `requested`, `backend`, `implementation`, and `native` independently, along with gravity and pixels per metre. `physics set --backend builtin` deliberately changes the project's requested backend to the AH2D fallback; use `--backend box2d` to switch it back.
 
-Simulation is read-only unless `--commit` is paired with an explicit mutation mode. It uses the selected Scene, project gravity and pixels-per-metre setting, and the Engine's built-in fixed-step physics.
+Runtime commands honor `engine.physics` by default. `validate --engine`, `simulate`, and `ecs export` also accept an execution-only `--backend box2d|builtin` override. The override does not modify the Universal Project. Their results include this normalized descriptor:
+
+```json
+{
+  "requested": "box2d",
+  "backend": "box2d",
+  "implementation": "planck",
+  "native": true
+}
+```
+
+Use `--backend builtin` when a test specifically requires the dependency-independent AH2D solver. Invalid backend names fail with `E_PHYSICS_BACKEND` rather than silently selecting a different implementation.
+
+## Physics simulation
+
+Simulation is read-only unless `--commit` is paired with an explicit mutation mode. It uses the selected Scene, project gravity and pixels-per-metre setting. By default it honors the project's requested backend, so a normal new project runs native Box2D through Planck. Fixed `dt` produces repeatable runs for the same implementation; select the AH2D deterministic fallback explicitly when that exact solver is required.
 
 ```text
 npm run ah2d -- simulate --file game.ah2d.json --scene main --steps 120 --dt 0.0166666667 --pretty
+npm run ah2d -- simulate --file game.ah2d.json --scene main --backend builtin --steps 120 --dt 0.0166666667 --pretty
 npm run ah2d -- simulate --file game.ah2d.json --scene main --steps 120 --dt 0.0166666667 --commit --write
 ```
 
@@ -207,13 +224,15 @@ Resources are accessible with `resource list|get|put|delete` for `assets`, `fold
 
 ```text
 npm run ah2d -- migrate --file legacy.json --out project-v4.json
-npm run ah2d -- validate --file project-v4.json --strict --warnings-as-errors
+npm run ah2d -- validate --file project-v4.json --strict --warnings-as-errors --engine
+npm run ah2d -- validate --file project-v4.json --engine --backend builtin
 npm run ah2d -- ecs export --file project-v4.json --scene main --out main.ecs.json
+npm run ah2d -- ecs export --file project-v4.json --scene main --backend builtin --out main.builtin.ecs.json
 ```
 
 `ecs export` is intentionally lossy and exports only the chosen runtime Scene. It never replaces the Universal project automatically.
 
-`validate` applies the `authoring` component profile, reports exact JSON Pointers, checks JSON safety and registered schemas, and detects duplicate storage conflicts. Add `--strict` to promote compatibility conflicts (and other strict diagnostics) to errors; add `--warnings-as-errors` when CI must reject every warning. `--engine` additionally verifies that the selected project can be loaded by the Engine.
+`validate` applies the `authoring` component profile, reports exact JSON Pointers, checks JSON safety and registered schemas, and detects duplicate storage conflicts. Add `--strict` to promote compatibility conflicts (and other strict diagnostics) to errors; add `--warnings-as-errors` when CI must reject every warning. `--engine` additionally verifies every Scene with the requested Physics backend and reports the actual backend/implementation used.
 
 Default compatibility validation accepts legacy numeric/boolean strings for schema inspection but does not coerce them. `--strict` rejects those values, and Engine runtime decoding is always strict; normalize authored values to real JSON numbers/booleans before execution.
 

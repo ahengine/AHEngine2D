@@ -67,6 +67,10 @@ try {
   assert.strictEqual(capabilities.sceneGraph.reparentModes.preserveWorld, '--preserve-world');
   assert.strictEqual(capabilities.sceneGraph.treeOutput.includeWorld, '--world');
   assert.ok(capabilities.commands.entity.includes('tree'));
+  assert.deepStrictEqual(capabilities.enums.physicsBackend, ['box2d', 'builtin']);
+  assert.strictEqual(capabilities.options.physicsBackend.flag, '--backend');
+  assert.deepStrictEqual(capabilities.options.physicsBackend.values, ['box2d', 'builtin']);
+  assert.deepStrictEqual(capabilities.options.physicsBackend.commands, ['physics set', 'validate --engine', 'simulate', 'ecs export']);
 
 
   const schemaIndex = success(['schema', 'list']).data;
@@ -93,6 +97,9 @@ try {
   assert.strictEqual(project.version, 4);
   assert.deepStrictEqual(project.dataModel, { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 });
   assert.strictEqual(project.scenes.length, 1);
+  assert.strictEqual(project.engine.physics, 'box2d');
+  assert.strictEqual(project.engine.physicsBackend, 'box2d');
+  assert.strictEqual(project.engine.physicsImplementation, 'planck');
   assert.ok(project.postProcess.effects.some(effect => effect.type === 'bloom'));
   assert.ok(project.postProcess.effects.some(effect => effect.type === 'crt'));
   const descriptorFile = path.join(tempRoot, 'descriptor-validation.ah2d.json');
@@ -157,6 +164,35 @@ try {
     { id: 'duplicate', name: 'Second' }
   ] });
   assert.ok(validateDocument(duplicateIdProject).some(item => item.code === 'E_DUPLICATE_ENTITY_ID' && item.pointer === '/scenes/0/objects/1/id'));
+
+  const duplicateColliderFile = path.join(tempRoot, 'duplicate-collider-id.ah2d.json');
+  const duplicateColliderProject = createProject({ objects: [
+    {
+      id: 'fixture-owner',
+      components: {
+        Collider: {
+          colliders: [
+            { id: 'hitbox', shape: 'rectangle', width: 12, height: 8, futureFixture: { keep: 1 } },
+            { id: 'hitbox', shape: 'circle', radius: 6, futureFixture: { keep: 2 } }
+          ],
+          futureWrapper: { keep: true }
+        },
+        FuturePhysicsData: { keep: ['all', 'unknown', 'fields'] }
+      }
+    },
+    { id: 'other-entity', components: { Collider: [{ id: 'hitbox', shape: 'circle', radius: 4 }] } }
+  ] });
+  const duplicateColliderSource = JSON.stringify(duplicateColliderProject);
+  const duplicateColliderDiagnostics = validateDocument(duplicateColliderProject);
+  const duplicateCollider = duplicateColliderDiagnostics.find(item => item.code === 'E_COLLIDER_ID_DUPLICATE');
+  assert.strictEqual(duplicateCollider.pointer, '/scenes/0/objects/0/components/Collider/colliders/1/id');
+  assert.strictEqual(duplicateCollider.details.firstPointer, '/scenes/0/objects/0/components/Collider/colliders/0/id');
+  assert.strictEqual(duplicateCollider.details.colliderId, 'hitbox');
+  assert.strictEqual(duplicateColliderDiagnostics.filter(item => item.code === 'E_COLLIDER_ID_DUPLICATE').length, 1, 'Collider ids are scoped to one Entity');
+  assert.strictEqual(JSON.stringify(duplicateColliderProject), duplicateColliderSource, 'CLI validation must preserve wrappers and unknown fields');
+  fs.writeFileSync(duplicateColliderFile, duplicateColliderSource);
+  const duplicateColliderValidation = failure(['validate', '--file', duplicateColliderFile], 'E_PROJECT_INVALID').payload;
+  assert.ok(duplicateColliderValidation.diagnostics.some(item => item.code === 'E_COLLIDER_ID_DUPLICATE' && item.pointer === '/scenes/0/objects/0/components/Collider/colliders/1/id'));
 
   const deepObjectCount = 10000;
   const deepObjects = Array.from({ length: deepObjectCount }, (_, index) => ({
@@ -329,6 +365,13 @@ try {
   success(['component', 'put', '--file', projectFile, '--scene', 'arena', 'child', 'Rigidbody', '--write']);
   success(['component', 'patch', '--file', projectFile, '--scene', 'arena', 'child', 'Rigidbody', '{"mass":2,"gravityScale":0.5}', '--write']);
   success(['component', 'put', '--file', projectFile, '--scene', 'arena', 'child', 'Collider', '--write']);
+  const beforeDuplicateColliderPut = fs.readFileSync(projectFile, 'utf8');
+  failure([
+    'component', 'put', '--file', projectFile, '--scene', 'arena', 'child', 'Collider',
+    '--value', JSON.stringify([{ id: 'same-fixture', shape: 'box' }, { id: 'same-fixture', shape: 'circle' }]),
+    '--write'
+  ], 'E_COLLIDER_ID_DUPLICATE');
+  assert.strictEqual(fs.readFileSync(projectFile, 'utf8'), beforeDuplicateColliderPut, 'duplicate Collider ids must fail atomically');
   const rigidbody = success(['component', 'get', '--file', projectFile, '--scene', 'arena', 'child', 'Rigidbody']).data.value;
   assert.strictEqual(rigidbody.mass, 2);
   assert.strictEqual(rigidbody.gravityScale, 0.5);
@@ -409,8 +452,37 @@ try {
   success(['runtime', 'set', '--file', projectFile, '--runtime', 'pixijs', '--write']);
   failure(['physics', 'set', '--file', projectFile, '--dry-run'], 'E_REQUIRED_VALUE');
   success(['physics', 'set', '--file', projectFile, '--gravity-x', '0', '--gravity-y', '100', '--pixels-per-meter', '50', '--write']);
+  const nativePhysics = success(['physics', 'get', '--file', projectFile]).data;
+  assert.deepStrictEqual(
+    { requested: nativePhysics.requested, backend: nativePhysics.backend, implementation: nativePhysics.implementation, native: nativePhysics.native },
+    { requested: 'box2d', backend: 'box2d', implementation: 'planck', native: true }
+  );
+  const builtinSetting = success(['physics', 'set', '--file', projectFile, '--backend', 'builtin', '--write']).data.results[0];
+  assert.deepStrictEqual(
+    { requested: builtinSetting.requested, backend: builtinSetting.backend, implementation: builtinSetting.implementation, native: builtinSetting.native },
+    { requested: 'builtin', backend: 'builtin', implementation: 'ah2d-builtin', native: false }
+  );
+  const builtinPhysics = success(['physics', 'get', '--file', projectFile]).data;
+  assert.strictEqual(builtinPhysics.physics, 'builtin');
+  assert.strictEqual(builtinPhysics.requested, 'builtin');
+  const persistedBuiltinSimulation = success(['simulate', '--file', projectFile, '--scene', 'arena', '--steps', '1', '--dt', '0.0166666667']).data;
+  assert.deepStrictEqual(
+    { requested: persistedBuiltinSimulation.physics.requested, backend: persistedBuiltinSimulation.physics.backend, implementation: persistedBuiltinSimulation.physics.implementation, native: persistedBuiltinSimulation.physics.native },
+    { requested: 'builtin', backend: 'builtin', implementation: 'ah2d-builtin', native: false }
+  );
+  success(['physics', 'set', '--file', projectFile, '--backend', 'box2d', '--write']);
+  failure(['physics', 'set', '--file', projectFile, '--backend', 'unknown', '--dry-run'], 'E_PHYSICS_BACKEND');
   const validation = success(['validate', '--file', projectFile, '--engine']).data;
   assert.strictEqual(validation.valid, true);
+  assert.deepStrictEqual(
+    { requested: validation.physics.requested, backend: validation.physics.backend, implementation: validation.physics.implementation, native: validation.physics.native },
+    { requested: 'box2d', backend: 'box2d', implementation: 'planck', native: true }
+  );
+  const builtinValidation = success(['validate', '--file', projectFile, '--engine', '--backend', 'builtin']).data;
+  assert.deepStrictEqual(
+    { requested: builtinValidation.physics.requested, backend: builtinValidation.physics.backend, implementation: builtinValidation.physics.implementation, native: builtinValidation.physics.native },
+    { requested: 'builtin', backend: 'builtin', implementation: 'ah2d-builtin', native: false }
+  );
 
   const hashBeforeMismatch = documentHash(fs.readFileSync(projectFile, 'utf8'));
   failure(['scene', 'rename', '--file', projectFile, '--scene', 'arena', '--name', 'Changed', '--write', '--expect-sha256', '0'.repeat(64)], 'E_HASH_MISMATCH');
@@ -465,14 +537,32 @@ try {
   const firstSimulation = success(['simulate', '--file', projectFile, '--scene', 'arena', '--steps', '10', '--dt', '0.0166666667']).data;
   const secondSimulation = success(['simulate', '--file', projectFile, '--scene', 'arena', '--steps', '10', '--dt', '0.0166666667']).data;
   assert.deepStrictEqual(firstSimulation.entities, secondSimulation.entities, 'fixed-step simulation must be deterministic');
+  assert.deepStrictEqual(
+    { requested: firstSimulation.physics.requested, backend: firstSimulation.physics.backend, implementation: firstSimulation.physics.implementation, native: firstSimulation.physics.native },
+    { requested: 'box2d', backend: 'box2d', implementation: 'planck', native: true }
+  );
+  const builtinSimulation = success(['simulate', '--file', projectFile, '--scene', 'arena', '--backend', 'builtin', '--steps', '1', '--dt', '0.0166666667']).data;
+  assert.deepStrictEqual(
+    { requested: builtinSimulation.physics.requested, backend: builtinSimulation.physics.backend, implementation: builtinSimulation.physics.implementation, native: builtinSimulation.physics.native },
+    { requested: 'builtin', backend: 'builtin', implementation: 'ah2d-builtin', native: false }
+  );
   assert.strictEqual(firstSimulation.committed, false);
+  failure(['simulate', '--file', projectFile, '--scene', 'arena', '--backend', 'unknown'], 'E_PHYSICS_BACKEND');
   failure(['simulate', '--file', projectFile, '--scene', 'arena', '--steps', '1', '--commit'], 'E_WRITE_MODE');
   success(['simulate', '--file', projectFile, '--scene', 'arena', '--steps', '1', '--commit', '--write']);
 
-  const ecs = success(['ecs', 'export', '--file', projectFile, '--scene', 'arena']).data.document;
+  const nativeEcsExport = success(['ecs', 'export', '--file', projectFile, '--scene', 'arena']).data;
+  const ecs = nativeEcsExport.document;
+  assert.deepStrictEqual(
+    { requested: nativeEcsExport.physics.requested, backend: nativeEcsExport.physics.backend, implementation: nativeEcsExport.physics.implementation, native: nativeEcsExport.physics.native },
+    { requested: 'box2d', backend: 'box2d', implementation: 'planck', native: true }
+  );
   assert.strictEqual(ecs.format, 'AH2D');
   assert.strictEqual(ecs.sceneId, 'arena');
   assert.ok(ecs.entities.some(entity => entity.id === 'child'));
+  const builtinEcsExport = success(['ecs', 'export', '--file', projectFile, '--scene', 'arena', '--backend', 'builtin']).data;
+  assert.strictEqual(builtinEcsExport.physics.backend, 'builtin');
+  assert.strictEqual(builtinEcsExport.physics.implementation, 'ah2d-builtin');
 
   const query = success(['query', '--file', projectFile, '--pointer', '/engine/runtime']).data;
   assert.strictEqual(query.value, 'pixijs');

@@ -5,6 +5,7 @@ require('./AH2DEngine.js');
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const vm = require('vm');
 
 const near = (actual, expected, epsilon = 1e-5, message = '') => {
   assert.ok(Math.abs(actual - expected) <= epsilon, `${message} expected ${expected}, received ${actual}`);
@@ -27,7 +28,23 @@ const testSceneGraphAndRuntimes = () => {
   engine.useRuntime(new AH2D.CustomRuntimeAdapter()); assert.strictEqual(engine.runtime.name, 'custom');
   assert.strictEqual(engine.export().format, 'AH2D');
   assert.strictEqual(engine.physics.name, 'box2d');
-  assert.strictEqual(engine.physics.backend, 'builtin', 'Box2D adapter must have a dependency-free fallback');
+  assert.strictEqual(engine.physics.backend, 'box2d', 'the installed Planck dependency must be selected by default');
+  assert.strictEqual(engine.physics.implementation, 'planck');
+  assert.strictEqual(engine.physics.status, 'ready');
+  assert.strictEqual(engine.physics.native, true);
+  const fallback = new AH2D.Box2DPhysicsAdapter(null);
+  assert.strictEqual(fallback.backend, 'builtin', 'an explicit missing native API must retain the deterministic fallback');
+  assert.strictEqual(fallback.implementation, 'ah2d-builtin');
+  assert.strictEqual(fallback.status, 'fallback');
+  assert.strictEqual(fallback.native, false);
+  const explicitBuiltin = new AH2D.Engine({ physics: 'builtin' });
+  assert.strictEqual(explicitBuiltin.physics.backend, 'builtin');
+  assert.strictEqual(explicitBuiltin.physics.implementation, 'ah2d-builtin');
+  assert.strictEqual(explicitBuiltin.physics.status, 'ready');
+  assert.strictEqual(explicitBuiltin.physics.native, false);
+  const incompatible = new AH2D.Box2DPhysicsAdapter({ World: class LegacyWorld {} });
+  assert.strictEqual(incompatible.backend, 'builtin', 'an uppercase/legacy Box2D surface must not be mistaken for Planck');
+  assert.strictEqual(incompatible.usingNative, false);
 };
 
 
@@ -1237,11 +1254,16 @@ const testNativeBox2DPath = () => {
     isAwake() { return this.awake; }
   }
   class FakeWorld {
-    constructor(gravity) { this.gravity = gravity; this.bodies = []; }
+    constructor(gravity) { this.gravity = gravity; this.bodies = []; this.listeners = new Map(); }
     createBody(definition) { const body = new FakeBody(definition); this.bodies.push(body); return body; }
     destroyBody(body) { this.bodies = this.bodies.filter(value => value !== body); }
     step(dt) { this.bodies.forEach(body => { body.position.x += body.velocity.x * dt; body.position.y += body.velocity.y * dt; body.angle += body.angular * dt; }); }
     setGravity(value) { this.gravity = value; }
+    setAutoClearForces() {}
+    clearForces() {}
+    getContactList() { return null; }
+    on(name, listener) { const values = this.listeners.get(name) || new Set(); values.add(listener); this.listeners.set(name, values); }
+    off(name, listener) { this.listeners.get(name)?.delete(listener); }
   }
   const fakeBox2D = {
     World: FakeWorld,
@@ -1434,6 +1456,340 @@ const testNativeBox2DPath = () => {
   nestedEngine.update(0);
   const scaledCircleBody = assertNativeCircleParity('rescaled circle');
   assert.notStrictEqual(scaledCircleBody, initialCircleBody, 'inherited scale must rebuild native circle geometry');
+};
+
+const testRealPlanckForcesConfigurationAndLifecycle = () => {
+  const adapter = new AH2D.Box2DPhysicsAdapter(undefined, {
+    gravity: { x: 0, y: 0 },
+    pixelsPerMeter: 10,
+    maxStep: 0.01,
+    maxSubSteps: 16,
+    velocityIterations: 7,
+    positionIterations: 5
+  });
+  const engine = new AH2D.Engine({ physics: adapter });
+  engine.createEntity({
+    id: 'force-body',
+    x: 20,
+    y: 30,
+    rigidbody: { type: 'dynamic', mass: 2, gravityScale: 0, allowSleep: false },
+    collider: { id: 'force-fixture', shape: 'box', width: 10, height: 20, density: 2 }
+  });
+  engine.update(0);
+
+  assert.strictEqual(adapter.backend, 'box2d');
+  assert.strictEqual(adapter.implementation, 'planck');
+  assert.strictEqual(adapter.status, 'ready');
+  assert.strictEqual(adapter.native, true);
+  assert.strictEqual(adapter.usingNative, true);
+  const initialWorld = adapter.getNativeWorld();
+  const initialBody = adapter.getNativeBody('force-body');
+  const initialFixture = adapter.getNativeFixture('force-body', 'force-fixture');
+  assert.ok(initialWorld && initialBody && initialFixture, 'native Planck handles must be available after synchronization');
+
+  const nativeSteps = [];
+  const step = initialWorld.step.bind(initialWorld);
+  initialWorld.step = (...args) => { nativeSteps.push(args); return step(...args); };
+  assert.strictEqual(adapter.applyForce('force-body', 20, 0), true);
+  assert.strictEqual(adapter.applyTorque('force-body', 200), true);
+  engine.update(0.05);
+
+  assert.strictEqual(nativeSteps.length, 5, 'maxStep must split a long Engine frame into bounded native steps');
+  nativeSteps.forEach(args => {
+    near(args[0], 0.01, 1e-10, 'native substep duration');
+    assert.strictEqual(args[1], 7, 'velocityIterations must reach Planck');
+    assert.strictEqual(args[2], 5, 'positionIterations must reach Planck');
+  });
+  let body = adapter.getBody('force-body');
+  near(body.velocity.x, 0.5, 1e-8, 'native force conversion must preserve pixel-space acceleration');
+  near(body.velocity.y, 0, 1e-8);
+  near(body.angularVelocity, 6.875493541569879, 1e-8, 'native torque conversion must preserve pixel-space inertia');
+  assert.deepStrictEqual(body.force, { x: 0, y: 0 }, 'queued force must clear after one Engine step');
+  assert.strictEqual(body.torque, 0, 'queued torque must clear after one Engine step');
+
+  const velocityAfterForce = { ...body.velocity };
+  const angularAfterTorque = body.angularVelocity;
+  engine.update(0.05);
+  body = adapter.getBody('force-body');
+  near(body.velocity.x, velocityAfterForce.x, 1e-8, 'a queued force must not repeat on later frames');
+  near(body.velocity.y, velocityAfterForce.y, 1e-8, 'a queued force must not repeat on later frames');
+  near(body.angularVelocity, angularAfterTorque, 1e-8, 'queued torque must not repeat on later frames');
+
+  const velocityBeforeImpulse = body.velocity.x;
+  assert.strictEqual(adapter.applyImpulse('force-body', 10, 0), true);
+  near(adapter.getBody('force-body').velocity.x, velocityBeforeImpulse + 5, 1e-8, 'native impulse must use pixel-space units');
+
+  const pixelState = {
+    position: { ...body.position },
+    rotation: body.rotation,
+    velocity: { ...body.velocity },
+    angularVelocity: body.angularVelocity
+  };
+  adapter.setPixelsPerMeter(20);
+  body = adapter.getBody('force-body');
+  assert.strictEqual(adapter.pixelsPerMeter, 20);
+  assert.notStrictEqual(adapter.getNativeWorld(), initialWorld, 'changing PPM must rebuild the native World safely');
+  assert.notStrictEqual(adapter.getNativeBody('force-body'), initialBody, 'changing PPM must rebuild native bodies');
+  assert.notStrictEqual(adapter.getNativeFixture('force-body', 'force-fixture'), initialFixture, 'changing PPM must rebuild fixtures');
+  near(body.position.x, pixelState.position.x, 1e-8, 'PPM rebuild must preserve pixel position x');
+  near(body.position.y, pixelState.position.y, 1e-8, 'PPM rebuild must preserve pixel position y');
+  near(body.rotation, pixelState.rotation, 1e-8, 'PPM rebuild must preserve rotation');
+  near(body.velocity.x, pixelState.velocity.x, 1e-8, 'PPM rebuild must preserve pixel velocity x');
+  near(body.velocity.y, pixelState.velocity.y, 1e-8, 'PPM rebuild must preserve pixel velocity y');
+  near(body.angularVelocity, pixelState.angularVelocity, 1e-8, 'PPM rebuild must preserve angular velocity');
+  near(adapter.getNativeBody('force-body').getPosition().x, body.position.x / 20, 1e-8);
+  near(adapter.getNativeBody('force-body').getLinearVelocity().x, body.velocity.x / 20, 1e-8);
+
+  const preLoadWorld = adapter.getNativeWorld();
+  engine.load({
+    engine: {
+      physics: 'box2d',
+      physicsImplementation: 'planck',
+      gravity: { x: 50, y: -100 },
+      pixelsPerMeter: 25
+    },
+    scene: [{
+      id: 'configured-body',
+      x: 50,
+      y: 75,
+      rigidbody: { type: 'dynamic', gravityScale: 0 },
+      collider: { id: 'configured-fixture', shape: 'circle', radius: 5 }
+    }]
+  });
+  assert.strictEqual(adapter.pixelsPerMeter, 25, 'load must consume project.engine.pixelsPerMeter');
+  assert.deepStrictEqual(adapter.gravity, { x: 50, y: -100 }, 'load must consume project.engine.gravity');
+  assert.notStrictEqual(adapter.getNativeWorld(), preLoadWorld, 'loading a different PPM must rebuild the World');
+  near(adapter.getNativeWorld().getGravity().x, 2, 1e-8, 'document gravity x must be converted to metres');
+  near(adapter.getNativeWorld().getGravity().y, -4, 1e-8, 'document gravity y must be converted to metres');
+  engine.update(0);
+  assert.ok(adapter.getNativeBody('configured-body'));
+  assert.ok(adapter.getNativeFixture('configured-body', 'configured-fixture'));
+  near(adapter.getNativeBody('configured-body').getPosition().x, 2, 1e-8);
+  near(adapter.getNativeBody('configured-body').getPosition().y, 3, 1e-8);
+
+  assert.deepStrictEqual(engine.destroyEntity('configured-body'), ['configured-body']);
+  assert.strictEqual(adapter.getBody('configured-body'), null);
+  assert.strictEqual(adapter.getNativeBody('configured-body'), null);
+  assert.strictEqual(adapter.getNativeFixture('configured-body', 'configured-fixture'), null);
+  assert.strictEqual(adapter.getNativeWorld().getBodyCount(), 0, 'destroyEntity must destroy the native Planck body');
+};
+
+const testRealPlanckContactsTriggersFilteringAndMass = () => {
+  const triggerEngine = new AH2D.Engine({ gravity: { x: 0, y: 0 }, physicsOptions: { pixelsPerMeter: 10 } });
+  triggerEngine.createEntity({
+    id: 'sensor', x: 0, y: 0,
+    collider: { id: 'sensor-fixture', shape: 'box', width: 20, height: 20, isTrigger: true, categoryBits: 2, maskBits: 4 }
+  });
+  triggerEngine.createEntity({
+    id: 'actor', x: 0, y: 0,
+    rigidbody: { type: 'dynamic', gravityScale: 0, allowSleep: false },
+    collider: { id: 'actor-fixture', shape: 'circle', radius: 4, categoryBits: 4, maskBits: 2 }
+  });
+  const triggerEvents = [];
+  let collisionEvents = 0;
+  for (const name of ['physics:triggerenter', 'physics:triggerstay', 'physics:triggerexit']) {
+    triggerEngine.events.on(name, event => triggerEvents.push(event));
+  }
+  triggerEngine.events.on('physics:collisionstart', () => { collisionEvents += 1; });
+  triggerEngine.update(1 / 60);
+  triggerEngine.update(1 / 60);
+  triggerEngine.ecs.get('actor', 'Transform').x = 100;
+  triggerEngine.update(1 / 60);
+  assert.deepStrictEqual(triggerEvents.map(event => event.phase), ['enter', 'stay', 'exit']);
+  assert.strictEqual(collisionEvents, 0, 'a native sensor must emit trigger events rather than collision events');
+  for (const event of triggerEvents) {
+    assert.deepStrictEqual([event.a, event.b].sort(), ['actor', 'sensor']);
+    assert.ok(Number.isFinite(event.point.x) && Number.isFinite(event.point.y), 'native contact point must be finite');
+    near(Math.hypot(event.normal.x, event.normal.y), 1, 1e-8, 'native contact normal must be normalized');
+  }
+
+  const collisionEngine = new AH2D.Engine({ gravity: { x: 0, y: 0 }, physicsOptions: { pixelsPerMeter: 10 } });
+  collisionEngine.createEntity({ id: 'wall', x: 0, y: 0, collider: { id: 'wall-fixture', shape: 'box', width: 20, height: 20 } });
+  collisionEngine.createEntity({
+    id: 'box', x: 0, y: 10,
+    rigidbody: { type: 'dynamic', gravityScale: 0, allowSleep: false },
+    collider: { id: 'box-fixture', shape: 'box', width: 10, height: 10 }
+  });
+  const collisionPhases = [];
+  for (const name of ['physics:collisionstart', 'physics:collisionstay', 'physics:collisionend']) {
+    collisionEngine.events.on(name, event => collisionPhases.push(event.phase));
+  }
+  collisionEngine.update(1 / 60);
+  collisionEngine.update(1 / 60);
+  collisionEngine.ecs.get('box', 'Transform').y = 100;
+  collisionEngine.update(1 / 60);
+  assert.deepStrictEqual(collisionPhases, ['start', 'stay', 'end'], 'native contacts must drive collision lifecycle events');
+
+  const filteredEngine = new AH2D.Engine({ gravity: { x: 0, y: 0 }, physicsOptions: { pixelsPerMeter: 10 } });
+  filteredEngine.createEntity({
+    id: 'filtered-dynamic', x: 0, y: 0,
+    rigidbody: { type: 'dynamic', gravityScale: 0 },
+    collider: { shape: 'box', width: 10, height: 10, categoryBits: 1, maskBits: 0 }
+  });
+  filteredEngine.createEntity({
+    id: 'filtered-static', x: 0, y: 0,
+    collider: { shape: 'box', width: 10, height: 10, categoryBits: 2, maskBits: 0xffff }
+  });
+  let filteredContacts = 0;
+  filteredEngine.events.on('physics:contact', () => { filteredContacts += 1; });
+  filteredEngine.update(1 / 60);
+  assert.strictEqual(filteredContacts, 0, 'Planck category/mask filtering must suppress excluded pairs');
+  assert.strictEqual(filteredEngine.physics.contacts.size, 0);
+
+  const staticEngine = new AH2D.Engine({ gravity: { x: 0, y: 0 }, physicsOptions: { pixelsPerMeter: 10 } });
+  staticEngine.createEntity({ id: 'static-a', x: 0, y: 0, collider: { shape: 'box', width: 20, height: 20 } });
+  staticEngine.createEntity({ id: 'static-b', x: 0, y: 0, collider: { shape: 'box', width: 20, height: 20 } });
+  let staticContacts = 0;
+  staticEngine.events.on('physics:contact', () => { staticContacts += 1; });
+  staticEngine.update(1 / 60);
+  assert.strictEqual(staticContacts, 0, 'the native path must not invent static/static contacts with an O(n^2) fallback scan');
+
+  const massEngine = new AH2D.Engine({ gravity: { x: 0, y: 0 }, physicsOptions: { pixelsPerMeter: 10 } });
+  massEngine.createEntity({
+    id: 'auto-mass-native',
+    components: {
+      Rigidbody: { type: 'dynamic', useAutoMass: true, gravityScale: 0 },
+      BoxCollider: [
+        { id: 'solid-mass', width: 10, height: 20, density: 2 },
+        { id: 'sensor-mass', width: 100, height: 100, density: 100, isTrigger: true }
+      ]
+    }
+  });
+  massEngine.update(0);
+  near(massEngine.physics.getBody('auto-mass-native').mass, 4, 1e-8, 'built-in mass projection must exclude sensors');
+  near(massEngine.physics.getNativeBody('auto-mass-native').getMass(), 4, 1e-8, 'native Planck mass must exclude sensors');
+  near(massEngine.physics.getNativeFixture('auto-mass-native', 'solid-mass').getDensity(), 2, 1e-8);
+  near(massEngine.physics.getNativeFixture('auto-mass-native', 'sensor-mass').getDensity(), 0, 1e-8);
+
+  const authoredMassEngine = new AH2D.Engine({ gravity: { x: 0, y: 0 }, physicsOptions: { pixelsPerMeter: 10 } });
+  authoredMassEngine.createEntity({
+    id: 'body-without-fixtures',
+    rigidbody: { type: 'dynamic', mass: 7, gravityScale: 0, allowSleep: false }
+  });
+  authoredMassEngine.createEntity({
+    id: 'body-with-only-sensor',
+    rigidbody: { type: 'dynamic', mass: 5, gravityScale: 0, allowSleep: false },
+    collider: { id: 'massless-sensor', shape: 'circle', radius: 10, density: 100, isTrigger: true }
+  });
+  authoredMassEngine.update(0);
+  near(authoredMassEngine.physics.getBody('body-without-fixtures').mass, 7, 1e-8, 'a native body without fixtures must preserve authored mass');
+  near(authoredMassEngine.physics.getNativeBody('body-without-fixtures').getMass(), 7, 1e-8, 'Planck must receive authored mass without fixtures');
+  near(authoredMassEngine.physics.getBody('body-with-only-sensor').mass, 5, 1e-8, 'a sensor-only native body must preserve authored mass');
+  near(authoredMassEngine.physics.getNativeBody('body-with-only-sensor').getMass(), 5, 1e-8, 'Planck sensors must not replace authored mass');
+  assert.strictEqual(authoredMassEngine.physics.applyImpulse('body-without-fixtures', 14, 0), true);
+  near(authoredMassEngine.physics.getBody('body-without-fixtures').velocity.x, 2, 1e-8, 'fixtureless impulse must use authored mass');
+};
+
+const testDocumentPhysicsSelectionAndNativeSnapshot = () => {
+  const engine = new AH2D.Engine({
+    gravity: { x: 0, y: 0 },
+    physicsOptions: { pixelsPerMeter: 10 },
+    runtime: 'custom'
+  });
+  assert.strictEqual(engine.physics.name, 'box2d');
+  assert.strictEqual(engine.physics.usingNative, true);
+
+  engine.load({
+    engine: { physics: 'builtin', gravity: { x: 0, y: 0 }, pixelsPerMeter: 12 },
+    scene: [{ id: 'builtin-object', rigidbody: { type: 'dynamic', mass: 3, gravityScale: 0 } }]
+  });
+  assert.strictEqual(engine.physics.name, 'builtin', 'an unlocked Engine must honor an authored built-in backend');
+  assert.strictEqual(engine.physics.implementation, 'ah2d-builtin');
+  assert.strictEqual(engine.physics.pixelsPerMeter, 12);
+
+  engine.load({ scene: [] });
+  assert.strictEqual(engine.physics.name, 'box2d', 'a legacy project without metadata must return to the documented Box2D default');
+  assert.strictEqual(engine.physics.usingNative, true);
+
+  engine.load({
+    engine: { physics: 'box2d', gravity: { x: 0, y: 0 }, pixelsPerMeter: 10 },
+    scene: [{
+      id: 'snapshot-body', x: 30, y: 40,
+      rigidbody: { type: 'dynamic', mass: 2, gravityScale: 0, allowSleep: false, velocityX: 8 },
+      collider: { id: 'snapshot-fixture', shape: 'box', width: 10, height: 20 }
+    }]
+  });
+  assert.strictEqual(engine.physics.name, 'box2d', 'an unlocked Engine must switch back to native Box2D from project data');
+  assert.strictEqual(engine.physics.usingNative, true);
+  engine.update(0);
+  engine.physics.setTransform('snapshot-body', 55, 65, 12);
+  engine.physics.setVelocity('snapshot-body', 9, -4);
+  engine.physics.setAngularVelocity('snapshot-body', 15);
+  engine.update(0);
+  const snapshot = engine.captureSnapshot();
+
+  engine.physics.setPixelsPerMeter(25);
+  engine.physics.setTransform('snapshot-body', 500, 600, 90);
+  engine.physics.setVelocity('snapshot-body', 0, 0);
+  engine.restoreSnapshot(snapshot);
+  const restored = engine.physics.getBody('snapshot-body');
+  assert.strictEqual(engine.physics.pixelsPerMeter, 10, 'native snapshot restore must restore pixelsPerMeter');
+  near(restored.position.x, 55, 1e-8, 'native snapshot restore position x');
+  near(restored.position.y, 65, 1e-8, 'native snapshot restore position y');
+  near(restored.rotation, 12, 1e-8, 'native snapshot restore rotation');
+  near(restored.velocity.x, 9, 1e-8, 'native snapshot restore velocity x');
+  near(restored.velocity.y, -4, 1e-8, 'native snapshot restore velocity y');
+  near(restored.angularVelocity, 15, 1e-8, 'native snapshot restore angular velocity');
+  near(engine.physics.getNativeBody('snapshot-body').getPosition().x, 5.5, 1e-8, 'restored state must be written back to Planck');
+  near(engine.physics.getNativeBody('snapshot-body').getLinearVelocity().x, 0.9, 1e-8, 'restored velocity must be written back to Planck');
+
+  const lockedBuiltin = new AH2D.Engine({ physics: 'builtin' });
+  lockedBuiltin.load({ engine: { physics: 'box2d' }, scene: [] });
+  assert.strictEqual(lockedBuiltin.physics.name, 'builtin', 'an explicit constructor adapter must override project metadata');
+  const lockedBox2D = new AH2D.Engine({ physics: 'box2d' });
+  lockedBox2D.load({ engine: { physics: 'builtin' }, scene: [] });
+  assert.strictEqual(lockedBox2D.physics.name, 'box2d', 'an explicit Box2D constructor choice must remain locked');
+
+  const restoreBackend = new AH2D.Engine({ runtime: 'custom' });
+  restoreBackend.load({ engine: { physics: 'builtin' }, scene: [{ id: 'authored-before-play' }] });
+  const builtinSnapshot = restoreBackend.captureSnapshot();
+  restoreBackend.load({ engine: { physics: 'box2d' }, scene: [{ id: 'runtime-replacement' }] });
+  assert.strictEqual(restoreBackend.physics.name, 'box2d');
+  delete builtinSnapshot.physicsAdapter;
+  const observedRestoreAdapters = [];
+  restoreBackend.events.on('document:load', () => observedRestoreAdapters.push(restoreBackend.physics.name));
+  restoreBackend.restoreSnapshot(builtinSnapshot);
+  assert.strictEqual(restoreBackend.physics.name, 'builtin', 'legacy snapshot restore must infer the adapter selected before Play from its document');
+  assert.deepStrictEqual(observedRestoreAdapters, ['builtin'], 'snapshot restore must not expose a transient backend during document:load');
+  assert.ok(restoreBackend.ecs.entities.has('authored-before-play'));
+};
+
+const testPublicPlayStopRestoresPhysicsBackendState = () => {
+  const engine = new AH2D.Engine({ runtime: 'custom' });
+  engine.load({
+    engine: { physics: 'builtin', gravity: { x: 0, y: 0 }, pixelsPerMeter: 12 },
+    scene: [
+      { id: 'fixtureless-before-play', x: 11, y: 13, rigidbody: { type: 'dynamic', mass: 7, gravityScale: 0, velocityX: 3, velocityY: -2 } },
+      { id: 'sensor-before-play', x: 21, y: 23, rigidbody: { type: 'dynamic', mass: 5, gravityScale: 0 }, collider: { id: 'play-sensor', shape: 'circle', radius: 4, isTrigger: true } }
+    ]
+  });
+  engine.update(0);
+  engine.start(null, { restoreOnStop: true });
+  engine.load({ engine: { physics: 'box2d', pixelsPerMeter: 40 }, scene: [{ id: 'native-during-play' }] });
+  engine.stop();
+  assert.strictEqual(engine.physics.name, 'builtin');
+  assert.strictEqual(engine.physics.pixelsPerMeter, 12);
+  near(engine.physics.getBody('fixtureless-before-play').mass, 7, 1e-8);
+  near(engine.physics.getBody('fixtureless-before-play').position.x, 11, 1e-8);
+  near(engine.physics.getBody('fixtureless-before-play').velocity.x, 3, 1e-8);
+  near(engine.physics.getBody('sensor-before-play').mass, 5, 1e-8);
+
+  engine.load({
+    engine: { physics: 'box2d', gravity: { x: 0, y: 0 }, pixelsPerMeter: 10 },
+    scene: [{ id: 'native-before-play', x: 35, y: 45, rigidbody: { type: 'dynamic', mass: 6, gravityScale: 0, velocityX: 8, velocityY: -3 }, collider: { id: 'native-play-sensor', shape: 'circle', radius: 5, isTrigger: true } }]
+  });
+  engine.update(0);
+  engine.start(null, { restoreOnStop: true });
+  engine.load({ engine: { physics: 'builtin', pixelsPerMeter: 70 }, scene: [{ id: 'builtin-during-play' }] });
+  engine.stop();
+  assert.strictEqual(engine.physics.name, 'box2d');
+  assert.strictEqual(engine.physics.usingNative, true);
+  assert.strictEqual(engine.physics.pixelsPerMeter, 10);
+  near(engine.physics.getBody('native-before-play').mass, 6, 1e-8);
+  near(engine.physics.getNativeBody('native-before-play').getMass(), 6, 1e-8);
+  near(engine.physics.getBody('native-before-play').position.x, 35, 1e-8);
+  near(engine.physics.getBody('native-before-play').velocity.x, 8, 1e-8);
+  near(engine.physics.getNativeBody('native-before-play').getPosition().x, 3.5, 1e-8);
 };
 
 const deferred = () => {
@@ -1885,14 +2241,20 @@ const testFrameErrorStopsPixiRuntime = () => {
 
 const testEditorRuntimeContract = () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'AH2DEdtior.html'), 'utf8');
+  const inlineScripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)].map(match => match[1]);
+  assert.ok(inlineScripts.length > 0, 'editor must include its inline application script');
+  inlineScripts.forEach((source, index) => assert.doesNotThrow(
+    () => new vm.Script(source, { filename: `AH2DEdtior.inline-${index + 1}.js` }),
+    `editor inline script ${index + 1} must be valid JavaScript`
+  ));
   for (const id of ['runtimeSelect', 'editorPlay', 'editorPause', 'editorStop', 'runtimeBackend', 'addComponentBtn', 'sceneSelect', 'newSceneBtn', 'saveSceneBtn', 'sceneModal', 'postProcessBtn', 'postProcessPanel', 'postProcessList', 'postProcessReset']) {
     assert.ok(html.includes(`id="${id}"`), `editor runtime control #${id} is missing`);
   }
-  for (const token of ['data-add-component="rigidbody"', 'data-add-component="box-collider"', 'data-add-component="circle-collider"', 'ah2dEngine.pause()', 'ah2dEngine.resume()', 'pullSceneTransformsFromEngine()', 'function switchScene(', 'function createScene(', 'function saveCurrentScene()', 'currentSceneId:state.currentSceneId', 'scenes,scene:', 'dataModel:{...dataModelDescriptor}', "componentSchemas.create('Rigidbody'", 'writeEditorComponent(', 'postProcess:cloneData(state.postProcess)', 'function applyScenePostProcess(']) {
+  for (const token of ['data-add-component="rigidbody"', 'data-add-component="box-collider"', 'data-add-component="circle-collider"', 'ah2dEngine.pause()', 'ah2dEngine.resume()', 'pullSceneTransformsFromEngine()', 'function switchScene(', 'function createScene(', 'function saveCurrentScene()', 'currentSceneId:state.currentSceneId', 'scenes,scene:', 'dataModel:{...dataModelDescriptor}', "componentSchemas.create('Rigidbody'", 'writeEditorComponent(', 'postProcess:cloneData(state.postProcess)', 'function applyScenePostProcess(', "requestedPhysics:'box2d'", 'physics:state.requestedPhysics', 'state.requestedPhysics=next.requestedPhysics', 'requireConfiguredPhysics()']) {
     assert.ok(html.includes(token), `editor integration token is missing: ${token}`);
   }
-  const dataModelScript = html.indexOf('./engine/AH2DDataModel.js'), engineScript = html.indexOf('./engine/AH2DEngine.js');
-  assert.ok(dataModelScript >= 0 && engineScript > dataModelScript, 'DataModel must load before the Engine');
+  const pixiScript = html.indexOf('./node_modules/pixi.js/dist/pixi.min.js'), pixiCspScript = html.indexOf('./node_modules/pixi.js/dist/packages/unsafe-eval.min.js'), planckScript = html.indexOf('./node_modules/planck/dist/planck.min.js'), dataModelScript = html.indexOf('./engine/AH2DDataModel.js'), engineScript = html.indexOf('./engine/AH2DEngine.js');
+  assert.ok(pixiScript >= 0 && pixiCspScript > pixiScript && planckScript > pixiCspScript && dataModelScript > planckScript && engineScript > dataModelScript, 'Pixi, its CSP-safe polyfill, Planck, DataModel, and Engine must load in dependency order');
   assert.ok(!html.includes('fallbackPhysicsSubstep'), 'editor must not run a second competing physics solver');
   assert.ok(html.includes("renderer:state.runtime"), 'Universal JSON must persist the selected runtime');
 };
@@ -1936,6 +2298,10 @@ const run = async () => {
   testSnapshotRestore();
   testPauseResumeKeepsSimulationState();
   testNativeBox2DPath();
+  testRealPlanckForcesConfigurationAndLifecycle();
+  testRealPlanckContactsTriggersFilteringAndMass();
+  testDocumentPhysicsSelectionAndNativeSnapshot();
+  testPublicPlayStopRestoresPhysicsBackendState();
   await testPixiV8AsyncMountAndNativeScene();
   await testPixiRuntimeMutationsAndAssetStaleness();
   testPixiLiveChildrenSurviveParentDeletion();

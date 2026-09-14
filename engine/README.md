@@ -9,12 +9,12 @@ AH2D keeps editor data independent from a specific renderer. The editor can prev
 - Scene Graph with cycle-safe nested parent/child relationships
 - Entity Component System (ECS)
 - Transform, Camera, Lighting, Shadow, Animation, and Tilemap systems
-- Box2D adapter with pixel/metre conversion
-- Deterministic built-in 2D physics fallback for offline editor previews
+- Native Box2D-compatible backend through Planck with pixel/metre conversion
+- Deterministic built-in 2D physics backend available by explicit selection
 - Runtime adapters for PixiJS, PhaserJS, and custom hosts
 - Editor bridge for `AH2DEdtior.html`
 - Multi-Scene project loading and runtime Scene switching
-- Dependency-free, agent-friendly CLI for lossless project automation
+- Agent-friendly CLI for lossless project automation; Runtime physics commands use the installed Planck package
 
 ## CLI
 
@@ -183,9 +183,15 @@ engine.useRuntime('custom', {
 }
 ```
 
-Collider-only entities are static. The physics API also exposes `applyForce`, `applyTorque`, `applyImpulse`, `setVelocity`, `setAngularVelocity`, `setTransform`, `wake`, `sleep`, `snapshot`, and `restore`.
+`Collider` also accepts an array or `{ colliders: [...] }` / `{ shapes: [...] }`; every enabled entry creates one native fixture. Explicit fixture IDs must be unique per Entity; stable IDs make contact payloads and `getNativeFixture()` deterministic.
+
+Collider-only entities are static. The physics API also exposes `applyForce`, `applyTorque`, `applyImpulse`, `setVelocity`, `setAngularVelocity`, `setTransform`, `setGravity`, `setPixelsPerMeter`, `wake`, `sleep`, `snapshot`, and `restore`.
 
 Collision events are emitted as `physics:collisionstart`, `physics:collisionstay`, and `physics:collisionend`. Trigger events use `physics:triggerenter`, `physics:triggerstay`, and `physics:triggerexit`.
+
+Normal execution reports `backend: "box2d"`, `implementation: "planck"`, and `native: true`. The built-in solver reports `backend: "builtin"`, `implementation: "ah2d-builtin"`, and `native: false`; request it through Universal Project `engine.physics` or lock it for a host with `{ physics: "builtin" }`. Native Planck handles are exposed by `getNativeWorld()`, `getNativeBody(entityId)`, and `getNativeFixture(entityId, colliderId)` for Runtime-only extensions.
+
+See [`../docs/PHYSICS.md`](../docs/PHYSICS.md) for units, multi-fixture layouts, stepping, contact payloads, CLI selection, Play Mode, lifecycle, and native-extension boundaries.
 
 The universal AH2D JSON remains the source of truth, so scenes and physics components are portable across all runtime adapters.
 
@@ -195,4 +201,4 @@ The universal AH2D JSON remains the source of truth, so scenes and physics compo
 node engine/AH2DEngine.test.js
 ```
 
-The suite covers deep nested local/world transforms, dirty propagation, traversal, cycle protection, preserve-world reparent/detach, atomic singular/shear rejection, graph-aware deletion, runtime selection, gravity and damping, contacts, triggers, collision filters, automatic mass, impulses, kinematic bodies, sleeping, lifecycle restoration, native Box2D conversion, and the Editor contract.
+The suite covers deep nested local/world transforms, dirty propagation, traversal, cycle protection, preserve-world reparent/detach, atomic singular/shear rejection, graph-aware deletion, runtime selection, gravity and damping, native contacts, triggers, collision filters, automatic mass, forces, torque, impulses, kinematic bodies, sleeping, bounded substeps, native-handle access, lifecycle restoration, native Box2D conversion, and the Editor contract.

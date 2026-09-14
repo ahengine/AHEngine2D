@@ -425,6 +425,51 @@ test('maps authored rectangle colliders only in the runtime copy', () => {
   assert.strictEqual(entity.components.Collider.shape, 'rectangle');
 });
 
+test('requires explicit Collider ids to be unique per Entity without rewriting wrappers or unknown fields', () => {
+  const registry = createDefaultComponentRegistry();
+  const wrapped = {
+    colliders: [
+      { id: 'hurtbox', shape: 'rectangle', extension: { keep: 1 } },
+      { id: 'hurtbox', shape: 'circle', radius: 8, futureFixture: true }
+    ],
+    futureWrapper: { keep: true }
+  };
+  const source = JSON.stringify(wrapped);
+  const componentDiagnostics = registry.validate('Collider', wrapped, { pointer: '/components/Collider' });
+  assert(componentDiagnostics.some(item => (
+    item.code === 'E_COLLIDER_ID_DUPLICATE'
+    && item.pointer === '/components/Collider/colliders/1/id'
+    && item.details.firstPointer === '/components/Collider/colliders/0/id'
+    && item.details.colliderId === 'hurtbox'
+  )));
+  assert.strictEqual(JSON.stringify(wrapped), source, 'validation must preserve the wrapper and unknown fields');
+
+  const implicitIds = registry.validate('Collider', [{ id: '' }, {}, { id: '' }], { pointer: '/components/Collider' });
+  assert.strictEqual(implicitIds.some(item => item.code === 'E_COLLIDER_ID_DUPLICATE'), false, 'empty ids use distinct generated runtime ids');
+
+  const codec = createDefaultEntityCodec();
+  const entity = {
+    id: 'fighter',
+    components: {
+      Collider: { shapes: [{ id: 'shared', extension: 'kept' }], wrapperExtension: 2 },
+      BoxCollider2D: { id: 'shared', width: 12, height: 14, custom: { keep: true } }
+    }
+  };
+  const entitySource = JSON.stringify(entity);
+  const entityDiagnostics = codec.validate(entity, { pointer: '/scenes/0/objects/0' });
+  const duplicate = entityDiagnostics.find(item => item.code === 'E_COLLIDER_ID_DUPLICATE');
+  assert.strictEqual(duplicate.pointer, '/scenes/0/objects/0/components/BoxCollider2D/id');
+  assert.strictEqual(duplicate.details.firstPointer, '/scenes/0/objects/0/components/Collider/shapes/0/id');
+  assert.strictEqual(duplicate.details.entityId, 'fighter');
+  assert.strictEqual(JSON.stringify(entity), entitySource, 'entity validation must remain non-mutating');
+  assert.throws(
+    () => codec.decodeToRuntime(entity),
+    error => error instanceof ComponentSchemaError
+      && error.code === 'E_COLLIDER_ID_DUPLICATE'
+      && error.pointer === '/components/BoxCollider2D/id'
+  );
+});
+
 test('prevents removal of required Name and Transform components', () => {
   const codec = createDefaultEntityCodec();
   const entity = { id: 'required', name: 'Required', x: 0, y: 0 };

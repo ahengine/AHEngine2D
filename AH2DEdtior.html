@@ -681,6 +681,8 @@ radial-gradient(circle at 50% 58%,#182b45,#0a121d 60%);background-size:32px 32px
 <div class="toast" id="toast"></div>
 
 <script src="./node_modules/pixi.js/dist/pixi.min.js"></script>
+<script src="./node_modules/pixi.js/dist/packages/unsafe-eval.min.js"></script>
+<script src="./node_modules/planck/dist/planck.min.js"></script>
 <script src="./engine/AH2DDataModel.js"></script>
 <script src="./engine/AH2DEngine.js"></script>
 <script>
@@ -733,13 +735,13 @@ const state={
  hierarchyCollapsed:false,projectCollapsed:false,leftClosed:false,rightClosed:false,openFolders:{},openEntities:{},
  projectSize:0,projectFolder:'',folders:['Environment','Props','Characters','FX','UI','Prefabs','Animations'],
  assets:[...builtins], history:[], future:[],
- runtime:'pixijs',playMode:'stopped',playSnapshot:null,playSelection:null,runtimeScene:null,runtimeError:'',playGeneration:0,worldGravity:{x:0,y:980},
+ runtime:'pixijs',requestedPhysics:'box2d',playMode:'stopped',playSnapshot:null,playSelection:null,runtimeScene:null,runtimeError:'',physicsError:'',playGeneration:0,worldGravity:{x:0,y:980},
  postProcess:createDefaultPostProcess(),
  animator:{frame:0,playing:false,fps:12,timer:0,onion:true,timelineHeight:300,clip:'Knight_Run'},
  particle:createDefaultParticle(),particleIncluded:true,
  particles:[],emitAcc:0
 };
-const ah2dEngine=new AH2D.Engine({runtime:'pixijs',runtimeOptions:{PIXI:window.PIXI,viewport:{width:1920,height:1080,fit:'contain'},backgroundAlpha:0}});
+const ah2dEngine=new AH2D.Engine({runtime:'pixijs',runtimeOptions:{PIXI:window.PIXI,viewport:{width:1920,height:1080,fit:'contain'},backgroundAlpha:0},box2d:window.planck,physicsOptions:{gravity:state.worldGravity,pixelsPerMeter:100}});
 const componentSchemas=ah2dEngine.componentSchemas;
 const entityCodec=ah2dEngine.entityCodec;
 const dataModelDescriptor=Object.freeze({id:AH2D.DataModel.DATA_MODEL_ID,version:AH2D.DataModel.DATA_MODEL_VERSION,componentSchemaVersion:AH2D.DataModel.COMPONENT_SCHEMA_VERSION});
@@ -756,7 +758,7 @@ window.AH2DEditorRuntime={
  play:()=>startPlayMode(),
  pause:()=>pausePlayMode(),
  stop:()=>stopPlayMode(),
- status:()=>({mode:state.playMode,runtime:state.runtime,backend:ah2dEngine.runtime?.backend||'editor-bridge',native:ah2dEngine.runtime?.native===true,error:state.runtimeError||null,canvasCount:$('#runtimeStage')?.querySelectorAll('canvas').length||0}),
+ status:()=>({mode:state.playMode,runtime:state.runtime,backend:ah2dEngine.runtime?.backend||'editor-bridge',native:ah2dEngine.runtime?.native===true,error:state.runtimeError||null,canvasCount:$('#runtimeStage')?.querySelectorAll('canvas').length||0,physics:physicsStatus()}),
  scenes:{list:()=>state.scenes.map(({id,name,updatedAt})=>({id,name,updatedAt})),current:()=>state.currentSceneId,switch:id=>switchScene(id),create:name=>createScene(name),save:()=>saveCurrentScene()},
  postProcess:{
   list:()=>cloneData(state.postProcess.effects),
@@ -767,14 +769,15 @@ window.AH2DEditorRuntime={
  exportECS:()=>ah2dEngine.export(),
  sync:()=>state.playMode==='stopped'?syncEngineDocument(true):false,
  physics:{
-  body:id=>ah2dEngine.physics.getBody(id),
-  applyForce:(id,x,y)=>ah2dEngine.physics.applyForce(id,x,y),
-  applyTorque:(id,value)=>ah2dEngine.physics.applyTorque(id,value),
-  applyImpulse:(id,x,y,point)=>ah2dEngine.physics.applyImpulse(id,x,y,point),
-  setVelocity:(id,x,y)=>ah2dEngine.physics.setVelocity(id,x,y),
-  setAngularVelocity:(id,value)=>ah2dEngine.physics.setAngularVelocity(id,value),
-  wake:id=>ah2dEngine.physics.wake(id),
-  sleep:id=>ah2dEngine.physics.sleep(id)
+   status:()=>physicsStatus(),
+   body:id=>ah2dEngine.physics.getBody(id),
+   applyForce:(id,x,y)=>ah2dEngine.physics.applyForce(id,x,y),
+   applyTorque:(id,value)=>ah2dEngine.physics.applyTorque(id,value),
+   applyImpulse:(id,x,y,point)=>ah2dEngine.physics.applyImpulse(id,x,y,point),
+   setVelocity:(id,x,y)=>ah2dEngine.physics.setVelocity(id,x,y),
+   setAngularVelocity:(id,value)=>ah2dEngine.physics.setAngularVelocity(id,value),
+   wake:id=>ah2dEngine.physics.wake(id),
+   sleep:id=>ah2dEngine.physics.sleep(id)
  }
 };
 function entity(name,kind,icon,x,y,w,h,layer,color,extra={}){
@@ -802,12 +805,17 @@ state.prefab=[
 /* helpers */
 function toast(t){const el=$('#toast');el.textContent=t;el.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>el.classList.remove('show'),1500)}
 function authoringMutationBlocked(){if(state.playMode==='stopped')return false;toast('Stop Preview before editing');return true}
+function physicsStatus(){
+ const physics=ah2dEngine.physics,requested=state.requestedPhysics==='builtin'?'builtin':'box2d',libraryLoaded=typeof window.planck?.World==='function',native=physics?.usingNative===true&&physics?.backend==='box2d',backend=native?'box2d':'builtin',implementation=native?'planck':'ah2d-builtin',builtinReady=requested==='builtin'&&physics?.name==='builtin'&&backend==='builtin',available=requested==='box2d'?native:builtinReady,fallback=requested==='box2d'&&!native,status=available?'ready':'fallback';
+ return{requested,requestedImplementation:requested==='box2d'?'planck':'ah2d-builtin',backend,implementation,implementationLabel:implementation==='planck'?'Planck.js':'AH2D built-in solver',status,native,available,fallback,libraryLoaded,pixelsPerMeter:physics?.pixelsPerMeter??null,error:requested==='box2d'&&!native?(state.physicsError||(physics?.nativeError?`Planck.js failed to initialize: ${runtimeErrorMessage(physics.nativeError)}`:libraryLoaded?'Planck.js loaded, but the Box2D adapter did not initialize':'Planck.js did not load; Box2D is unavailable')):null};
+}
+function setPhysicsPixelsPerMeter(value){const physics=ah2dEngine.physics,next=Math.max(.001,Number(value));if(!physics||!Number.isFinite(next)||typeof physics.setPixelsPerMeter!=='function')return physics?.pixelsPerMeter??null;physics.setPixelsPerMeter(next);return physics.pixelsPerMeter}
 function currentObjects(){return activePage==='prefab'?state.prefab:state.scene}
 function selectedObject(){let id=activePage==='prefab'?state.prefabSelected:state.sceneSelected;return currentObjects().find(o=>o.id===id)||null}
 function selectedIds(mode=activePage==='prefab'?'prefab':'scene'){return state[mode+'SelectedIds']}
 function setSelection(mode,ids,primary=null){state[mode+'SelectedIds']=[...new Set(ids)];state[mode+'Selected']=primary&&ids.includes(primary)?primary:(ids.at(-1)||null)}
 function historyState(){return{scene:state.scene,prefab:state.prefab,worldGravity:state.worldGravity,pixelsPerMeter:ah2dEngine.physics?.pixelsPerMeter,postProcess:state.postProcess}}
-function restoreHistoryState(s){state.scene=s.scene;state.prefab=s.prefab;if(s.worldGravity)state.worldGravity=s.worldGravity;if(s.postProcess)state.postProcess=s.postProcess;if(Number.isFinite(s.pixelsPerMeter)&&ah2dEngine.physics)ah2dEngine.physics.pixelsPerMeter=s.pixelsPerMeter;setSelection('scene',[]);setSelection('prefab',[])}
+function restoreHistoryState(s){state.scene=s.scene;state.prefab=s.prefab;if(s.worldGravity)state.worldGravity=s.worldGravity;if(s.postProcess)state.postProcess=s.postProcess;if(Number.isFinite(s.pixelsPerMeter))setPhysicsPixelsPerMeter(s.pixelsPerMeter);setSelection('scene',[]);setSelection('prefab',[])}
 function snapshot(){const checkpoint={history:[...state.history],future:[...state.future]};state.history.push(JSON.stringify(historyState()));if(state.history.length>50)state.history.shift();state.future=[];return checkpoint}
 function rollbackSnapshot(checkpoint){if(!checkpoint)return;state.history=checkpoint.history;state.future=checkpoint.future}
 function undo(){if(authoringMutationBlocked()||!state.history.length)return;state.future.push(JSON.stringify(historyState()));restoreHistoryState(JSON.parse(state.history.pop()));renderAll();renderPostProcessPanel()}
@@ -948,6 +956,34 @@ function openSceneModal(){if(authoringMutationBlocked())return;const modal=$('#s
 function saveCurrentScene(){if(authoringMutationBlocked())return false;const name=activeSceneRecord()?.name||'Scene';return saveLocal(`${name} saved`)}
 const defaultRigidbody=()=>componentSchemas.create('Rigidbody',{}, {profile:AH2D.DataModel.PROFILES.AUTHORING});
 const defaultCollider=(o,shape='rectangle')=>{const width=Math.max(8,Math.abs(o.w||64)),height=Math.max(8,Math.abs(o.h||64));return componentSchemas.create('Collider',{shape,width,height,radius:Math.max(4,Math.min(width,height)/2)},{profile:AH2D.DataModel.PROFILES.AUTHORING,entity:o})};
+function colliderCollection(value){
+ if(Array.isArray(value))return{kind:'array',items:value};
+ if(value&&typeof value==='object'){if(Array.isArray(value.colliders))return{kind:'colliders',items:value.colliders};if(Array.isArray(value.shapes))return{kind:'shapes',items:value.shapes};return{kind:'single',items:[value]}}
+ return{kind:'none',items:[]};
+}
+function rebuildColliderCollection(value,kind,items){if(kind==='array')return items;if(kind==='colliders'||kind==='shapes'){const next=cloneData(value);next[kind]=items;return next}return items[0]||null}
+function stabilizeColliderFixtureIds(value){
+ const next=cloneData(value),collection=colliderCollection(next),used=new Set();
+ for(const fixture of collection.items){if(!fixture||typeof fixture!=='object'||Array.isArray(fixture))continue;const supplied=typeof fixture.id==='string'?fixture.id.trim():'';if(supplied&&!used.has(supplied)){fixture.id=supplied;used.add(supplied)}else fixture.id=uniqueEditorId(used)}
+ return next;
+}
+function newColliderFixture(o,shape,used=new Set()){return{id:uniqueEditorId(used),...defaultCollider(o,shape)}}
+function appendColliderFixture(o,shape){
+ const current=readEditorComponent(o,'Collider');if(!current)return newColliderFixture(o,shape);
+ const next=stabilizeColliderFixtureIds(current),collection=colliderCollection(next),used=new Set(collection.items.map(item=>item?.id).filter(Boolean)),fixture=newColliderFixture(o,shape,used);
+ if(collection.kind==='single')return[collection.items[0],fixture];const items=[...collection.items,fixture];return rebuildColliderCollection(next,collection.kind,items);
+}
+function colliderFixtureRecords(o,value=readEditorComponent(o,'Collider')){
+ const number=(fallback,...values)=>{for(const value of values){if(value==null)continue;const parsed=Number(value);if(Number.isFinite(parsed))return parsed}return fallback};
+ return colliderCollection(value).items.map((raw,index)=>{if(!raw||typeof raw!=='object'||Array.isArray(raw))return null;const size=raw.size&&typeof raw.size==='object'?raw.size:{},offset=raw.offset&&typeof raw.offset==='object'?raw.offset:{},shapeName=String(raw.shape||raw.type||(raw.radius!=null?'circle':'rectangle')).toLowerCase(),shape=shapeName==='circle'||shapeName==='sphere'?'circle':'rectangle',defaults=defaultCollider(o,shape),authoredId=typeof raw.id==='string'&&raw.id.trim()?raw.id.trim():'';return{index,raw,view:{...defaults,...raw,id:authoredId||`${o.id}:collider:${index}`,authoredId,enabled:raw.enabled!==false,shape,width:number(defaults.width,raw.width,raw.w,size.x),height:number(defaults.height,raw.height,raw.h,size.y),radius:number(defaults.radius,raw.radius),offsetX:number(defaults.offsetX,raw.offsetX,offset.x),offsetY:number(defaults.offsetY,raw.offsetY,offset.y),rotation:number(defaults.rotation,raw.rotation,raw.angle),density:number(defaults.density,raw.density),friction:number(defaults.friction,raw.friction),restitution:number(defaults.restitution,raw.restitution,raw.bounce),isTrigger:Boolean(raw.isTrigger??raw.trigger??raw.sensor),categoryBits:number(defaults.categoryBits,raw.categoryBits,raw.category),maskBits:number(defaults.maskBits,raw.maskBits,raw.mask),groupIndex:number(defaults.groupIndex,raw.groupIndex,raw.group)}}}).filter(Boolean);
+}
+function colliderFixtureIndex(before,after,fixtureId,index){const fallback=Number(index);if(fixtureId&&before.items.filter(item=>item?.id===fixtureId).length===1){const matched=after.items.findIndex(item=>item?.id===fixtureId);if(matched>=0)return matched}return Number.isInteger(fallback)?fallback:-1}
+function writeColliderFixture(o,fixtureId,index,changes){
+ const current=readEditorComponent(o,'Collider');if(!current)return null;const before=colliderCollection(current),next=stabilizeColliderFixtureIds(current),collection=colliderCollection(next),items=[...collection.items],target=colliderFixtureIndex(before,collection,fixtureId,index);if(!items[target]||typeof items[target]!=='object')return null;items[target]={...items[target],...changes};return writeEditorComponent(o,'Collider',rebuildColliderCollection(next,collection.kind,items));
+}
+function removeColliderFixture(o,fixtureId,index){
+ const current=readEditorComponent(o,'Collider');if(!current)return false;const before=colliderCollection(current),next=stabilizeColliderFixtureIds(current),collection=colliderCollection(next),items=[...collection.items],target=colliderFixtureIndex(before,collection,fixtureId,index);if(target<0||target>=items.length)return false;items.splice(target,1);if(!items.length)removeEditorComponent(o,'Collider');else writeEditorComponent(o,'Collider',rebuildColliderCollection(next,collection.kind,items));return true;
+}
 function runtimeOptions(runtime){
  if(runtime==='pixijs')return{PIXI:window.PIXI,designWidth:1920,designHeight:1080,viewport:{width:1920,height:1080,fit:'contain'},fit:'contain',backgroundAlpha:0,transparent:true};
  if(runtime==='phaserjs')return{Phaser:window.Phaser};
@@ -964,7 +1000,7 @@ function syncEngineComponents(objects=state.scene){
  }
 }
 function syncEngineDocument(force=false,objects=state.scene){
- const editorState={...state,scene:prepareEditorEntities(objects)};
+ const editorState={...state,scene:prepareEditorEntities(objects),engine:{physics:state.requestedPhysics,gravity:cloneData(state.worldGravity),pixelsPerMeter:ah2dEngine.physics?.pixelsPerMeter||100}};
  if(force)ah2dBridge.lastSignature='';
  const changed=ah2dBridge.sync(editorState);
  syncEngineComponents(objects);
@@ -1007,16 +1043,17 @@ function selectRuntime(runtime,silent=false){
  return ah2dEngine.runtime;
 }
 function capturePlayAuthoringState(){
- return cloneData({projectName:state.projectName,scene:state.scene,scenes:state.scenes,currentSceneId:state.currentSceneId,prefab:state.prefab,folders:state.folders,assets:state.assets,particle:state.particle,particleIncluded:state.particleIncluded,postProcess:state.postProcess,worldGravity:state.worldGravity,sceneZoom:state.sceneZoom,scenePan:state.scenePan,sceneSelectedIds:state.sceneSelectedIds,sceneSelected:state.sceneSelected,prefabSelectedIds:state.prefabSelectedIds,prefabSelected:state.prefabSelected,history:state.history,future:state.future,pixelsPerMeter:ah2dEngine.physics?.pixelsPerMeter,activePage});
+ return cloneData({projectName:state.projectName,requestedPhysics:state.requestedPhysics,scene:state.scene,scenes:state.scenes,currentSceneId:state.currentSceneId,prefab:state.prefab,folders:state.folders,assets:state.assets,particle:state.particle,particleIncluded:state.particleIncluded,postProcess:state.postProcess,worldGravity:state.worldGravity,sceneZoom:state.sceneZoom,scenePan:state.scenePan,sceneSelectedIds:state.sceneSelectedIds,sceneSelected:state.sceneSelected,prefabSelectedIds:state.prefabSelectedIds,prefabSelected:state.prefabSelected,history:state.history,future:state.future,pixelsPerMeter:ah2dEngine.physics?.pixelsPerMeter,activePage});
 }
 function restorePlayAuthoringState(saved){
- if(!saved)return;for(const key of ['projectName','scene','scenes','currentSceneId','prefab','folders','assets','particle','particleIncluded','postProcess','worldGravity','sceneZoom','scenePan','history','future'])state[key]=cloneData(saved[key]);
- setSelection('scene',saved.sceneSelectedIds||[],saved.sceneSelected);setSelection('prefab',saved.prefabSelectedIds||[],saved.prefabSelected);if(Number.isFinite(saved.pixelsPerMeter)&&ah2dEngine.physics)ah2dEngine.physics.pixelsPerMeter=saved.pixelsPerMeter;$('#projectTitle').textContent=state.projectName+'⌄';$('#zoomLabel').textContent=Math.round(state.sceneZoom*100)+'%';ah2dEngine.postProcess?.load(state.postProcess);
+ if(!saved)return;for(const key of ['projectName','requestedPhysics','scene','scenes','currentSceneId','prefab','folders','assets','particle','particleIncluded','postProcess','worldGravity','sceneZoom','scenePan','history','future'])state[key]=cloneData(saved[key]);
+ setSelection('scene',saved.sceneSelectedIds||[],saved.sceneSelected);setSelection('prefab',saved.prefabSelectedIds||[],saved.prefabSelected);if(Number.isFinite(saved.pixelsPerMeter))setPhysicsPixelsPerMeter(saved.pixelsPerMeter);$('#projectTitle').textContent=state.projectName+'⌄';$('#zoomLabel').textContent=Math.round(state.sceneZoom*100)+'%';ah2dEngine.postProcess?.load(state.postProcess);
 }
 function clearPlayInteractions(){
  state.sceneInteraction=null;state.sceneSelectionRect=null;state.prefabInteraction=null;state.prefabSelectionRect=null;$('#dropCover').classList.remove('show');$('#postProcessPanel').classList.remove('show');$('#componentMenu').classList.remove('show');$('#appMenu').classList.remove('show');document.querySelector('.hier-context')?.classList.remove('show');for(const key of Object.keys(panKeys||{}))panKeys[key]=false;
 }
 function runtimeErrorMessage(error){return String(error?.message||error?.error?.message||error||'Unknown runtime error').slice(0,500)}
+function requireConfiguredPhysics(){const status=physicsStatus();if(status.requested==='box2d'&&!status.native)throw new Error(`Box2D Play Mode requires the Planck.js backend. ${status.error||'The editor is using its built-in fallback solver.'}`);if(status.requested==='builtin'&&!status.available)throw new Error('The requested AH2D built-in physics adapter did not initialize');state.physicsError='';return status}
 function handlePlayRuntimeError(error){
  if(state.playMode==='stopped'||state.playMode==='error')return;state.runtimeError=runtimeErrorMessage(error);console.error('AH2D Play Mode runtime error',error);try{ah2dEngine.pause()}catch{}state.playMode='error';updateRuntimeControls();toast('Runtime error — authoring state is safe');
 }
@@ -1029,9 +1066,10 @@ async function startPlayMode(){
  try{
   $('#runtimeStage').replaceChildren();const adapter=selectRuntime(state.runtime,true);if(state.runtime!=='custom'&&adapter?.native!==true)throw new Error(`${state.runtime==='pixijs'?'PixiJS':'PhaserJS'} library is not available in this editor`);
   const runtimeDocument=projectData();ah2dEngine.load(runtimeDocument);syncEngineComponents(state.runtimeScene);ah2dBridge.lastSignature='';
+  requireConfiguredPhysics();
   const gravity=state.worldGravity;if(typeof ah2dEngine.physics?.setGravity==='function')ah2dEngine.physics.setGravity(gravity);else if(typeof ah2dEngine.physics?.world?.setGravity==='function')ah2dEngine.physics.world.setGravity(gravity);
   ah2dEngine.start($('#runtimeStage'),{restoreOnStop:true});updateRuntimeControls();await Promise.resolve(adapter?.ready);
-  if(generation!==state.playGeneration||state.playMode!=='starting')return;if(state.runtime!=='custom'&&(adapter?.native!==true||adapter?.error||(state.runtime==='pixijs'&&adapter?.backend!=='pixijs')))throw adapter?.error||new Error(`${state.runtime} renderer failed to initialize`);state.playMode='playing';updateRuntimeControls();toast(`Playing with ${state.runtime==='phaserjs'?'PhaserJS':state.runtime==='pixijs'?'PixiJS':'Custom'} runtime`);
+  if(generation!==state.playGeneration||state.playMode!=='starting')return;if(state.runtime!=='custom'&&(adapter?.native!==true||adapter?.error||(state.runtime==='pixijs'&&adapter?.backend!=='pixijs')))throw adapter?.error||new Error(`${state.runtime} renderer failed to initialize`);const physics=requireConfiguredPhysics();state.playMode='playing';updateRuntimeControls();toast(`Playing with ${state.runtime==='phaserjs'?'PhaserJS':state.runtime==='pixijs'?'PixiJS':'Custom'} + ${physics.implementationLabel} physics`);
  }catch(error){if(generation===state.playGeneration&&state.playMode!=='stopped')handlePlayRuntimeError(error)}
 }
 function pausePlayMode(){
@@ -1048,6 +1086,7 @@ function updatePlaySimulation(){
 }
 ah2dEngine.events.on('runtime:fallback',payload=>{if(payload?.runtime===ah2dEngine.runtime&&state.playMode!=='stopped')handlePlayRuntimeError(payload.error||payload.runtime?.error||new Error('Runtime renderer fallback'))});
 ah2dEngine.events.on('runtime:error',payload=>{if(state.playMode!=='stopped')handlePlayRuntimeError(payload?.error||payload)});
+ah2dEngine.events.on('physics:fallback',payload=>{if(payload?.adapter!==ah2dEngine.physics||state.requestedPhysics!=='box2d')return;const cause=payload?.error||new Error('Planck.js backend stopped unexpectedly'),message=`Planck.js Box2D backend failed: ${runtimeErrorMessage(cause)}`;state.physicsError=message;console.error(message,cause);if(state.playMode!=='stopped')handlePlayRuntimeError(new Error(`${message}. Play Mode will not continue with the built-in fallback solver.`));else{renderInspector();toast('Box2D unavailable — using built-in physics fallback')}});
 
 /* canvas setup */
 const sc=$('#sceneCanvas'), sctx=sc.getContext('2d'), mini=$('#miniCanvas'), mctx=mini.getContext('2d');
@@ -1087,11 +1126,13 @@ function drawObj(ctx,o,map){
  ctx.restore()
 }
 function drawPhysicsOverlay(ctx,o,map){
- const c=o.collider;if(!c||c.enabled===false||o.__effectiveVisible===false)return;const matrix=o.__matrix||localTransformMatrix(o),center=map(matrix[4],matrix[5]),screenScale=Math.max(TRANSFORM_EPSILON,center.z*Math.max(Math.hypot(matrix[0],matrix[1]),Math.hypot(matrix[2],matrix[3]))),strokeUnit=1/screenScale;
- ctx.save();ctx.translate(center.x,center.y);ctx.transform(matrix[0]*center.z,matrix[1]*center.z,matrix[2]*center.z,matrix[3]*center.z,0,0);ctx.translate(Number(c.offsetX)||0,Number(c.offsetY)||0);ctx.rotate((Number(c.rotation)||0)*Math.PI/180);ctx.strokeStyle=c.isTrigger?'#d696ff':'#65e0b0';ctx.fillStyle=c.isTrigger?'rgba(214,150,255,.07)':'rgba(101,224,176,.055)';ctx.lineWidth=1.5*strokeUnit;ctx.setLineDash(c.isTrigger?[3*strokeUnit,3*strokeUnit]:[7*strokeUnit,4*strokeUnit]);
- if(c.shape==='circle'){const radius=Math.max(1,Math.abs(c.radius||1));ctx.beginPath();ctx.arc(0,0,radius,0,Math.PI*2);ctx.fill();ctx.stroke()}
- else{const w=Math.max(1,Math.abs(c.width||o.w||1)),h=Math.max(1,Math.abs(c.height||o.h||1));ctx.fillRect(-w/2,-h/2,w,h);ctx.strokeRect(-w/2,-h/2,w,h)}
- ctx.setLineDash([]);ctx.restore();
+ const source=o.__local||o,fixtures=colliderFixtureRecords(source);if(!fixtures.length||o.__effectiveVisible===false)return;const matrix=o.__matrix||localTransformMatrix(o),center=map(matrix[4],matrix[5]),screenScale=Math.max(TRANSFORM_EPSILON,center.z*Math.max(Math.hypot(matrix[0],matrix[1]),Math.hypot(matrix[2],matrix[3]))),strokeUnit=1/screenScale;
+ ctx.save();ctx.translate(center.x,center.y);ctx.transform(matrix[0]*center.z,matrix[1]*center.z,matrix[2]*center.z,matrix[3]*center.z,0,0);
+ for(const {view:c} of fixtures){if(c.enabled===false)continue;ctx.save();ctx.translate(Number(c.offsetX)||0,Number(c.offsetY)||0);ctx.rotate((Number(c.rotation)||0)*Math.PI/180);ctx.strokeStyle=c.isTrigger?'#d696ff':'#65e0b0';ctx.fillStyle=c.isTrigger?'rgba(214,150,255,.07)':'rgba(101,224,176,.055)';ctx.lineWidth=1.5*strokeUnit;ctx.setLineDash(c.isTrigger?[3*strokeUnit,3*strokeUnit]:[7*strokeUnit,4*strokeUnit]);
+  if(c.shape==='circle'){const radius=Math.max(1,Math.abs(c.radius||1));ctx.beginPath();ctx.arc(0,0,radius,0,Math.PI*2);ctx.fill();ctx.stroke()}
+  else{const w=Math.max(1,Math.abs(c.width||source.w||1)),h=Math.max(1,Math.abs(c.height||source.h||1));ctx.fillRect(-w/2,-h/2,w,h);ctx.strokeRect(-w/2,-h/2,w,h)}
+  ctx.setLineDash([]);ctx.restore()}
+ ctx.restore();
 }
 function selGeom(o,map){const matrix=o.__matrix||localTransformMatrix(o),p=map(matrix[4],matrix[5]),halfW=Math.abs(Number(o.w)||0)/2,halfH=Math.abs(Number(o.h)||0)/2,screenPoint=(x,y)=>{const world=transformPoint(matrix,x,y);return map(world.x,world.y)},corners=[screenPoint(-halfW,-halfH),screenPoint(halfW,-halfH),screenPoint(halfW,halfH),screenPoint(-halfW,halfH)],top={x:(corners[0].x+corners[1].x)/2,y:(corners[0].y+corners[1].y)/2},distance=Math.max(TRANSFORM_EPSILON,Math.hypot(top.x-p.x,top.y-p.y)),rot={x:top.x+(top.x-p.x)/distance*30,y:top.y+(top.y-p.y)/distance*30};return{p,w:Math.hypot(corners[1].x-corners[0].x,corners[1].y-corners[0].y),h:Math.hypot(corners[3].x-corners[0].x,corners[3].y-corners[0].y),corners,rot}}
 function drawSelection(ctx,o,map,primary=true,showHandles=true){if(!o)return;const g=selGeom(o,map);ctx.save();ctx.strokeStyle=primary?'#6ea6ff':'rgba(106,166,255,.78)';ctx.lineWidth=primary?1.5:1;ctx.setLineDash(primary?[5,3]:[3,3]);ctx.beginPath();ctx.moveTo(g.corners[0].x,g.corners[0].y);g.corners.slice(1).forEach(p=>ctx.lineTo(p.x,p.y));ctx.closePath();ctx.stroke();ctx.setLineDash([]);if(primary&&showHandles){ctx.fillStyle='#6ea6ff';g.corners.forEach(p=>ctx.fillRect(p.x-4,p.y-4,8,8));ctx.fillStyle='#fff';ctx.strokeStyle='#6ea6ff';ctx.beginPath();ctx.arc(g.rot.x,g.rot.y,6,0,Math.PI*2);ctx.fill();ctx.stroke()}ctx.restore()}
@@ -1292,13 +1333,17 @@ $('#postProcessReset').onclick=()=>{if(authoringMutationBlocked())return;snapsho
 /* inspector */
 function sec(title,body,open=true){return`<div class="section ${open?'':'closed'}"><div class="section-head">${esc(title)}</div><div class="props">${body}</div></div>`}
 function componentSec(key,title,body,badge='2D'){return`<div class="section"><div class="section-head has-action"><span class="section-label">${esc(title)} <span class="component-badge">${esc(badge)}</span></span><button class="component-remove" data-remove-component="${esc(key)}" title="Remove ${esc(title)}">×</button></div><div class="props">${body}</div></div>`}
+function colliderFixtureSec(index,title,id,authoredId,body){return`<div class="section" data-fixture-id="${esc(authoredId)}"><div class="section-head has-action"><span class="section-label">${esc(title)} <span class="component-badge">Fixture ${index+1}</span></span><button class="component-remove" data-remove-collider-fixture="${index}" title="Remove ${esc(title)}">×</button></div><div class="props">${body}<div class="row"><label>Fixture ID</label><div class="field" title="${esc(id)}">${esc(id)}</div></div></div></div>`}
 function row(label,key,val,type='number',extra=''){return`<div class="row"><label>${esc(label)}</label><input class="field" ${type==='number'?'type="number"':''} data-prop="${esc(key)}" value="${esc(val)}" ${extra}></div>`}
 function xy(label,a,b){return`<div class="row"><label>${esc(label)}</label><div class="xy"><input class="field" type="number" data-prop="${esc(a[0])}" value="${esc(a[1])}"><input class="field" type="number" data-prop="${esc(b[0])}" value="${esc(b[1])}"></div></div>`}
 function rng(label,key,v,min,max,step=1){return`<div class="range-row"><label>${esc(label)}</label><input type="range" data-particle="${esc(key)}" min="${esc(min)}" max="${esc(max)}" step="${esc(step)}" value="${esc(v)}"><input class="field" type="number" data-pnum="${esc(key)}" value="${esc(v)}" step="${esc(step)}"></div>`}
 function compRow(scope,label,key,val,min='',step='any'){return`<div class="row"><label>${label}</label><input class="field" type="number" data-${scope}="${key}" value="${esc(val)}" ${min!==''?`min="${min}"`:''} step="${step}"></div>`}
 function compXY(scope,label,a,b){return`<div class="row"><label>${label}</label><div class="xy"><input class="field" type="number" data-${scope}="${a[0]}" value="${esc(a[1])}" step="any"><input class="field" type="number" data-${scope}="${b[0]}" value="${esc(b[1])}" step="any"></div></div>`}
 function compToggle(scope,label,key,on){return`<div class="row"><label>${label}</label><div class="toggle ${on?'on':''}" data-${scope}-toggle="${key}" role="switch" aria-checked="${on?'true':'false'}"></div></div>`}
-function bindWorldPhysics(){bindSections();$$('[data-world]').forEach(input=>input.onchange=()=>{if(state.playMode!=='stopped')return;const key=input.dataset.world,value=parseFloat(input.value);if(!Number.isFinite(value))return;snapshot();if(key==='pixelsPerMeter'){ah2dEngine.physics.pixelsPerMeter=Math.max(.001,value)}else state.worldGravity[key]=value;syncEngineDocument(true);renderInspector()})}
+function colliderRow(index,label,key,val,min='',step='any'){return`<div class="row"><label>${esc(label)}</label><input class="field" type="number" data-collider="${esc(key)}" data-collider-index="${index}" value="${esc(val)}" ${min!==''?`min="${esc(min)}"`:''} step="${esc(step)}"></div>`}
+function colliderXY(index,label,a,b){return`<div class="row"><label>${esc(label)}</label><div class="xy"><input class="field" type="number" data-collider="${esc(a[0])}" data-collider-index="${index}" value="${esc(a[1])}" step="any"><input class="field" type="number" data-collider="${esc(b[0])}" data-collider-index="${index}" value="${esc(b[1])}" step="any"></div></div>`}
+function colliderToggle(index,label,key,on){return`<div class="row"><label>${esc(label)}</label><div class="toggle ${on?'on':''}" data-collider-toggle="${esc(key)}" data-collider-index="${index}" role="switch" aria-checked="${on?'true':'false'}"></div></div>`}
+function bindWorldPhysics(){bindSections();$$('[data-world]').forEach(input=>input.onchange=()=>{if(state.playMode!=='stopped')return;const key=input.dataset.world,value=parseFloat(input.value);if(!Number.isFinite(value))return;snapshot();if(key==='pixelsPerMeter')setPhysicsPixelsPerMeter(value);else state.worldGravity[key]=value;syncEngineDocument(true);renderInspector()})}
 function renderInspector(){
  let root=$('#inspector');
  const componentMode=(activePage==='edit'||activePage==='prefab')&&state.playMode==='stopped',componentObjects=activePage==='prefab'?state.prefab:state.scene,componentIds=componentMode?selectedIds(activePage==='prefab'?'prefab':'scene').filter(id=>{const entity=componentObjects.find(item=>item.id===id);return entity&&!editorEntityLocked(entity)}):[],addButton=$('#addComponentBtn');addButton.disabled=!componentMode||!componentIds.length;if(addButton.disabled)$('#componentMenu').classList.remove('show');
@@ -1323,7 +1368,7 @@ function renderInspector(){
  const mode=activePage==='prefab'?'prefab':'scene',multiIds=selectedIds(mode);
  if(multiIds.length>1){const picked=currentObjects().filter(o=>multiIds.includes(o.id));$('#inspectorIcon').textContent='▦';$('#inspectorName').textContent=`${picked.length} objects selected`;$('#inspectorSub').textContent='Multi-selection';root.innerHTML=sec('Selection',`<div class="small">${picked.map(o=>esc(o.name)).join(' • ')}</div>`)+sec('Group Actions',`<div class="small">Drag any selected object to move the group. Press Delete to remove all selected objects, or Escape to clear selection.</div>`);bindSections();return}
  const inspectorObjects=activePage==='edit'&&state.playMode!=='stopped'&&state.runtimeScene?state.runtimeScene:currentObjects();let o=inspectorObjects.find(item=>item.id===(activePage==='prefab'?state.prefabSelected:state.sceneSelected))||selectedObject();
- if(!o){$('#inspectorIcon').textContent='◇';$('#inspectorName').textContent='Scene';$('#inspectorSub').textContent='Physics & Document Settings';root.innerHTML=sec('Physics World',`<div class="row"><label>Backend</label><div class="field">Box2D / ${esc(ah2dEngine.physics?.backend||'builtin')}</div></div>`+compXY('world','Gravity',['x',state.worldGravity.x],['y',state.worldGravity.y])+compRow('world','Pixels / metre','pixelsPerMeter',ah2dEngine.physics?.pixelsPerMeter||100,.001,1))+sec('Document','<div class="small">Select a Game Object to edit Transform, Rigidbody and Collider components.</div>');bindWorldPhysics();return}
+ if(!o){const physics=physicsStatus(),backend=physics.fallback?`${physics.backend} (fallback)`:physics.backend,requested=physics.requested==='box2d'?'Box2D / Planck.js':'AH2D built-in';$('#inspectorIcon').textContent='◇';$('#inspectorName').textContent='Scene';$('#inspectorSub').textContent='Physics & Document Settings';root.innerHTML=sec('Physics World',`<div class="row"><label>Requested</label><div class="field">${esc(requested)}</div></div><div class="row"><label>Backend</label><div class="field">${esc(backend)}</div></div><div class="row"><label>Implementation</label><div class="field">${esc(physics.implementationLabel)}</div></div>${physics.error?`<div class="small">${esc(physics.error)}</div>`:''}`+compXY('world','Gravity',['x',state.worldGravity.x],['y',state.worldGravity.y])+compRow('world','Pixels / metre','pixelsPerMeter',ah2dEngine.physics?.pixelsPerMeter||100,.001,1))+sec('Document','<div class="small">Select a Game Object to edit Transform, Rigidbody and Collider components.</div>');bindWorldPhysics();return}
  $('#inspectorIcon').textContent=o.icon;$('#inspectorName').textContent=o.name;$('#inspectorSub').textContent=activePage==='prefab'?(o.component||o.kind):state.playMode==='stopped'?'Game Object':'Runtime Game Object · Read only';
  const local=editorLocalTransform(o),world=editorWorldObject(inspectorObjects,o),round=value=>Math.round((Number(value)||0)*1000)/1000,parent=inspectorObjects.find(item=>item.id===o.parentId);
  let html=sec('Transform · Local',xy('Position',['x',round(local.x)],['y',round(local.y)])+row('Rotation','rot',round(local.rot))+xy('Scale',['sx',round(local.sx)],['sy',round(local.sy)])+`<div class="row"><label>World Position</label><div class="xy"><div class="field">X ${round(world?.x)}</div><div class="field">Y ${round(world?.y)}</div></div></div><div class="row"><label>World Rotation</label><div class="field">${round(world?.rot)}°</div></div><div class="row"><label>World Scale</label><div class="xy"><div class="field">X ${round(world?.sx)}</div><div class="field">Y ${round(world?.sy)}</div></div></div>${parent?`<div class="row"><label>Parent</label><div class="field">${esc(parent.name)}</div></div>`:''}`);
@@ -1336,10 +1381,10 @@ function renderInspector(){
   compRow('rigidbody','Mass','mass',rb.mass,.001,.05)+compToggle('rigidbody','Auto Mass','useAutoMass',rb.useAutoMass)+compRow('rigidbody','Gravity','gravityScale',rb.gravityScale,'',.05)+
   compRow('rigidbody','Linear Drag','linearDamping',rb.linearDamping,0,.01)+compRow('rigidbody','Angular Drag','angularDamping',rb.angularDamping,0,.01)+compXY('rigidbody','Velocity',['velocityX',rb.velocityX],['velocityY',rb.velocityY])+compRow('rigidbody','Angular Vel.','angularVelocity',rb.angularVelocity,'',.1)+
    compToggle('rigidbody','Fixed Rotation','fixedRotation',rb.fixedRotation)+compToggle('rigidbody','Continuous','bullet',rb.bullet)+compToggle('rigidbody','Allow Sleep','allowSleep',rb.allowSleep!==false)+compToggle('rigidbody','Sleeping','sleeping',rb.sleeping),'Box2D');}
- if(colliderValue){const c={...defaultCollider(o),...colliderValue};html+=componentSec('collider',c.shape==='circle'?'Circle Collider':'Box Collider',
-  compToggle('collider','Enabled','enabled',c.enabled!==false)+`<div class="row"><label>Shape</label><select class="field" data-collider="shape"><option value="rectangle">Rectangle</option><option value="circle">Circle</option></select></div>`+
-   (c.shape==='circle'?compRow('collider','Radius','radius',c.radius,1,.5):compXY('collider','Size',['width',c.width],['height',c.height]))+compXY('collider','Offset',['offsetX',c.offsetX],['offsetY',c.offsetY])+compRow('collider','Rotation','rotation',c.rotation,'',.1)+
-   compRow('collider','Density','density',c.density,.001,.05)+compRow('collider','Friction','friction',c.friction,0,.01)+compRow('collider','Bounce','restitution',c.restitution,0,.01)+compToggle('collider','Is Trigger','isTrigger',c.isTrigger)+compRow('collider','Category','categoryBits',c.categoryBits,0,1)+compRow('collider','Mask','maskBits',c.maskBits,0,1)+compRow('collider','Group','groupIndex',c.groupIndex,'',1),'Shape');}
+ if(colliderValue){const fixtures=colliderFixtureRecords(o,colliderValue);for(const {index,view:c} of fixtures){const idLabel=c.authoredId?c.id:`${c.id} (assigned on edit)`;html+=colliderFixtureSec(index,c.shape==='circle'?'Circle Collider':'Box Collider',idLabel,c.authoredId,
+  colliderToggle(index,'Enabled','enabled',c.enabled!==false)+`<div class="row"><label>Shape</label><select class="field" data-collider="shape" data-collider-index="${index}"><option value="rectangle" ${c.shape==='rectangle'?'selected':''}>Rectangle</option><option value="circle" ${c.shape==='circle'?'selected':''}>Circle</option></select></div>`+
+   (c.shape==='circle'?colliderRow(index,'Radius','radius',c.radius,1,.5):colliderXY(index,'Size',['width',c.width],['height',c.height]))+colliderXY(index,'Offset',['offsetX',c.offsetX],['offsetY',c.offsetY])+colliderRow(index,'Rotation','rotation',c.rotation,'',.1)+
+   colliderRow(index,'Density','density',c.density,.001,.05)+colliderRow(index,'Friction','friction',c.friction,0,.01)+colliderRow(index,'Bounce','restitution',c.restitution,0,.01)+colliderToggle(index,'Is Trigger','isTrigger',c.isTrigger)+colliderRow(index,'Category','categoryBits',c.categoryBits,0,1)+colliderRow(index,'Mask','maskBits',c.maskBits,0,1)+colliderRow(index,'Group','groupIndex',c.groupIndex,'',1))}if(!fixtures.length)html+=sec('Collider','<div class="small">This Collider has no fixtures. Use Add Component to append a Box or Circle fixture.</div>')}
  html+=sec('State',`<div class="row"><label>Visible</label><div class="toggle ${editorEntityVisible(o)?'on':''}" data-toggle="visible" role="switch" aria-checked="${editorEntityVisible(o)?'true':'false'}"></div></div><div class="row"><label>Locked</label><div class="toggle ${editorEntityLocked(o)?'on':''}" data-toggle="locked" role="switch" aria-checked="${editorEntityLocked(o)?'true':'false'}"></div></div>`)
  +sec('Metadata',row('Name','name',o.name,'text')+row('Tag','tag',o.tag||'','text')+`<div class="row"><label>ID</label><div class="field">${esc(o.id)}</div></div>`);
  root.innerHTML=html;bindInspector()
@@ -1349,14 +1394,11 @@ function bindInspector(){
  bindSections();let o=selectedObject();
  $$('[data-prop]').forEach(i=>i.onchange=()=>{if(!o||authoringMutationBlocked())return;if(editorEntityLocked(o)){toast('Unlock the object before editing it');renderInspector();return}snapshot();const k=i.dataset.prop,value=i.type==='number'?parseFloat(i.value):i.value;if(['x','y','rot','sx','sy'].includes(k))writeEditorLocalTransform(o,{[k]:value});else o[k]=value;renderAll()});
  $$('[data-toggle]').forEach(t=>t.onclick=()=>{if(!o||authoringMutationBlocked())return;snapshot();const k=t.dataset.toggle;if(k==='visible')setEditorEntityVisible(o,!editorEntityVisible(o));else if(k==='locked')setEditorEntityLocked(o,!editorEntityLocked(o));renderAll()});
- for(const scope of ['rigidbody','collider']){
-  const type=scope==='rigidbody'?'Rigidbody':'Collider';
-  $$(`[data-${scope}]`).forEach(i=>{
-   const current=readEditorComponent(o,type);if(current&&i.tagName==='SELECT')i.value=current[i.dataset[scope]];
-   i.onchange=()=>{const value=readEditorComponent(o,type);if(!value||authoringMutationBlocked())return;if(editorEntityLocked(o)){toast('Unlock the object before editing it');renderInspector();return}snapshot();const k=i.dataset[scope],raw=i.type==='number'?parseFloat(i.value):i.value;writeEditorComponent(o,type,{...value,[k]:Number.isNaN(raw)?0:raw});if(scope==='collider'&&k==='shape')renderInspector();syncEngineDocument();drawScene();drawPrefab()}
-  });
-  $$(`[data-${scope}-toggle]`).forEach(t=>t.onclick=()=>{const value=readEditorComponent(o,type);if(!value||authoringMutationBlocked())return;if(editorEntityLocked(o)){toast('Unlock the object before editing it');renderInspector();return}snapshot();const k=t.dataset[scope+'Toggle'];writeEditorComponent(o,type,{...value,[k]:!value[k]});renderAll()})
- }
+ $$('[data-rigidbody]').forEach(i=>{const current=readEditorComponent(o,'Rigidbody');if(current&&i.tagName==='SELECT')i.value=current[i.dataset.rigidbody];i.onchange=()=>{const value=readEditorComponent(o,'Rigidbody');if(!value||authoringMutationBlocked())return;if(editorEntityLocked(o)){toast('Unlock the object before editing it');renderInspector();return}snapshot();const k=i.dataset.rigidbody,raw=i.type==='number'?parseFloat(i.value):i.value;writeEditorComponent(o,'Rigidbody',{...value,[k]:Number.isNaN(raw)?0:raw});syncEngineDocument();drawScene();drawPrefab()}});
+ $$('[data-rigidbody-toggle]').forEach(t=>t.onclick=()=>{const value=readEditorComponent(o,'Rigidbody');if(!value||authoringMutationBlocked())return;if(editorEntityLocked(o)){toast('Unlock the object before editing it');renderInspector();return}snapshot();const k=t.dataset.rigidbodyToggle;writeEditorComponent(o,'Rigidbody',{...value,[k]:!value[k]});renderAll()});
+ $$('[data-collider]').forEach(i=>i.onchange=()=>{const value=readEditorComponent(o,'Collider');if(!value||authoringMutationBlocked())return;if(editorEntityLocked(o)){toast('Unlock the object before editing it');renderInspector();return}const checkpoint=snapshot(),index=Number(i.dataset.colliderIndex),fixtureId=i.closest('[data-fixture-id]')?.dataset.fixtureId||'',key=i.dataset.collider,raw=i.type==='number'?parseFloat(i.value):i.value;try{if(!writeColliderFixture(o,fixtureId,index,{[key]:Number.isNaN(raw)?0:raw})){rollbackSnapshot(checkpoint);return}syncEngineDocument();renderInspector();drawScene();drawPrefab()}catch(error){rollbackSnapshot(checkpoint);renderInspector();toast(error?.message||'Invalid Collider value')}});
+ $$('[data-collider-toggle]').forEach(t=>t.onclick=()=>{const value=readEditorComponent(o,'Collider');if(!value||authoringMutationBlocked())return;if(editorEntityLocked(o)){toast('Unlock the object before editing it');renderInspector();return}const index=Number(t.dataset.colliderIndex),fixtureId=t.closest('[data-fixture-id]')?.dataset.fixtureId||'',record=colliderFixtureRecords(o,value).find(item=>item.index===index);if(!record)return;const checkpoint=snapshot(),key=t.dataset.colliderToggle;try{if(!writeColliderFixture(o,fixtureId,index,{[key]:!record.view[key]})){rollbackSnapshot(checkpoint);return}renderAll()}catch(error){rollbackSnapshot(checkpoint);renderInspector();toast(error?.message||'Invalid Collider value')}});
+ $$('[data-remove-collider-fixture]').forEach(b=>b.onclick=e=>{e.stopPropagation();if(!o||authoringMutationBlocked())return;if(editorEntityLocked(o)){toast('Unlock the object before editing it');return}const checkpoint=snapshot(),fixtureId=b.closest('[data-fixture-id]')?.dataset.fixtureId||'';if(!removeColliderFixture(o,fixtureId,Number(b.dataset.removeColliderFixture))){rollbackSnapshot(checkpoint);return}renderAll();toast('Collider fixture removed')});
  $$('[data-remove-component]').forEach(b=>b.onclick=e=>{e.stopPropagation();if(!o||authoringMutationBlocked())return;if(editorEntityLocked(o)){toast('Unlock the object before editing it');return}snapshot();removeEditorComponent(o,b.dataset.removeComponent==='rigidbody'?'Rigidbody':'Collider');renderAll();toast('Component removed')});
  $$('[data-particle]').forEach(i=>i.oninput=()=>{let k=i.dataset.particle;state.particle[k]=parseFloat(i.value);let n=$(`[data-pnum="${k}"]`);if(n)n.value=i.value});
  $$('[data-pnum]').forEach(i=>i.onchange=()=>{let k=i.dataset.pnum;state.particle[k]=parseFloat(i.value);let r=$(`[data-particle="${k}"]`);if(r)r.value=i.value});
@@ -1389,7 +1431,7 @@ document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e
 function selectedComponentTargets(){const mode=activePage==='prefab'?'prefab':'scene',arr=mode==='prefab'?state.prefab:state.scene;return selectedIds(mode).map(id=>arr.find(o=>o.id===id)).filter(o=>o&&!editorEntityLocked(o))}
 function addSelectedComponent(type){
  if(authoringMutationBlocked())return;const targets=selectedComponentTargets();if(!targets.length)return;let changed=0,checkpoint=snapshot();
- for(const o of targets){const schemaType=type==='rigidbody'?'Rigidbody':'Collider',resolved=resolveEditorComponent(o,schemaType);if(!resolved.found){writeEditorComponent(o,schemaType,schemaType==='Rigidbody'?defaultRigidbody():defaultCollider(o,type==='circle-collider'?'circle':'rectangle'));changed++}else if(schemaType==='Collider'){const value=resolved.value,shape=type==='circle-collider'?'circle':'rectangle';if(value.shape!==shape){writeEditorComponent(o,'Collider',{...value,shape});changed++}}}
+ for(const o of targets){if(type==='rigidbody'){const resolved=resolveEditorComponent(o,'Rigidbody');if(!resolved.found){writeEditorComponent(o,'Rigidbody',defaultRigidbody());changed++}}else{const shape=type==='circle-collider'?'circle':'rectangle';writeEditorComponent(o,'Collider',appendColliderFixture(o,shape));changed++}}
  $('#componentMenu').classList.remove('show');if(!changed){rollbackSnapshot(checkpoint);toast('Component already exists');return}renderAll();toast(`${changed>1?changed+' objects':'Component'} updated`);
 }
 $('#addComponentBtn').onclick=e=>{e.stopPropagation();if(e.currentTarget.disabled)return;$('#componentMenu').classList.toggle('show')};
@@ -1405,7 +1447,7 @@ $('#appMenuBtn').onclick=e=>{e.stopPropagation();$('#appMenu').classList.toggle(
 function serializedScenes(){
  const editObjects=prepareEditorEntities(editableSceneObjects());return state.scenes.map(scene=>({id:scene.id,name:scene.name,objects:scene.id===state.currentSceneId?editObjects:prepareEditorEntities(scene.objects||[]),updatedAt:scene.updatedAt||Date.now(),view:scene.id===state.currentSceneId?{zoom:state.sceneZoom,pan:cloneData(state.scenePan)}:cloneData(scene.view||{zoom:1,pan:{x:0,y:0}})}));
 }
-function projectData(){const scenes=serializedScenes(),active=scenes.find(scene=>scene.id===state.currentSceneId)||scenes[0];return{format:'AH2D',version:4,dataModel:{...dataModelDescriptor},project:{name:state.projectName},engine:{name:'AH2D Engine',version:AH2D.VERSION,renderer:state.runtime,runtime:state.runtime,runtimeBackend:ah2dEngine.runtime?.backend||'editor-bridge',physics:'box2d',physicsBackend:ah2dEngine.physics?.backend||'builtin',gravity:state.worldGravity,pixelsPerMeter:ah2dEngine.physics?.pixelsPerMeter||100,compatibleRuntimes:['pixijs','phaserjs','custom']},meta:{name:state.projectName,units:'px',currentSceneId:state.currentSceneId},currentSceneId:state.currentSceneId,scenes,scene:cloneData(active?.objects||[]),postProcess:cloneData(state.postProcess),assets:state.assets.filter(a=>a.imageSrc).map(a=>({id:a.id,name:a.name,folder:a.folder,kind:a.kind,imageSrc:a.imageSrc,size:a.size})),folders:state.folders,prefab:prepareEditorEntities(state.prefab),animations:[{name:'Knight_Run',fps:12,frames:12,loop:true,events:[{frame:4,name:'Footstep'},{frame:9,name:'Footstep'}]}],particles:state.particleIncluded?[state.particle]:[]}}
+function projectData(){const scenes=serializedScenes(),active=scenes.find(scene=>scene.id===state.currentSceneId)||scenes[0],physics=physicsStatus();return{format:'AH2D',version:4,dataModel:{...dataModelDescriptor},project:{name:state.projectName},engine:{name:'AH2D Engine',version:AH2D.VERSION,renderer:state.runtime,runtime:state.runtime,runtimeBackend:ah2dEngine.runtime?.backend||'editor-bridge',physics:state.requestedPhysics,physicsBackend:physics.backend,physicsImplementation:physics.implementation,gravity:state.worldGravity,pixelsPerMeter:ah2dEngine.physics?.pixelsPerMeter||100,compatibleRuntimes:['pixijs','phaserjs','custom']},meta:{name:state.projectName,units:'px',currentSceneId:state.currentSceneId},currentSceneId:state.currentSceneId,scenes,scene:cloneData(active?.objects||[]),postProcess:cloneData(state.postProcess),assets:state.assets.filter(a=>a.imageSrc).map(a=>({id:a.id,name:a.name,folder:a.folder,kind:a.kind,imageSrc:a.imageSrc,size:a.size})),folders:state.folders,prefab:prepareEditorEntities(state.prefab),animations:[{name:'Knight_Run',fps:12,frames:12,loop:true,events:[{frame:4,name:'Footstep'},{frame:9,name:'Footstep'}]}],particles:state.particleIncluded?[state.particle]:[]}}
 function dl(name,type,data){let a=document.createElement('a'),u=URL.createObjectURL(new Blob([data],{type}));a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000)}
 function saveLocal(message='Project saved'){if(authoringMutationBlocked())return false;commitActiveScene();try{localStorage.setItem(PROJECT_STORAGE_KEY,JSON.stringify(projectData()))}catch{}toast(message);return true}
 function exportProject(){dl('AH2D_Project.json','application/json',JSON.stringify(projectData(),null,2));toast('Universal JSON exported')}
@@ -1429,8 +1471,8 @@ function stageLoadedProject(d){
  if(d.particles!==undefined&&!Array.isArray(d.particles))throw new Error('Project particles must be an array');let particle=cloneData(state.particle),particleIncluded=state.particleIncluded;if(Array.isArray(d.particles)){particleIncluded=d.particles.length>0;particle={...createDefaultParticle(),...(d.particles[0]&&typeof d.particles[0]==='object'&&!Array.isArray(d.particles[0])?cloneData(d.particles[0]):{})}}
  const stagedPostProcess=new AH2D.PostProcessSystem(null);stagedPostProcess.load(d.postProcess);const postProcess=stagedPostProcess.toJSON();
  const requested=String(d.currentSceneId||d.meta?.currentSceneId||''),currentSceneId=scenes.some(scene=>scene.id===requested)?requested:scenes[0].id,active=scenes.find(scene=>scene.id===currentSceneId);
- const gravity=d.engine?.gravity&&typeof d.engine.gravity==='object'&&!Array.isArray(d.engine.gravity)?d.engine.gravity:null,worldGravity=gravity?{...state.worldGravity,...cloneData(gravity)}:cloneData(state.worldGravity),pixelsPerMeter=Number.isFinite(d.engine?.pixelsPerMeter)?Math.max(.001,d.engine.pixelsPerMeter):null;
- return{projectName:String(d.project?.name||d.meta?.name||'Untitled Project').slice(0,80),scenes,currentSceneId,active,prefab,folders,assets,particle,particleIncluded,postProcess,worldGravity,pixelsPerMeter,runtime:d.engine?.runtime,hierarchyRepairs};
+ const gravity=d.engine?.gravity&&typeof d.engine.gravity==='object'&&!Array.isArray(d.engine.gravity)?d.engine.gravity:null,worldGravity=gravity?{...state.worldGravity,...cloneData(gravity)}:cloneData(state.worldGravity),pixelsPerMeter=Number.isFinite(d.engine?.pixelsPerMeter)?Math.max(.001,d.engine.pixelsPerMeter):null,physicsValue=String(d.engine?.physics||'box2d').trim().toLowerCase(),requestedPhysics=physicsValue==='builtin'||physicsValue==='ah2d-builtin'?'builtin':'box2d';
+ return{projectName:String(d.project?.name||d.meta?.name||'Untitled Project').slice(0,80),scenes,currentSceneId,active,prefab,folders,assets,particle,particleIncluded,postProcess,worldGravity,pixelsPerMeter,requestedPhysics,runtime:d.engine?.runtime,hierarchyRepairs};
 }
 function loadProject(d){
  if(state.playMode!=='stopped'){toast('Stop Preview before loading a Project');return null}
@@ -1438,12 +1480,12 @@ function loadProject(d){
  state.projectName=next.projectName;$('#projectTitle').textContent=state.projectName+'⌄';
  state.scenes=next.scenes;state.currentSceneId=next.currentSceneId;state.scene=hydrateEditorObjects(cloneData(next.active.objects));state.sceneZoom=next.active.view.zoom;state.scenePan=cloneData(next.active.view.pan);$('#zoomLabel').textContent=Math.round(state.sceneZoom*100)+'%';
  state.prefab=hydrateEditorObjects(cloneData(next.prefab));state.folders=next.folders;state.assets=next.assets;state.particle=next.particle;state.particleIncluded=next.particleIncluded;
- state.postProcess=next.postProcess;ah2dEngine.postProcess.load(state.postProcess);state.worldGravity=next.worldGravity;
- if(next.pixelsPerMeter!=null&&ah2dEngine.physics)ah2dEngine.physics.pixelsPerMeter=next.pixelsPerMeter;if(next.runtime)selectRuntime(next.runtime,true);
+ state.postProcess=next.postProcess;ah2dEngine.postProcess.load(state.postProcess);state.worldGravity=next.worldGravity;state.requestedPhysics=next.requestedPhysics;state.physicsError='';
+ if(next.pixelsPerMeter!=null)setPhysicsPixelsPerMeter(next.pixelsPerMeter);if(next.runtime)selectRuntime(next.runtime,true);
  resetSceneSession();setSelection('prefab',[]);renderAll();
  const repairs=next.hierarchyRepairs;toast(repairs?`${state.scenes.length} Scene${state.scenes.length===1?'':'s'} loaded · repaired ${repairs} invalid hierarchy link${repairs===1?'':'s'}`:`${state.scenes.length} Scene${state.scenes.length===1?'':'s'} loaded`);
 }
-function newProject(){if(authoringMutationBlocked())return;state.projectName='Untitled Project';$('#projectTitle').textContent=state.projectName+'⌄';state.scene=cloneData(starterSceneTemplate);state.prefab=[];state.particle=createDefaultParticle();state.particleIncluded=false;state.sceneZoom=1;state.scenePan={x:0,y:0};state.postProcess=createDefaultPostProcess();state.currentSceneId=uid();state.scenes=[{id:state.currentSceneId,name:'Main Scene',objects:cloneData(state.scene),updatedAt:Date.now(),view:{zoom:1,pan:{x:0,y:0}}}];resetSceneSession();setSelection('prefab',[]);$('#zoomLabel').textContent='100%';renderAll();toast('New project')}
+function newProject(){if(authoringMutationBlocked())return;state.projectName='Untitled Project';$('#projectTitle').textContent=state.projectName+'⌄';state.requestedPhysics='box2d';state.physicsError='';state.scene=cloneData(starterSceneTemplate);state.prefab=[];state.particle=createDefaultParticle();state.particleIncluded=false;state.sceneZoom=1;state.scenePan={x:0,y:0};state.postProcess=createDefaultPostProcess();state.currentSceneId=uid();state.scenes=[{id:state.currentSceneId,name:'Main Scene',objects:cloneData(state.scene),updatedAt:Date.now(),view:{zoom:1,pan:{x:0,y:0}}}];resetSceneSession();setSelection('prefab',[]);$('#zoomLabel').textContent='100%';renderAll();toast('New project')}
 function importImages(files,world=null){if(authoringMutationBlocked())return false;[...files].filter(f=>f.type.startsWith('image/')).forEach((f,idx)=>{let fr=new FileReader();fr.onload=()=>{if(state.playMode!=='stopped')return;let im=new Image();im.onload=()=>{if(state.playMode!=='stopped')return;let scale=Math.min(1,240/Math.max(im.naturalWidth,im.naturalHeight)),a={id:uid(),name:f.name.replace(/\.[^.]+$/,''),folder:'Imported',kind:'prop',icon:'🖼️',color:'#fff',size:[Math.max(16,Math.round(im.naturalWidth*scale)),Math.max(16,Math.round(im.naturalHeight*scale))],imageSrc:fr.result};if(!state.folders.includes('Imported'))state.folders.push('Imported');state.assets.push(a);renderProject();if(world&&idx===0)addAssetToScene(a,world)};im.src=fr.result};fr.readAsDataURL(f)});return true}
 $('#imageInput').onchange=e=>{importImages(e.target.files);e.target.value=''};
 $('#projectInput').onchange=e=>{let f=e.target.files[0];if(!f)return;let fr=new FileReader();fr.onload=()=>{try{loadProject(JSON.parse(fr.result))}catch(error){toast(error?.message||'Invalid project file')}};fr.readAsText(f);e.target.value=''};
