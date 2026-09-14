@@ -27,7 +27,13 @@ const {
   applyJsonPointerOperation,
   applyPrefabOverrideOperation,
   validatePrefabDocument,
-  assertPrefabDocument
+  assertPrefabDocument,
+  ANIMATION_CLIP_SCHEMA,
+  normalizeAnimationClip,
+  normalizeAnimationClips,
+  sampleAnimationClip,
+  validateAnimationDocument,
+  assertAnimationDocument
 } = DataModel;
 
 const tests = [];
@@ -785,6 +791,198 @@ test('rejects circular and otherwise non-JSON component data', () => {
   ]) {
     const diagnostics = registry.validate('CustomData', value);
     assert(diagnostics.some(item => item.code === expectedCode), `${expectedCode} not reported`);
+  }
+});
+
+test('normalizes, validates, and samples canonical Animation Clips without losing extensions', () => {
+  assert.strictEqual(ANIMATION_CLIP_SCHEMA.required.includes('tracks'), true);
+  assert.strictEqual(JSON_SCHEMAS.animationClip, ANIMATION_CLIP_SCHEMA);
+  const legacy = {
+    name: 'Knight Run', fps: 10, frames: 4, loop: true, futureClip: { keep: true },
+    events: [{ frame: 2, name: 'Footstep', payload: { foot: 'left' }, futureEvent: 7 }]
+  };
+  const legacyDiagnostics = validateAnimationDocument({ animations: [legacy] });
+  assert(legacyDiagnostics.some(item => item.code === 'W_ANIMATION_LEGACY' && item.pointer === '/animations/0/id'));
+  assert.throws(() => assertAnimationDocument({ animations: [legacy] }, { strict: true }), error => error instanceof ComponentSchemaError && error.code === 'E_ANIMATION_LEGACY');
+  const normalized = normalizeAnimationClip(legacy, 0);
+  assert.strictEqual(normalized.id, 'knight-run');
+  assert.strictEqual(normalized.frameCount, 4);
+  assert.strictEqual(normalized.futureClip.keep, true);
+  assert.strictEqual(normalized.tracks[0].type, 'event');
+  assert.strictEqual(normalized.tracks[0].keyframes[0].value.payload.foot, 'left');
+  assert.strictEqual(normalized.tracks[0].keyframes[0].futureEvent, 7);
+
+  const clip = {
+    id: 'move', name: 'Move', fps: 10, frameCount: 4, loop: false, futureClip: 'preserved',
+    tracks: [
+      { id: 'position', type: 'position', targetEntityId: 'player', keyframes: [
+        { id: 'position-0', frame: 0, value: { x: 0, y: 5, futureValue: true } },
+        { id: 'position-3', frame: 3, value: { x: 30, y: 5 } }
+      ] },
+      { id: 'rotation', type: 'rotation', targetEntityId: 'player', keyframes: [
+        { id: 'rotation-0', frame: 0, value: 0 },
+        { id: 'rotation-3', frame: 3, value: 90 }
+      ] },
+      { id: 'custom', type: 'gameplay-custom', keyframes: [{ id: 'custom-1', frame: 1, value: { keep: true } }], futureTrack: 9 }
+    ]
+  };
+  assert.deepStrictEqual(validateAnimationDocument({ animations: [clip], scenes: [{ objects: [{ id: 'player' }] }] }), []);
+  assert.doesNotThrow(() => assertAnimationDocument({ animations: [clip], scenes: [{ objects: [{ id: 'player' }] }] }));
+  const sample = sampleAnimationClip(clip, 1.5, { unit: 'frame' });
+  assert.strictEqual(sample.frame, 1.5);
+  assert.strictEqual(sample.frameIndex, 1);
+  assert.strictEqual(sample.values.position.x, 15);
+  assert.strictEqual(sample.values.position.y, 5);
+  assert.strictEqual(sample.values.position.futureValue, true);
+  assert.strictEqual(sample.values.rotation, 45);
+  assert.deepStrictEqual(sample.values.custom, { keep: true });
+
+  const invalid = JSON.parse(JSON.stringify(clip));
+  invalid.tracks[0].keyframes.push({ id: 'position-3', frame: 8, value: { x: 1, y: 2 } });
+  const diagnostics = validateAnimationDocument({ animations: [invalid], scenes: [{ objects: [{ id: 'other' }] }] });
+  assert(diagnostics.some(item => item.code === 'E_ANIMATION_TARGET_MISSING'));
+  assert(diagnostics.some(item => item.code === 'E_ANIMATION_KEYFRAME_ID_DUPLICATE'));
+  assert(diagnostics.some(item => item.code === 'E_ANIMATION_KEYFRAME_FRAME'));
+});
+
+test('keeps custom Animation track types lossless and removes legacy empty events', () => {
+  const normalized = normalizeAnimationClip({
+    id: 'extensions', name: 'Extensions', fps: 12, frameCount: 2, loop: true,
+    events: [], futureClip: { keep: true },
+    tracks: [
+      { id: 'shader', type: 'ShaderUniform', interpolation: 'step', futureTrack: true, keyframes: [
+        { id: 'shader-0', frame: 0, value: { uniform: 'glow', value: 0.5 } }
+      ] },
+      { id: 'position', type: 'POSITION', keyframes: [
+        { id: 'position-0', frame: 0, value: { x: 1, y: 2 } }
+      ] }
+    ]
+  });
+  assert.strictEqual(normalized.tracks[0].type, 'ShaderUniform');
+  assert.strictEqual(normalized.tracks[1].type, 'position');
+  assert.strictEqual(normalized.futureClip.keep, true);
+  assert.strictEqual(normalized.tracks[0].futureTrack, true);
+  assert.strictEqual(hasOwn(normalized, 'events'), false);
+  assert.strictEqual(sampleAnimationClip(normalized, 0, { unit: 'frame' }).tracks[0].type, 'ShaderUniform');
+  assert.deepStrictEqual(validateAnimationDocument({ animations: [normalized] }, { strict: true }), []);
+});
+
+test('canonicalizes legacy Sprite frame aliases with canonical precedence', () => {
+  const normalized = normalizeAnimationClip({
+    id: 'sprite-alias', name: 'Sprite Alias', fps: 12, frameCount: 2, loop: true,
+    tracks: [{ id: 'sprite', type: 'sprite', keyframes: [
+      { id: 'legacy', frame: 0, value: { spriteFrame: '2', extension: true } },
+      { id: 'canonical', frame: 1, value: { frame: 3, spriteFrame: 9 } }
+    ] }]
+  });
+  assert.deepStrictEqual(normalized.tracks[0].keyframes.map(key => key.value.frame), [2, 3]);
+  assert.strictEqual(normalized.tracks[0].keyframes[0].value.extension, true);
+  assert.strictEqual(hasOwn(normalized.tracks[0].keyframes[0].value, 'spriteFrame'), false);
+  assert.strictEqual(hasOwn(normalized.tracks[0].keyframes[1].value, 'spriteFrame'), false);
+
+  const invalid = value => ({
+    id: 'invalid-sprite', name: 'Invalid Sprite', fps: 12, frameCount: 1, loop: true,
+    tracks: [{ id: 'sprite', type: 'sprite', keyframes: [{ id: 'sprite-0', frame: 0, value }] }]
+  });
+  assert(validateAnimationDocument([invalid({ frame: -1 })]).some(item => item.code === 'E_ANIMATION_SPRITE_FRAME'));
+  assert(validateAnimationDocument([invalid({ frame: 1.5 })]).some(item => item.code === 'E_ANIMATION_SPRITE_FRAME'));
+  assert.strictEqual(validateAnimationDocument([invalid({ frame: '2' })]).some(item => item.code === 'E_ANIMATION_SPRITE_FRAME'), false);
+  assert(validateAnimationDocument([invalid({ frame: '2' })], { strict: true }).some(item => item.code === 'E_ANIMATION_SPRITE_FRAME'));
+});
+
+test('generates deterministic collision-safe IDs for legacy Animation Clip collections', () => {
+  const legacy = name => ({ name, fps: 12, frames: 2, loop: true, events: [] });
+  const normalized = normalizeAnimationClips([
+    legacy('Walk Left'),
+    legacy('Walk-Left'),
+    legacy('Walk Left'),
+    { ...legacy('Explicit'), id: 'walk-left-2' }
+  ]);
+  assert.deepStrictEqual(
+    normalized.map(clip => clip.id),
+    ['walk-left', 'walk-left-3', 'walk-left-4', 'walk-left-2'],
+    'generated IDs must avoid both earlier generated IDs and every explicit ID in the collection'
+  );
+
+  const explicitDuplicates = [
+    { ...legacy('First'), id: 'same-id' },
+    { ...legacy('Second'), id: 'same-id' }
+  ];
+  assert.deepStrictEqual(normalizeAnimationClips(explicitDuplicates).map(clip => clip.id), ['same-id', 'same-id']);
+  assert(validateAnimationDocument(explicitDuplicates).some(item => item.code === 'E_ANIMATION_CLIP_ID_DUPLICATE'));
+});
+
+test('uses exact schema types in strict Animation validation', () => {
+  const clip = {
+    id: 'numeric-strings', name: 'Numeric Strings', fps: '12', frameCount: '2', speed: '1', loop: false,
+    tracks: [{ id: 'position', type: 'position', interpolation: 7, keyframes: [{
+      id: 'position-1', frame: '1', easing: 9, value: { x: '1', y: '2' }
+    }] }]
+  };
+  const compatible = validateAnimationDocument({ animations: [clip] });
+  assert(compatible.some(item => item.code === 'E_ANIMATION_INTERPOLATION'));
+  assert(compatible.some(item => item.code === 'E_ANIMATION_EASING'));
+  assert.strictEqual(compatible.some(item => ['E_ANIMATION_FPS', 'E_ANIMATION_FRAME_COUNT', 'E_ANIMATION_SPEED', 'E_ANIMATION_KEYFRAME_FRAME', 'E_ANIMATION_POSITION_VALUE'].includes(item.code)), false);
+
+  const strict = validateAnimationDocument({ animations: [clip] }, { strict: true });
+  for (const code of ['E_ANIMATION_FPS', 'E_ANIMATION_FRAME_COUNT', 'E_ANIMATION_SPEED', 'E_ANIMATION_INTERPOLATION', 'E_ANIMATION_KEYFRAME_FRAME', 'E_ANIMATION_EASING', 'E_ANIMATION_POSITION_VALUE']) {
+    assert(strict.some(item => item.code === code), `${code} not reported`);
+  }
+});
+
+test('samples every Event keyframe that shares the exact frame', () => {
+  const clip = {
+    id: 'simultaneous-events', name: 'Simultaneous Events', fps: 10, frameCount: 2, loop: false,
+    tracks: [{ id: 'events', type: 'event', keyframes: [
+      { id: 'sound', frame: 1, value: { name: 'Sound', payload: { volume: 0.5 } } },
+      { id: 'damage', frame: 1, value: { name: 'Damage', payload: { amount: 4 } } }
+    ] }]
+  };
+  assert.deepStrictEqual(validateAnimationDocument([clip]), []);
+  const sample = sampleAnimationClip(clip, 1, { unit: 'frame', loop: false });
+  assert.deepStrictEqual(sample.events.map(event => event.keyframeId), ['sound', 'damage']);
+  assert.deepStrictEqual(sample.events.map(event => event.name), ['Sound', 'Damage']);
+  assert.deepStrictEqual(sample.events[1].payload, { amount: 4 });
+});
+
+test('validates Animation targets and clip references across Scenes and Prefabs', () => {
+  const clip = { id: 'idle', name: 'Idle', fps: 12, frameCount: 1, loop: true, tracks: [] };
+  const missingTarget = { ...clip, id: 'missing-target', targetEntityId: 'ghost' };
+  assert(validateAnimationDocument({
+    animations: [missingTarget], scenes: [{ id: 'empty', objects: [] }], prefabs: []
+  }).some(item => item.code === 'E_ANIMATION_TARGET_MISSING'));
+
+  const document = {
+    animations: [clip],
+    scenes: [{ id: 'main', objects: [{ id: 'scene-entity', components: { Animation: { clipId: 'missing-scene' } } }] }],
+    prefabs: [{ id: 'animated-prefab', rootEntityId: 'source-root', revision: 1, entities: [
+      { id: 'source-root', components: { Animation: { clipId: 'missing-prefab' } } }
+    ] }]
+  };
+  const diagnostics = validateAnimationDocument(document);
+  assert(diagnostics.some(item => item.code === 'E_ANIMATION_CLIP_REFERENCE' && item.pointer === '/scenes/0/objects/0/components/Animation/clipId'));
+  assert(diagnostics.some(item => item.code === 'E_ANIMATION_CLIP_REFERENCE' && item.pointer === '/prefabs/0/entities/0/components/Animation/clipId'));
+
+  document.scenes[0].objects[0].components.Animation.clipId = 'idle';
+  document.prefabs[0].entities[0].components.Animation.clipId = 'idle';
+  assert.deepStrictEqual(validateAnimationDocument(document), []);
+});
+
+test('accepts definition-free v3 Animation snapshots without weakening authoring references', () => {
+  const animatedEntity = { id: 'animated', components: { Animation: { clipId: 'run', time: 0.25 } } };
+  const snapshot = { format: 'AH2D', version: 3, entities: [animatedEntity] };
+  assert.deepStrictEqual(validateAnimationDocument(snapshot, { strict: true }), []);
+  assert.doesNotThrow(() => assertAnimationDocument(snapshot, { strict: true }));
+
+  for (const authoringLike of [
+    { format: 'AH2D', version: 4, entities: [animatedEntity] },
+    { format: 'AH2D', version: 3, entities: [animatedEntity], animations: [] },
+    { format: 'AH2D', version: 3, scenes: [{ id: 'main', objects: [animatedEntity] }] }
+  ]) {
+    assert(
+      validateAnimationDocument(authoringLike, { strict: true }).some(item => item.code === 'E_ANIMATION_CLIP_REFERENCE'),
+      'only a v3 entities snapshot with no animations field may omit Clip definitions'
+    );
   }
 });
 

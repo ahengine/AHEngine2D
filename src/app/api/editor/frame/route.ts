@@ -51,6 +51,29 @@ const WORKSPACE_BRIDGE = String.raw`
     });
   }
 
+  function animationKey(clip) {
+    if (!clip || typeof clip !== "object" || Array.isArray(clip)) return null;
+    if (clip.id != null && String(clip.id).trim()) return "id:" + String(clip.id);
+    if (clip.name != null && String(clip.name).trim()) return "name:" + String(clip.name);
+    return null;
+  }
+
+  function mergeAnimations(baseAnimations, authoredAnimations) {
+    if (!Array.isArray(authoredAnimations)) return clone(baseAnimations);
+    const originals = new Map();
+    for (const clip of Array.isArray(baseAnimations) ? baseAnimations : []) {
+      const key = animationKey(clip);
+      if (key && !originals.has(key)) originals.set(key, clip);
+    }
+    return authoredAnimations.map((clip) => {
+      const key = animationKey(clip);
+      const original = key ? originals.get(key) : null;
+      return clip && typeof clip === "object" && !Array.isArray(clip)
+        ? mergeRecord(original, clip)
+        : clone(clip);
+    });
+  }
+
   // Merge the fields authored by the current editor into the original
   // universal document. Runtime extensions and future schema fields must
   // survive an editor autosave even when this UI cannot render them yet.
@@ -78,9 +101,12 @@ const WORKSPACE_BRIDGE = String.raw`
       merged.meta.name = baseProject.meta.name;
     }
 
-    // The current Animator does not load arbitrary external clip extensions.
-    if (!Array.isArray(baseProject.animations) && Array.isArray(editorDocument.animations)) {
-      merged.animations = clone(editorDocument.animations);
+    // Animation clips are authored by the Editor. Merge matching records by
+    // stable ID (or legacy name) so future clip-level extension fields survive
+    // an Editor round-trip while additions, deletions and ordering remain owned
+    // by the authored array.
+    if (Array.isArray(editorDocument.animations)) {
+      merged.animations = mergeAnimations(baseProject.animations, editorDocument.animations);
     }
 
     // Particle UI authors the first system; additional systems remain opaque.

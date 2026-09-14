@@ -84,10 +84,13 @@ try {
   assert.strictEqual(capabilities.prefabs.overrideSynchronization.staleInstanceGroups, 'skip');
   assert.strictEqual(capabilities.prefabs.componentContainerSynthesis, 'direct /components/<Type> add only');
   assert.ok(capabilities.prefabs.operations.includes('prefab.unpack'));
+  assert.deepStrictEqual(capabilities.enums.animationTrackType, ['sprite', 'position', 'rotation', 'event', 'hitbox']);
+  assert.strictEqual(capabilities.animations.schema, 'animationClip');
+  assert.strictEqual(capabilities.animations.stableReference, 'clipId');
 
 
   const schemaIndex = success(['schema', 'list']).data;
-  assert.deepStrictEqual(schemaIndex.schemas, ['project', 'prefabAsset', 'operation', 'batch']);
+  assert.deepStrictEqual(schemaIndex.schemas, ['project', 'prefabAsset', 'animationClip', 'operation', 'batch']);
   assert.ok(schemaIndex.components.includes('Collider'));
   const transformSchema = success(['schema', 'show', '--component', 'Transform']).data;
   assert.strictEqual(transformSchema.name, 'component:Transform');
@@ -101,8 +104,11 @@ try {
   assert.deepStrictEqual(projectSchema.$defs.entity.properties.parentId.type, ['string', 'null']);
   assert.ok(projectSchema.$defs.entity.properties.x.description.includes('Local'));
   assert.strictEqual(projectSchema.properties.prefabs.items.$ref, '#/$defs/prefabAsset');
+  assert.strictEqual(projectSchema.properties.animations.items.$ref, '#/$defs/animationClip');
   const prefabAssetSchema = success(['schema', 'show', '--name', 'prefabAsset']).data.schema;
   assert.deepStrictEqual(prefabAssetSchema.required, ['id', 'rootEntityId', 'entities']);
+  const animationClipSchema = success(['schema', 'show', '--name', 'animationClip']).data.schema;
+  assert.deepStrictEqual(animationClipSchema.required, ['id', 'name', 'fps', 'frameCount', 'loop', 'tracks']);
 
 
   const initialized = success(['init', '--file', projectFile, '--name', 'Agent Test']).data;
@@ -118,6 +124,42 @@ try {
   assert.strictEqual(project.engine.physicsImplementation, 'planck');
   assert.ok(project.postProcess.effects.some(effect => effect.type === 'bloom'));
   assert.ok(project.postProcess.effects.some(effect => effect.type === 'crt'));
+  const clip = {
+    id: 'idle', name: 'Idle', fps: 12, frameCount: 2, loop: true, futureClip: { keep: true },
+    tracks: [{ id: 'sprite', type: 'sprite', keyframes: [{ id: 'sprite-0', frame: 0, value: { frame: 0, futureValue: true } }] }]
+  };
+  const animationDryRun = success(['resource', 'put', '--file', projectFile, 'animation', '--value', JSON.stringify(clip), '--dry-run', '--include-document']).data.document;
+  assert.strictEqual(animationDryRun.animations[0].futureClip.keep, true);
+  assert.strictEqual(animationDryRun.animations[0].tracks[0].keyframes[0].value.futureValue, true);
+  assert.strictEqual(JSON.parse(fs.readFileSync(projectFile, 'utf8')).animations.length, 0, 'Animation dry-run must not mutate the Project');
+  success(['resource', 'put', '--file', projectFile, 'animation', '--value', JSON.stringify(clip), '--write']);
+  assert.strictEqual(success(['resource', 'get', '--file', projectFile, 'animation', 'idle']).data.value.name, 'Idle');
+
+  const invalidAnimationFile = path.join(tempRoot, 'invalid-animation.ah2d.json');
+  const invalidAnimationProject = createProject();
+  invalidAnimationProject.animations = [{ ...clip, tracks: [{ id: 'sprite', type: 'sprite', keyframes: [{ id: 'bad', frame: 2, value: { frame: 2 } }] }] }];
+  fs.writeFileSync(invalidAnimationFile, JSON.stringify(invalidAnimationProject));
+  assert.ok(failure(['validate', '--file', invalidAnimationFile], 'E_PROJECT_INVALID').payload.diagnostics.some(item => item.code === 'E_ANIMATION_KEYFRAME_FRAME'));
+
+  const legacyAnimationFile = path.join(tempRoot, 'legacy-animation.ah2d.json');
+  const legacyAnimationProject = createProject();
+  legacyAnimationProject.animations = [{ name: 'Legacy', fps: 12, frames: 2, loop: true, events: [{ frame: 1, name: 'Event' }] }];
+  fs.writeFileSync(legacyAnimationFile, JSON.stringify(legacyAnimationProject));
+  assert.ok(success(['validate', '--file', legacyAnimationFile]).diagnostics.some(item => item.code === 'W_ANIMATION_LEGACY'));
+  assert.ok(failure(['validate', '--file', legacyAnimationFile, '--strict'], 'E_PROJECT_INVALID').payload.diagnostics.some(item => item.code === 'E_ANIMATION_LEGACY'));
+  const danglingPrefabAnimationFile = path.join(tempRoot, 'dangling-prefab-animation.ah2d.json');
+  const danglingPrefabAnimationProject = createProject();
+  danglingPrefabAnimationProject.animations = [clip];
+  danglingPrefabAnimationProject.prefabs = [{
+    id: 'animated-prefab', name: 'Animated Prefab', rootEntityId: 'source-root', revision: 1,
+    entities: [{ id: 'source-root', components: { Animation: { clipId: 'missing' } } }]
+  }];
+  fs.writeFileSync(danglingPrefabAnimationFile, JSON.stringify(danglingPrefabAnimationProject));
+  const danglingPrefabResult = failure(['validate', '--file', danglingPrefabAnimationFile], 'E_PROJECT_INVALID');
+  assert.ok(danglingPrefabResult.payload.diagnostics.some(item => item.code === 'E_ANIMATION_CLIP_REFERENCE' && item.pointer === '/prefabs/0/entities/0/components/Animation/clipId'));
+  danglingPrefabAnimationProject.prefabs[0].entities[0].components.Animation.clipId = 'idle';
+  fs.writeFileSync(danglingPrefabAnimationFile, JSON.stringify(danglingPrefabAnimationProject));
+  assert.deepStrictEqual(success(['validate', '--file', danglingPrefabAnimationFile]).diagnostics, []);
   const descriptorFile = path.join(tempRoot, 'descriptor-validation.ah2d.json');
   const descriptorFixture = createProject({ name: 'Descriptor Validation' });
   delete descriptorFixture.dataModel;

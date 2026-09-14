@@ -34,6 +34,7 @@ AH2D Editor (Next.js)
 - `engine/CLI.md`: مرجع کامل فرمان‌های CLI.
 - `docs/COLLABORATION.md`: قرارداد API عمومی، revision، attribution و realtime.
 - `docs/LOCAL_PROJECTS.md`: قرارداد پوشهٔ پروژه، مرورگرهای پشتیبانی‌شده و رفتار Save.
+- `docs/ANIMATIONS.md`: قرارداد Clip/Track/Keyframe، Timeline، binding و Runtime Animation.
 - `docs/DEPLOYMENT.md`: اجرای Production و محدودیت storage محلی.
 - `docs/PHYSICS.md`: قرارداد کامل Box2D، واحدها، fixtureها، contactها، Play Mode و API بومی.
 - `Agent.md`: راهنمای توسعهٔ بازی توسط Agent.
@@ -121,7 +122,7 @@ Editor تعبیه‌شده عمومی است، اما در iframe با origin ا
 - در مرورگری که File System Access API ندارد، Open با file input انجام و Save به‌صورت دانلود یک نسخهٔ جدید ارائه می‌شود؛ UI این حالت را با `Download mode` مشخص می‌کند.
 - نسخهٔ standalone فایل `AH2DEdtior.html` همچنان از `localStorage` با کلید `AH2D.Project.v4` استفاده می‌کند.
 - `Export Universal JSON` فایل `AH2D_Project.json` را دانلود می‌کند. این فایل منبع اصلی و قابل‌حمل پروژه است.
-- `Export Animation JSON` فایل `<clip>.animation.json` می‌سازد.
+- `Export Animation JSON` کل Clip انتخاب‌شده را همراه Trackها و Keyframeها در فایل `<clip>.animation.json` می‌سازد.
 - `Export Particle JSON` فایل `<effect>.particle.json` می‌سازد.
 - تصاویر Importشده به شکل Data URL/Base64 داخل JSON قرار می‌گیرند. این خروجی self-contained است، اما تصاویر بزرگ حجم فایل را زیاد می‌کنند و در نسخهٔ standalone مصرف `localStorage` را نیز بالا می‌برند.
 - اگر هنگام Play ذخیره یا Export انجام شود، Editor وضعیت Authoring قبل از Play را می‌نویسد، نه Transformهای موقت حاصل از simulation.
@@ -134,7 +135,7 @@ Editor تعبیه‌شده عمومی است، اما در iframe با origin ا
 | --- | ---: | --- | --- |
 | Editor Universal JSON | 4 | تمام Sceneها، assets، Prefab Asset/Instance/Override، animationها، particleها، Post Process و تنظیمات Engine | منبع اصلی پروژه، Save/Load و ادامهٔ ویرایش |
 | `Engine.export()` یا `ah2d ecs export` | 3 | فقط Entity/Componentهای Scene فعال در Runtime | Debug، تست یا انتقال snapshot فعال |
-| Animation asset | 1 | مشخصات clip و eventها | مصرف توسط سیستم animation بازی |
+| Animation asset | 1 | Clip کامل شامل FPS، frame count، Trackها، Keyframeها، easing، event و hitbox | Import/اشتراک Asset و مصرف توسط AnimationSystem |
 | Particle asset | 1 | پارامترهای emitter | مصرف توسط renderer/particle system بازی |
 
 هیچ‌وقت فایل Universal نسخهٔ ۴ را با نتیجهٔ `Engine.export()` جایگزین نکنید؛ snapshot نسخهٔ ۳ Sceneها و resourceهای پروژه را ندارد.
@@ -842,29 +843,36 @@ Payload شامل `a`, `b`, `bodyA`, `bodyB`, `colliderA`, `colliderB`, `normal`,
 
 ### Animation
 
-AnimationSystem فعلی clock را جلو می‌برد؛ تعویض Sprite Frame را renderer بازی انجام می‌دهد:
+Animation Clipهای واقعی در `animations[]` پروژهٔ Universal ذخیره می‌شوند. هر Clip یک ID پایدار، timebase مبتنی بر frame و Trackهای Sprite، Position، Rotation، Event و Hitbox دارد. Entity با `Animation.clipId` به Asset وصل می‌شود:
 
 ```js
 engine.ecs.add('player', 'Animation', {
-  clip: 'Knight_Run',
-  playing: true,
-  time: 0,
-  duration: 0.8,
+  clipId: 'knight-run',
+  autoplay: true,
   speed: 1,
-  loop: true,
-  frameCount: 12
+  loop: true
 });
 
-function animationFrame(entityId) {
-  const animation = engine.ecs.get(entityId, 'Animation');
-  const normalized = animation.duration > 0
-    ? (animation.time % animation.duration) / animation.duration
-    : 0;
-  return Math.floor(normalized * animation.frameCount) % animation.frameCount;
-}
+// برای شروع دستی می‌توان autoplay را حذف کرد:
+engine.animation.play('player', 'knight-run', { fromStart: true });
+engine.update(1 / 60);
+
+const pose = AH2D.sampleAnimationClip(
+  project.animations.find(clip => clip.id === 'knight-run'),
+  6,
+  { unit: 'frame' }
+);
 ```
 
-فایل مستقل Animation فعلی شامل `name`, `fps`, `frames`, `loop` و `events` است. اتصال frameها به sprite sheet، interpolation و اجرای eventها مسئولیت کد بازی/renderer است.
+AnimationSystem زمان هر Entity را مستقل جلو می‌برد، Position/Rotation را روی Transform محلی و Sprite را روی Renderable نمونه‌برداری و اعمال می‌کند، Hitbox sample را در state Runtime نگه می‌دارد و Event Track را با `animation:event` منتشر می‌کند. Clip غیر-loop در پایان `animation:complete` می‌فرستد. PixiJS adapter مقدار `Renderable.sourceRect` را مستقیماً به subtexture برش‌خورده تبدیل می‌کند؛ مقدار `frame` بدون `sourceRect` فقط وقتی قابل‌نمایش است که Asset یا host متادیتای Sprite Sheet لازم برای تبدیل شمارهٔ frame به rectangle را فراهم کند. در PhaserJS و Runtime سفارشی، نگاشت Renderable نهایی به Texture/frame بومی همچنان بر عهدهٔ host است.
+
+در Sprite Track، `keyframe.frame` موقعیت زمانی Key و `value.frame` شمارهٔ تصویر Sprite Sheet است؛ `value.sourceRect` برش دقیق پیکسلی را نگه می‌دارد. `spriteFrame` فقط alias سازگاری قدیمی است و خروجی canonical از `frame` استفاده می‌کند.
+
+برای اجرای Clip در Play Mode، Game Object را انتخاب کنید و از `Add Component > Animation` یک Component اضافه کنید، سپس Clip، Autoplay، Speed و Loop را در Inspector تنظیم کنید. Play داخل Animator صرفاً Preview Timeline است؛ Play اصلی Editor سند را در Runtime انتخاب‌شده اجرا می‌کند و Stop وضعیت Authoring قبل از اجرا را بازمی‌گرداند.
+
+یک Clip می‌تواند چند Track هم‌نوع با targetهای متفاوت داشته باشد. اولویت هدف `track.targetEntityId`، سپس `clip.targetEntityId` و در نهایت Entity دارای Animation Component است. اگر چند Track هم‌نوع یک property از یک target مشترک را بنویسند، Track آخر در `tracks[]` برنده است؛ Eventها همگی dispatch و Hitboxها تجمیع می‌شوند.
+
+Animator و Timeline همین قرارداد را مستقیماً Load، ویرایش، Preview و Save می‌کنند؛ frame انتخاب‌شده و playhead state موقت Editor هستند و وارد Asset نمی‌شوند. قرارداد کامل، schema، API، رفتار loop/event و مثال CLI در [`docs/ANIMATIONS.md`](./docs/ANIMATIONS.md) قرار دارد.
 
 ### Camera، Light، Shadow و Tilemap
 
@@ -951,6 +959,7 @@ Adapter به‌صورت خودکار:
 - برای هر Entity یک `PIXI.Container` می‌سازد و Nested Scene Graph را mirror می‌کند؛
 - Transform محلی را با Matrix اعمال می‌کند تا world transformهای چرخیده، scale غیرهمسان و shear حاصل از nesting دقیق بمانند؛
 - برای Renderable دارای تصویر `PIXI.Sprite` با anchor مرکزی و برای Renderable بدون تصویر `PIXI.Graphics` می‌سازد؛
+- `Renderable.sourceRect` را به subtexture بومی Pixi برش می‌دهد و تا زمانی که Texture یا rectangle همان Sprite عوض نشده، همان subtexture را نگه می‌دارد؛
 - `Hidden`، `Renderable.visible` و `layer`/`zIndex` را همگام می‌کند؛
 - ساخت، حذف و Reparent شدن Entityها را در Frame بعدی reconcile می‌کند؛
 - `imageSrc` را مستقیم و `assetId` را از `project.assets` resolve می‌کند و منابع را با `PIXI.Assets.load()` به‌صورت async بار می‌گیرد؛
@@ -981,7 +990,7 @@ class GameScene extends Phaser.Scene {
 }
 ```
 
-PixiJS adapter اکنون Display Tree، Sprite/Graphics، Transform، visibility، Camera و asset loading پایه را مستقیماً از ECS ایجاد و Render می‌کند. PhaserJS همچنان یک adapter انتخاب/سازگاری است و ساخت Game Objectها، sync ECS و Camera/renderer mapping آن باید توسط پروژهٔ بازی انجام شود؛ مثال `createPhaserObjectsFromECS` بالا host-owned است. Animation frame slicing، Particle rendering، Light/Shadow و Post Process filters برای هر دو Runtime همچنان نیازمند نگاشت اختصاصی بازی هستند.
+PixiJS adapter اکنون Display Tree، Sprite/Graphics، Transform، visibility، Camera، asset loading پایه و برش native مقدار `Renderable.sourceRect` را مستقیماً از ECS ایجاد و Render می‌کند. مقدار `Renderable.frame` به‌تنهایی ابعاد و مختصات برش را تعیین نمی‌کند و به metadata مربوط به Asset یا host نیاز دارد. PhaserJS همچنان یک adapter انتخاب/سازگاری است و ساخت Game Objectها، sync ECS و Camera/renderer mapping آن باید توسط پروژهٔ بازی انجام شود؛ مثال `createPhaserObjectsFromECS` بالا host-owned است. Particle rendering، Light/Shadow و Post Process filters نیز در PhaserJS/Custom به نگاشت اختصاصی host نیاز دارند.
 
 ### اجرای Headless در Node.js
 
@@ -1080,11 +1089,11 @@ engine.events.emit(type, payload)
 
 - نام پروژه در خروجی مستقیم Editor فعلاً `Demo Project` است؛ CLI می‌تواند `meta.name` را بدون از دست رفتن داده تغییر دهد.
 - Loader فعلی Editor فیلدهای ناشناختهٔ سند، Scene، `meta`، `engine`، Asset و Entity را هنگام Load/Save حفظ می‌کند؛ بخش‌هایی که Editor واقعاً مدل می‌کند با state فعال به‌روزرسانی می‌شوند. برای mutation اتمیک و قابل‌شرط‌گذاری با hash همچنان از CLI استفاده کنید.
-- Project Load فقط `particles[0]` را بازیابی می‌کند و `animations` را هنوز به state ادیتور برنمی‌گرداند. Assetها نیز بر اساس ID merge می‌شوند.
+- Project Load تمام `animations[]` را به state Animator برمی‌گرداند و تغییر Clip/Track/Keyframe را در Save بعدی حفظ می‌کند. Particle Editor فعلاً فقط `particles[0]` را مدل می‌کند و Assetها بر اساس ID merge می‌شوند.
 - standalone animation/particle JSON ورودی مستقیم Project Load نیستند.
 - layout پنل‌ها، selection، undo history، grid/snap، commentهای محلی داخل canvas و وضعیت دوربین Prefab در Universal JSON ذخیره نمی‌شوند. Commentهای مشارکتی Studio جداگانه در Project API ذخیره می‌شوند.
 - Prefabهای canonical از Asset/Instance/Override/Apply/Revert/Unpack پشتیبانی می‌کنند؛ nested Prefab Asset و structural override هنوز پشتیبانی نمی‌شوند و برای تغییر hierarchy یک Instance متصل باید ابتدا Unpack انجام شود.
-- Animation export فعلاً metadata و eventهای hard-coded clip را ذخیره می‌کند؛ frame image، curve و hitbox serialization کامل نیست و Project Load آن را مصرف نمی‌کند.
+- Sprite Track اطلاعات canonical `frame`/`sourceRect` را ذخیره می‌کند. PixiJS adapter مستقیماً `sourceRect` را به subtexture تبدیل می‌کند؛ `frame` بدون rectangle به متادیتای Sprite Sheet از Asset/host نیاز دارد و نگاشت PhaserJS/Custom همچنان host-owned است.
 - Particle export پارامترهای emitter را ذخیره می‌کند؛ texture، gradient، curve keyها و live particleها صادر نمی‌شوند.
 - Editor چند fixture مستقل box/circle را روی یک Entity مدیریت می‌کند. polygon/chain/joint هنوز قرارداد Authoring داخل Universal JSON ندارند؛ در صورت نیاز بازی از handle بومی Runtime استفاده کند.
 - دادهٔ `playing` در Particle export وضعیت Preview Editor است و نباید به‌تنهایی مبنای lifecycle Runtime قرار گیرد.

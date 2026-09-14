@@ -40,5 +40,36 @@ assert.match(html, /readEditorComponent\(entity,'Renderable'\)/, 'component-only
 assert.match(html, /prefabRevision:revision/, 'instances must track the canonical Asset revision');
 assert.match(html, /revision:Number\.isInteger\(prefab\.revision\)/, 'Prefab Assets must serialize canonical revision');
 assert.match(html, /assertPrefabDocument\(document/, 'save/export must validate the connected Prefab graph');
+assert.match(html, /sourceMap=new Map\(nodes\.map\(item=>\[item\.id,item\.id\]\)\)/, 'Prefab source IDs must preserve authored Entity IDs so Animation track targets remap per instance');
+assert.doesNotMatch(html, /sourceMap=new Map\(nodes\.map\(item=>\[item\.id,uniqueEditorId/, 'Prefab creation must not orphan Animation track target IDs by randomizing source IDs');
+
+const editorFunctionSource = name => {
+  const source = html.match(new RegExp(`function ${name}\\([^\\r\\n]+`))?.[0];
+  assert.ok(source, `${name} must be extractable for executable regression testing`);
+  return source;
+};
+
+const removalState = {
+  scene: [],
+  scenes: [{ id: 'main', objects: [{ id: 'actor-body' }] }],
+  currentSceneId: 'main',
+  prefab: [],
+  prefabs: [{ id: 'actor-prefab', entities: [{ id: 'actor-body' }] }],
+  activePrefabId: null,
+  animations: [{
+    id: 'actor-motion',
+    targetEntityId: 'actor-body',
+    tracks: [{ id: 'body-position', type: 'position', targetEntityId: 'actor-body', keyframes: [] }]
+  }]
+};
+const removalContext = vm.createContext({ state: removalState });
+new vm.Script(`${editorFunctionSource('animationTargetStillExists')};${editorFunctionSource('repairAnimationTargetsAfterEntityRemoval')}`).runInContext(removalContext);
+assert.equal(removalContext.repairAnimationTargetsAfterEntityRemoval(['actor-body']), 0, 'removing the first linked instance must retain targets backed by the Prefab source');
+assert.equal(removalState.animations[0].targetEntityId, 'actor-body');
+assert.equal(removalState.animations[0].tracks[0].targetEntityId, 'actor-body');
+removalState.prefabs = [];
+assert.equal(removalContext.repairAnimationTargetsAfterEntityRemoval(['actor-body']), 2, 'targets must clear after their last live Scene or Prefab source is removed');
+assert.equal('targetEntityId' in removalState.animations[0], false);
+assert.equal('targetEntityId' in removalState.animations[0].tracks[0], false);
 
 console.log(`AH2DEdtior Prefab regression checks passed (${scripts.length} inline scripts parsed)`);

@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const {
   PROTOCOL, PROJECT_VERSION, PHYSICS_BACKENDS, PHYSICS_IMPLEMENTATIONS, EXIT, DomainError, clone, detectDialect, createProject,
-  DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES, PREFAB_ASSET_SCHEMA, componentRegistry,
+  DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES, PREFAB_ASSET_SCHEMA, ANIMATION_CLIP_SCHEMA, componentRegistry,
   migrateDocument, syncActiveMirror, validateDocument, assertValid, resolveScene,
   resolveEntity, entityName, applyOperations, applyJsonPatch, mergePatch, getPointer,
   listComponents, listEntities, getComponent, putComponent, resourceField, documentHash,
@@ -331,7 +331,7 @@ function capabilities() {
       runtime: ['get', 'set'], physics: ['get', 'set'], schema: ['list', 'show'],
       topLevel: ['init', 'inspect', 'validate', 'format', 'migrate', 'query', 'patch', 'apply', 'simulate', 'ecs export', 'doctor', 'version', 'capabilities']
     },
-    enums: { runtime: ['pixijs', 'phaserjs', 'custom'], physicsBackend: [...PHYSICS_BACKENDS], rigidbodyType: ['static', 'dynamic', 'kinematic'], colliderShape: ['rectangle', 'box', 'circle'] },
+    enums: { runtime: ['pixijs', 'phaserjs', 'custom'], physicsBackend: [...PHYSICS_BACKENDS], rigidbodyType: ['static', 'dynamic', 'kinematic'], colliderShape: ['rectangle', 'box', 'circle'], animationTrackType: ['sprite', 'position', 'rotation', 'event', 'hitbox'] },
     options: {
       physicsBackend: {
         flag: '--backend', values: [...PHYSICS_BACKENDS],
@@ -363,6 +363,12 @@ function capabilities() {
       deleteLiveInstances: '--unpack-instances', overrideSelection: '--path or --all', overrideRemoval: '--remove',
       operations: ['prefab.asset.create', 'prefab.asset.update', 'prefab.asset.delete', 'prefab.instantiate', 'prefab.override.set', 'prefab.override.apply', 'prefab.override.revert', 'prefab.unpack']
     },
+    animations: {
+      storage: 'animations', schema: 'animationClip', component: 'Animation', stableReference: 'clipId',
+      legacyReference: 'clip', trackTypes: ['sprite', 'position', 'rotation', 'event', 'hitbox'],
+      timebase: { authoring: 'frame', duration: 'frameCount / fps' },
+      mutation: 'resource put|delete or project patch/apply'
+    },
     mutationSafety: { explicitWrite: ['--write', '--out', '--print-document', '--dry-run'], optimisticConcurrency: '--expect-sha256', atomicReplace: true, batchRollback: true, unknownFieldsPreserved: true },
     input: { project: ['--file PATH', '--file -'], jsonValue: ['JSON', '@file.json', '-'] },
     output: { protocol: PROTOCOL, default: 'json', human: '--format text', pretty: '--pretty' }
@@ -374,8 +380,9 @@ function componentSchemaTypes() {
 }
 
 const schemas = {
-  project: { $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'AH2D Project', type: 'object', required: ['format', 'version', 'currentSceneId', 'scenes'], properties: { format: { const: 'AH2D' }, version: { type: 'integer', maximum: PROJECT_VERSION }, dataModel: { type: 'object', required: ['id', 'version', 'componentSchemaVersion'], properties: { id: { const: DATA_MODEL_DESCRIPTOR.id }, version: { const: DATA_MODEL_DESCRIPTOR.version }, componentSchemaVersion: { const: DATA_MODEL_DESCRIPTOR.componentSchemaVersion } }, additionalProperties: true }, currentSceneId: { type: 'string' }, scenes: { type: 'array', minItems: 1, items: { $ref: '#/$defs/scene' } }, prefabs: { type: 'array', items: { $ref: '#/$defs/prefabAsset' } } }, $defs: { scene: { type: 'object', required: ['id', 'name', 'objects'], properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string' }, objects: { type: 'array', items: { $ref: '#/$defs/entity' } } }, additionalProperties: true }, entity: { type: 'object', required: ['id'], properties: { id: { type: 'string', minLength: 1 }, parentId: { type: ['string', 'null'], minLength: 1, description: 'Stable ID of the parent Entity in the same Scene; Transform is local to this parent.' }, x: { type: 'number', description: 'Local X position.' }, y: { type: 'number', description: 'Local Y position.' }, rot: { type: 'number', description: 'Local rotation in degrees.' }, rotation: { type: 'number', description: 'Local rotation in degrees.' }, sx: { type: 'number', description: 'Local X scale.' }, sy: { type: 'number', description: 'Local Y scale.' }, scaleX: { type: 'number', description: 'Local X scale.' }, scaleY: { type: 'number', description: 'Local Y scale.' }, components: { type: 'object' } }, additionalProperties: true }, prefabAsset: clone(PREFAB_ASSET_SCHEMA) } },
+  project: { $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'AH2D Project', type: 'object', required: ['format', 'version', 'currentSceneId', 'scenes'], properties: { format: { const: 'AH2D' }, version: { type: 'integer', maximum: PROJECT_VERSION }, dataModel: { type: 'object', required: ['id', 'version', 'componentSchemaVersion'], properties: { id: { const: DATA_MODEL_DESCRIPTOR.id }, version: { const: DATA_MODEL_DESCRIPTOR.version }, componentSchemaVersion: { const: DATA_MODEL_DESCRIPTOR.componentSchemaVersion } }, additionalProperties: true }, currentSceneId: { type: 'string' }, scenes: { type: 'array', minItems: 1, items: { $ref: '#/$defs/scene' } }, prefabs: { type: 'array', items: { $ref: '#/$defs/prefabAsset' } }, animations: { type: 'array', items: { $ref: '#/$defs/animationClip' } } }, $defs: { scene: { type: 'object', required: ['id', 'name', 'objects'], properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string' }, objects: { type: 'array', items: { $ref: '#/$defs/entity' } } }, additionalProperties: true }, entity: { type: 'object', required: ['id'], properties: { id: { type: 'string', minLength: 1 }, parentId: { type: ['string', 'null'], minLength: 1, description: 'Stable ID of the parent Entity in the same Scene; Transform is local to this parent.' }, x: { type: 'number', description: 'Local X position.' }, y: { type: 'number', description: 'Local Y position.' }, rot: { type: 'number', description: 'Local rotation in degrees.' }, rotation: { type: 'number', description: 'Local rotation in degrees.' }, sx: { type: 'number', description: 'Local X scale.' }, sy: { type: 'number', description: 'Local Y scale.' }, scaleX: { type: 'number', description: 'Local X scale.' }, scaleY: { type: 'number', description: 'Local Y scale.' }, components: { type: 'object' } }, additionalProperties: true }, prefabAsset: clone(PREFAB_ASSET_SCHEMA), animationClip: clone(ANIMATION_CLIP_SCHEMA) } },
   prefabAsset: clone(PREFAB_ASSET_SCHEMA),
+  animationClip: clone(ANIMATION_CLIP_SCHEMA),
   operation: { type: 'object', required: ['op'], properties: { op: { type: 'string', pattern: '^(scene|entity|component|resource|runtime|physics|project|prefab)\\.' } }, additionalProperties: true },
   batch: { type: 'array', minItems: 1, items: { $ref: '#/$defs/operation' }, $defs: { operation: { type: 'object', required: ['op'], properties: { op: { type: 'string' } } } } }
 };

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import vm from "node:vm";
 import { CollaborationError } from "./errors";
 import { CollaborationEventHub } from "./event-hub";
 import { CollaborationService } from "./service";
@@ -425,6 +426,138 @@ async function main(): Promise<void> {
     assert.match(frameSource, /postMessage\([^\n]+EXPECTED_PARENT_ORIGIN\)/);
     assert.match(frameSource, /AH2D_SAVE_REQUEST/);
     assert.match(frameSource, /AH2D_EDITOR_COMMAND/);
+    assert.match(frameSource, /merged\.animations\s*=\s*mergeAnimations\(baseProject\.animations, editorDocument\.animations\)/);
+    assert.doesNotMatch(frameSource, /!Array\.isArray\(baseProject\.animations\)/);
+
+    const bridgeSource = frameSource.match(
+      /<script data-ah2d-workspace-bridge>\s*([\s\S]*?)<\/script>/,
+    )?.[1];
+    assert(bridgeSource, "the rendered Editor frame must contain its workspace bridge");
+
+    const bridgeListeners = new Map<string, Array<(event: Record<string, unknown>) => void>>();
+    const bridgeMessages: Array<Record<string, unknown>> = [];
+    const bridgeParent = {
+      postMessage(message: Record<string, unknown>, origin: string) {
+        bridgeMessages.push({ ...structuredClone(message), targetOrigin: origin });
+      },
+    };
+    let editorSnapshot: Record<string, unknown> | null = null;
+    const bridgeWindow = {
+      parent: bridgeParent,
+      projectData: () => editorSnapshot,
+      loadProject(project: Record<string, unknown>) {
+        const sourceClip = (project.animations as Array<Record<string, unknown>>)[0];
+        editorSnapshot = {
+          ...structuredClone(project),
+          animations: [
+            {
+              id: sourceClip.id,
+              name: sourceClip.name,
+              fps: 24,
+              frameCount: sourceClip.frameCount,
+              loop: sourceClip.loop,
+              tracks: structuredClone(sourceClip.tracks),
+            },
+            {
+              id: "new-clip",
+              name: "New Clip",
+              fps: 10,
+              frameCount: 2,
+              loop: false,
+              tracks: [],
+            },
+          ],
+        };
+        return true;
+      },
+      addEventListener(type: string, listener: (event: Record<string, unknown>) => void) {
+        const listeners = bridgeListeners.get(type) ?? [];
+        listeners.push(listener);
+        bridgeListeners.set(type, listeners);
+      },
+      setInterval() { return 1; },
+      setTimeout() { return 1; },
+      toast() {},
+    };
+    const bridgeDocument = {
+      referrer: "http://localhost/",
+      addEventListener() {},
+      getElementById() { return null; },
+    };
+    vm.runInNewContext(bridgeSource, {
+      window: bridgeWindow,
+      document: bridgeDocument,
+      URL,
+      Date,
+      JSON,
+      Error,
+      structuredClone,
+      performance: { now: () => 0 },
+    }, { filename: "editor-workspace-bridge.js" });
+
+    const loadedProject = {
+      format: "AH2D",
+      version: 4,
+      project: { name: "Animation Bridge" },
+      scenes: [{ id: "main", name: "Main", objects: [] }],
+      currentSceneId: "main",
+      scene: [],
+      animations: [
+        {
+          id: "walk",
+          name: "Walk",
+          fps: 12,
+          frameCount: 4,
+          loop: true,
+          tracks: [],
+          futureClipExtension: { curveEditor: "keep-me" },
+        },
+        {
+          id: "delete-me",
+          name: "Deleted in Editor",
+          fps: 12,
+          frameCount: 1,
+          loop: false,
+          tracks: [],
+        },
+      ],
+    };
+    const messageListener = bridgeListeners.get("message")?.[0];
+    assert(messageListener, "the bridge must subscribe to parent messages");
+    messageListener({
+      source: bridgeParent,
+      origin: "http://localhost",
+      data: {
+        source: "ah2d-studio",
+        type: "AH2D_LOAD_PROJECT",
+        requestId: "animation-load",
+        document: loadedProject,
+      },
+    });
+    const hostCommandListener = bridgeListeners.get("ah2d:host-command")?.[0];
+    assert(hostCommandListener, "the bridge must subscribe to hosted save commands");
+    hostCommandListener({ detail: { command: "save", document: editorSnapshot } });
+
+    const saveMessage = bridgeMessages.find((message) => message.type === "AH2D_SAVE_REQUEST");
+    assert(saveMessage, "an authored animation change must produce a hosted save request");
+    const savedAnimations = (saveMessage.document as {
+      animations: Array<Record<string, unknown>>;
+    }).animations;
+    assert.equal(savedAnimations.length, 2, "the authored clip list owns additions and deletions");
+    assert.equal(savedAnimations[0].id, "walk");
+    assert.equal(savedAnimations[0].fps, 24, "known authored values must replace the base clip values");
+    assert.deepEqual(
+      savedAnimations[0].futureClipExtension,
+      { curveEditor: "keep-me" },
+      "unknown clip fields must survive the Editor/bridge round-trip",
+    );
+    assert.equal(savedAnimations[1].id, "new-clip");
+    assert.equal(
+      savedAnimations.some((clip) => clip.id === "delete-me"),
+      false,
+      "clips removed by the Editor must not be restored by the bridge",
+    );
+    assert.equal(saveMessage.targetOrigin, "http://localhost");
 
     const routeProjectResponse = await createProjectRoute(new Request("http://localhost/api/projects", {
       method: "POST",

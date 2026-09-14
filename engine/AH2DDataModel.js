@@ -15,6 +15,7 @@
     RUNTIME: 'runtime',
     SNAPSHOT: 'snapshot'
   });
+  const ANIMATION_TRACK_TYPES = Object.freeze(['sprite', 'position', 'rotation', 'event', 'hitbox']);
   const PROFILE_NAMES = Object.freeze(Object.values(PROFILES));
   const COMPONENT_NAME_PATTERN = '^[A-Z][A-Za-z0-9]*$';
   const COMPONENT_NAME_RE = new RegExp(COMPONENT_NAME_PATTERN);
@@ -251,9 +252,13 @@
     ...TRANSFORM_AUTHORING_SCHEMA.properties,
     world: { type: 'array', items: number(), minItems: 6, maxItems: 6 }
   });
+  const SOURCE_RECT_SCHEMA = object({
+    x: number(), y: number(), width: number({ exclusiveMinimum: 0 }), height: number({ exclusiveMinimum: 0 })
+  });
   const RENDERABLE_SCHEMA = object({
     kind: string(), width: number({ minimum: 0 }), height: number({ minimum: 0 }), color: string(),
-    assetId: nullableString(), imageSrc: nullableString(), layer: number(), visible: boolean()
+    assetId: nullableString(), imageSrc: nullableString(), layer: number(), visible: boolean(),
+    frame: integer({ minimum: 0 }), sourceRect: SOURCE_RECT_SCHEMA
   });
   const RIGIDBODY_AUTHORING_SCHEMA = object({
     enabled: boolean(), type: { type: 'string', enum: ['static', 'dynamic', 'kinematic'] },
@@ -349,7 +354,12 @@
   const LIGHT_SCHEMA = object({ color: string(), intensity: number({ minimum: 0 }), radius: number({ minimum: 0 }), type: string(), enabled: boolean() });
   const SHADOW_SCHEMA = object({ opacity: number({ minimum: 0, maximum: 1 }), enabled: boolean(), color: string(), blur: number({ minimum: 0 }) });
   const ANIMATION_AUTHORING_SCHEMA = object({
-    clip: string(), playing: boolean(), time: number({ minimum: 0 }), duration: number({ minimum: 0 }), speed: number(), loop: boolean(), frameCount: integer({ minimum: 0 })
+    clipId: string(), clip: string(), autoplay: boolean(), playing: boolean(), time: number({ minimum: 0 }),
+    duration: number({ minimum: 0 }), speed: number(), loop: boolean(), frameCount: integer({ minimum: 0 })
+  });
+  const ANIMATION_RUNTIME_SCHEMA = object({
+    ...ANIMATION_AUTHORING_SCHEMA.properties,
+    frame: number({ minimum: 0 }), sampledHitboxes: { type: 'array', items: { type: 'object' } }, completed: boolean()
   });
   const TILEMAP_SCHEMA = object({
     tileWidth: number({ exclusiveMinimum: 0 }), tileHeight: number({ exclusiveMinimum: 0 }),
@@ -373,7 +383,7 @@
     Camera: profileSet(CAMERA_SCHEMA),
     Light: profileSet(LIGHT_SCHEMA),
     ShadowCaster: profileSet(SHADOW_SCHEMA),
-    Animation: profileSet(ANIMATION_AUTHORING_SCHEMA),
+    Animation: profileSet(ANIMATION_AUTHORING_SCHEMA, ANIMATION_RUNTIME_SCHEMA),
     Tilemap: profileSet(TILEMAP_SCHEMA),
     ParticleEmitter: profileSet(PARTICLE_SCHEMA),
     BoxCollider: profileSet(COLLIDER_SCHEMA),
@@ -424,14 +434,521 @@
     revision: integer({ minimum: 0 }),
     entities: { type: 'array', items: ENTITY_SCHEMA, minItems: 1 }
   }, { required: ['id', 'rootEntityId', 'entities'] });
+  const ANIMATION_KEYFRAME_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    frame: integer({ minimum: 0 }),
+    value: {},
+    easing: string()
+  }, { required: ['id', 'frame', 'value'] });
+  const ANIMATION_TRACK_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    type: string({ minLength: 1, pattern: '\\S' }),
+    targetEntityId: string({ minLength: 1, pattern: '\\S' }),
+    interpolation: string(),
+    keyframes: { type: 'array', items: ANIMATION_KEYFRAME_SCHEMA }
+  }, { required: ['id', 'type', 'keyframes'] });
+  const ANIMATION_CLIP_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    name: string({ minLength: 1, pattern: '\\S' }),
+    fps: number({ exclusiveMinimum: 0 }),
+    frameCount: integer({ minimum: 1 }),
+    loop: boolean(),
+    speed: number(),
+    targetEntityId: string({ minLength: 1, pattern: '\\S' }),
+    tracks: { type: 'array', items: ANIMATION_TRACK_SCHEMA }
+  }, { required: ['id', 'name', 'fps', 'frameCount', 'loop', 'tracks'] });
   const JSON_SCHEMAS = {
     components: COMPONENT_SCHEMAS,
     componentProfiles: PROFILE_SCHEMAS,
     componentMap: COMPONENT_MAP_SCHEMA,
     entity: ENTITY_SCHEMA,
     prefabOverrideOperation: PREFAB_OVERRIDE_OPERATION_SCHEMA,
-    prefabAsset: PREFAB_ASSET_SCHEMA
+    prefabAsset: PREFAB_ASSET_SCHEMA,
+    animationKeyframe: ANIMATION_KEYFRAME_SCHEMA,
+    animationTrack: ANIMATION_TRACK_SCHEMA,
+    animationClip: ANIMATION_CLIP_SCHEMA
   };
+
+  function animationSlug(value, fallback = 'animation') {
+    const slug = String(value == null ? '' : value)
+      .trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    return slug || fallback;
+  }
+
+  function animationGeneratedId(base, used, fallback) {
+    let candidate = animationSlug(base, fallback);
+    let suffix = 2;
+    while (used.has(candidate)) candidate = `${animationSlug(base, fallback)}-${suffix++}`;
+    used.add(candidate);
+    return candidate;
+  }
+
+  function normalizeAnimationClip(input, options = {}) {
+    if (Number.isInteger(options)) options = { index: options };
+    const source = isPlainObject(input) ? cloneJson(input) : {};
+    const index = Number.isInteger(options.index) && options.index >= 0 ? options.index : 0;
+    const output = source;
+    const name = typeof source.name === 'string' && source.name.trim()
+      ? source.name.trim()
+      : (typeof source.id === 'string' && source.id.trim() ? source.id.trim() : `Animation ${index + 1}`);
+    output.id = typeof source.id === 'string' && source.id.trim()
+      ? source.id.trim()
+      : animationSlug(name, `animation-${index + 1}`);
+    output.name = name;
+    output.fps = Number.isFinite(Number(source.fps)) && Number(source.fps) > 0 ? Number(source.fps) : 12;
+    const legacyFrameCount = !Array.isArray(source.frames) ? Number(source.frames) : NaN;
+    const authoredFrameCount = Number(source.frameCount);
+    const sourceTracks = Array.isArray(source.tracks) ? source.tracks : [];
+    const rootEvents = Array.isArray(source.events) ? source.events : [];
+    const discoveredLastFrame = [...sourceTracks.flatMap(track => Array.isArray(track?.keyframes) ? track.keyframes : []), ...rootEvents]
+      .reduce((last, keyframe) => Number.isInteger(Number(keyframe?.frame)) ? Math.max(last, Number(keyframe.frame)) : last, -1);
+    output.frameCount = Number.isInteger(authoredFrameCount) && authoredFrameCount > 0
+      ? authoredFrameCount
+      : (Number.isInteger(legacyFrameCount) && legacyFrameCount > 0 ? legacyFrameCount : Math.max(1, discoveredLastFrame + 1));
+    if (source.frames != null && !Array.isArray(source.frames)) delete output.frames;
+    output.loop = typeof source.loop === 'boolean' ? source.loop : true;
+    if (source.speed != null) output.speed = Number.isFinite(Number(source.speed)) ? Number(source.speed) : 1;
+
+    const usedTrackIds = new Set();
+    output.tracks = sourceTracks.filter(isPlainObject).map((rawTrack, trackIndex) => {
+      const track = cloneJson(rawTrack);
+      const authoredType = typeof track.type === 'string' && track.type.trim() ? track.type.trim() : 'property';
+      const canonicalType = authoredType.toLowerCase();
+      const type = ANIMATION_TRACK_TYPES.includes(canonicalType) ? canonicalType : authoredType;
+      track.type = type;
+      if (typeof track.id === 'string' && track.id.trim()) {
+        track.id = track.id.trim();
+        usedTrackIds.add(track.id);
+      } else track.id = animationGeneratedId(type, usedTrackIds, `track-${trackIndex + 1}`);
+      if (typeof track.interpolation !== 'string' || !track.interpolation.trim()) {
+        track.interpolation = type === 'position' || type === 'rotation' ? 'linear' : 'step';
+      }
+      const usedKeyframeIds = new Set();
+      track.keyframes = (Array.isArray(rawTrack.keyframes) ? rawTrack.keyframes : [])
+        .filter(isPlainObject)
+        .map((rawKeyframe, keyframeIndex) => {
+          const keyframe = cloneJson(rawKeyframe);
+          keyframe.frame = Number.isFinite(Number(keyframe.frame)) ? Number(keyframe.frame) : 0;
+          if (typeof keyframe.id === 'string' && keyframe.id.trim()) {
+            keyframe.id = keyframe.id.trim();
+            usedKeyframeIds.add(keyframe.id);
+          } else keyframe.id = animationGeneratedId(`${track.id}-${keyframe.frame}`, usedKeyframeIds, `key-${keyframeIndex + 1}`);
+          if (type === 'sprite' && isPlainObject(keyframe.value)) {
+            const hasCanonicalFrame = hasOwn(keyframe.value, 'frame');
+            const hasLegacyFrame = hasOwn(keyframe.value, 'spriteFrame');
+            if (hasCanonicalFrame || hasLegacyFrame) {
+              const authoredFrame = hasCanonicalFrame ? keyframe.value.frame : keyframe.value.spriteFrame;
+              keyframe.value.frame = Number.isInteger(Number(authoredFrame)) ? Number(authoredFrame) : authoredFrame;
+            }
+            if (hasLegacyFrame) delete keyframe.value.spriteFrame;
+          }
+          return keyframe;
+        })
+        .sort((left, right) => left.frame - right.frame);
+      return track;
+    });
+
+    if (rootEvents.length) {
+      let eventTrack = output.tracks.find(track => track.type === 'event');
+      if (!eventTrack) {
+        const id = animationGeneratedId('events', usedTrackIds, 'events');
+        eventTrack = { id, type: 'event', interpolation: 'step', keyframes: [] };
+        output.tracks.push(eventTrack);
+      }
+      const usedEventIds = new Set(eventTrack.keyframes.map(keyframe => keyframe.id));
+      for (let eventIndex = 0; eventIndex < rootEvents.length; eventIndex += 1) {
+        const rawEvent = rootEvents[eventIndex];
+        if (!isPlainObject(rawEvent)) continue;
+        const frame = Number.isFinite(Number(rawEvent.frame)) ? Number(rawEvent.frame) : 0;
+        const keyframe = cloneJson(rawEvent);
+        const value = isPlainObject(rawEvent.value)
+          ? cloneJson(rawEvent.value)
+          : {
+              name: typeof rawEvent.name === 'string' ? rawEvent.name : 'Event',
+              ...(hasOwn(rawEvent, 'payload') ? { payload: cloneJson(rawEvent.payload) } : {})
+            };
+        keyframe.id = typeof rawEvent.id === 'string' && rawEvent.id.trim()
+          ? rawEvent.id.trim()
+          : animationGeneratedId(`event-${frame}`, usedEventIds, `event-${eventIndex + 1}`);
+        usedEventIds.add(keyframe.id);
+        keyframe.frame = frame;
+        keyframe.value = value;
+        delete keyframe.name;
+        delete keyframe.payload;
+        eventTrack.keyframes.push(keyframe);
+      }
+      eventTrack.keyframes.sort((left, right) => left.frame - right.frame);
+    }
+    if (Array.isArray(source.events)) delete output.events;
+    return output;
+  }
+
+  function normalizeAnimationClips(input, options = {}) {
+    const source = Array.isArray(input) ? input : [];
+    const entries = source
+      .map((clip, index) => ({ clip, index }))
+      .filter(entry => isPlainObject(entry.clip));
+    const reservedIds = new Set(entries
+      .map(entry => typeof entry.clip.id === 'string' ? entry.clip.id.trim() : '')
+      .filter(Boolean));
+    const usedIds = new Set(reservedIds);
+    return entries.map(({ clip: rawClip, index }) => {
+      const clip = normalizeAnimationClip(rawClip, { ...options, index });
+      const hasExplicitId = typeof rawClip.id === 'string' && Boolean(rawClip.id.trim());
+      if (!hasExplicitId) {
+        clip.id = animationGeneratedId(clip.id, usedIds, `animation-${index + 1}`);
+      }
+      return clip;
+    });
+  }
+
+  function animationEase(value, easing) {
+    const t = Math.max(0, Math.min(1, value));
+    if (easing === 'ease-in') return t * t;
+    if (easing === 'ease-out') return 1 - ((1 - t) * (1 - t));
+    if (easing === 'ease-in-out') return t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2;
+    return t;
+  }
+
+  function interpolateAnimationValue(type, left, right, amount) {
+    const t = animationEase(amount, left.easing);
+    if (type === 'rotation') {
+      if (Number.isFinite(Number(left.value)) && Number.isFinite(Number(right.value))) {
+        return Number(left.value) + (Number(right.value) - Number(left.value)) * t;
+      }
+      if (isPlainObject(left.value) && isPlainObject(right.value) && Number.isFinite(Number(left.value.rotation)) && Number.isFinite(Number(right.value.rotation))) {
+        return { ...cloneJson(left.value), rotation: Number(left.value.rotation) + (Number(right.value.rotation) - Number(left.value.rotation)) * t };
+      }
+    }
+    if (type === 'position' && isPlainObject(left.value) && isPlainObject(right.value)) {
+      const value = cloneJson(left.value);
+      for (const axis of ['x', 'y']) {
+        if (Number.isFinite(Number(left.value[axis])) && Number.isFinite(Number(right.value[axis]))) {
+          value[axis] = Number(left.value[axis]) + (Number(right.value[axis]) - Number(left.value[axis])) * t;
+        }
+      }
+      return value;
+    }
+    return cloneJson(left.value);
+  }
+
+  function sampleAnimationClip(input, timeOrFrame = 0, options = {}) {
+    const clip = normalizeAnimationClip(input, options.index || 0);
+    const fps = clip.fps;
+    const frameCount = clip.frameCount;
+    const duration = frameCount / fps;
+    const requested = Number.isFinite(Number(timeOrFrame)) ? Number(timeOrFrame) : 0;
+    const rawFrame = options.unit === 'frame' ? requested : requested * fps;
+    const shouldLoop = options.loop == null ? clip.loop : Boolean(options.loop);
+    const sampleFrame = shouldLoop
+      ? ((rawFrame % frameCount) + frameCount) % frameCount
+      : Math.max(0, Math.min(frameCount - 1, rawFrame));
+    const sampleTime = options.unit === 'frame'
+      ? sampleFrame / fps
+      : (shouldLoop ? sampleFrame / fps : Math.max(0, Math.min(duration, requested)));
+    const sampledTracks = [];
+    const events = [];
+    const values = {};
+    for (const track of clip.tracks) {
+      const keyframes = track.keyframes.filter(keyframe => Number.isFinite(keyframe.frame));
+      if (!keyframes.length) continue;
+      if (track.type === 'event') {
+        for (const keyframe of keyframes.filter(item => Math.abs(item.frame - sampleFrame) <= 1e-7)) {
+          const value = cloneJson(keyframe.value);
+          events.push({
+            trackId: track.id,
+            keyframeId: keyframe.id,
+            targetEntityId: track.targetEntityId || clip.targetEntityId || null,
+            frame: keyframe.frame,
+            time: keyframe.frame / fps,
+            value,
+            ...(isPlainObject(value) && typeof value.name === 'string' ? { name: value.name } : {}),
+            ...(isPlainObject(value) && hasOwn(value, 'payload') ? { payload: cloneJson(value.payload) } : {})
+          });
+        }
+      }
+      let left = null;
+      let right = null;
+      for (const keyframe of keyframes) {
+        if (keyframe.frame <= sampleFrame) left = keyframe;
+        else { right = keyframe; break; }
+      }
+      if (!left) continue;
+      if (track.type === 'event' && Math.abs(left.frame - sampleFrame) > 1e-7) continue;
+      const interpolation = String(track.interpolation || (track.type === 'position' || track.type === 'rotation' ? 'linear' : 'step')).toLowerCase();
+      let value = cloneJson(left.value);
+      if (interpolation !== 'step' && right && right.frame > left.frame && (track.type === 'position' || track.type === 'rotation')) {
+        value = interpolateAnimationValue(track.type, left, right, (sampleFrame - left.frame) / (right.frame - left.frame));
+      }
+      const sampled = {
+        trackId: track.id,
+        type: track.type,
+        targetEntityId: track.targetEntityId || clip.targetEntityId || null,
+        interpolation,
+        keyframeId: left.id,
+        value
+      };
+      sampledTracks.push(sampled);
+      defineJsonProperty(values, track.id, cloneJson(value));
+    }
+    return {
+      clipId: clip.id,
+      time: sampleTime,
+      frame: sampleFrame,
+      frameIndex: Math.min(frameCount - 1, Math.floor(sampleFrame)),
+      duration,
+      tracks: sampledTracks,
+      events,
+      values
+    };
+  }
+
+  function animationKnownEntityIds(document) {
+    const ids = new Set();
+    for (const collection of animationEntityCollections(document)) {
+      for (const entity of collection.entities) if (typeof entity?.id === 'string') ids.add(entity.id);
+    }
+    return ids;
+  }
+
+  function animationLegacyDiagnostic(output, strict, message, pointer, details) {
+    output.push(diagnostic(strict ? 'E_ANIMATION_LEGACY' : 'W_ANIMATION_LEGACY', message, pointer, details, strict ? 'error' : 'warning'));
+  }
+
+  function animationFiniteNumber(value, strict) {
+    if (typeof value === 'number') return Number.isFinite(value);
+    return !strict && typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value));
+  }
+
+  function animationInteger(value, strict) {
+    if (typeof value === 'number') return Number.isInteger(value);
+    return !strict && typeof value === 'string' && value.trim() !== '' && Number.isInteger(Number(value));
+  }
+
+  function validateAnimationValue(type, value, pointer, output, strict) {
+    output.push(...jsonSafetyDiagnostics(value, pointer));
+    if (type === 'position') {
+      if (!isPlainObject(value) || !animationFiniteNumber(value.x, strict) || !animationFiniteNumber(value.y, strict)) {
+        output.push(diagnostic('E_ANIMATION_POSITION_VALUE', 'Position keyframe value must contain finite x and y numbers', pointer));
+      }
+    } else if (type === 'rotation') {
+      const valid = animationFiniteNumber(value, strict) || (isPlainObject(value) && animationFiniteNumber(value.rotation, strict));
+      if (!valid) output.push(diagnostic('E_ANIMATION_ROTATION_VALUE', 'Rotation keyframe value must be a finite number or an object with finite rotation', pointer));
+    } else if (type === 'sprite') {
+      if (!isPlainObject(value)) output.push(diagnostic('E_ANIMATION_SPRITE_VALUE', 'Sprite keyframe value must be an object', pointer));
+      else {
+        const frameKey = hasOwn(value, 'frame') ? 'frame' : (hasOwn(value, 'spriteFrame') ? 'spriteFrame' : null);
+        if (frameKey && (!animationInteger(value[frameKey], strict) || Number(value[frameKey]) < 0)) {
+          output.push(diagnostic('E_ANIMATION_SPRITE_FRAME', 'Sprite frame must be a non-negative integer', joinPointer(pointer, frameKey)));
+        }
+        if (value.sourceRect != null) {
+          const rect = value.sourceRect;
+          if (!isPlainObject(rect) || !animationFiniteNumber(rect.x, strict) || !animationFiniteNumber(rect.y, strict) || !animationFiniteNumber(rect.width, strict) || Number(rect.width) <= 0 || !animationFiniteNumber(rect.height, strict) || Number(rect.height) <= 0) {
+            output.push(diagnostic('E_ANIMATION_SOURCE_RECT', 'sourceRect must contain finite x/y and positive width/height', joinPointer(pointer, 'sourceRect')));
+          }
+        }
+      }
+    } else if (type === 'event') {
+      if (!isPlainObject(value) || typeof value.name !== 'string' || !value.name.trim()) output.push(diagnostic('E_ANIMATION_EVENT_VALUE', 'Event keyframe value must have a non-empty name', pointer));
+    } else if (type === 'hitbox') {
+      if (!isPlainObject(value)) output.push(diagnostic('E_ANIMATION_HITBOX_VALUE', 'Hitbox keyframe value must be an object', pointer));
+      else if (value.colliderId != null && (typeof value.colliderId !== 'string' || !value.colliderId.trim())) output.push(diagnostic('E_ANIMATION_HITBOX_ID', 'Hitbox colliderId must be a non-empty string', joinPointer(pointer, 'colliderId')));
+    }
+  }
+
+  function animationEntityCollections(document) {
+    if (!isPlainObject(document) || document.format === 'AH2D.Animation') return [];
+    const collections = [];
+    if (Array.isArray(document.scenes)) {
+      document.scenes.forEach((scene, sceneIndex) => collections.push({
+        entities: Array.isArray(scene?.objects) ? scene.objects : [],
+        pointer: `/scenes/${sceneIndex}/objects`
+      }));
+    } else if (Array.isArray(document.entities)) collections.push({ entities: document.entities, pointer: '/entities' });
+    else if (Array.isArray(document.scene)) collections.push({ entities: document.scene, pointer: '/scene' });
+    for (let prefabIndex = 0; prefabIndex < (Array.isArray(document.prefabs) ? document.prefabs.length : 0); prefabIndex += 1) {
+      const prefab = document.prefabs[prefabIndex];
+      collections.push({
+        entities: Array.isArray(prefab?.entities) ? prefab.entities : [],
+        pointer: `/prefabs/${prefabIndex}/entities`
+      });
+    }
+    return collections;
+  }
+
+  function validateAnimationComponentReferences(document, clipIds, clipNames, output, options = {}) {
+    const strict = Boolean(options.strict);
+    const codec = options.entityCodec instanceof EntityCodec ? options.entityCodec : createDefaultEntityCodec();
+    for (const collection of animationEntityCollections(document)) {
+      collection.entities.forEach((entity, entityIndex) => {
+        if (!isPlainObject(entity)) return;
+        let resolved;
+        try { resolved = codec.resolve(entity, 'Animation'); }
+        catch (_) { return; }
+        if (!resolved.found || !isPlainObject(resolved.value)) return;
+        const animation = resolved.value;
+        const pointer = `${collection.pointer}/${entityIndex}${pointerForStorage(resolved.storage)}`;
+        const clipId = typeof animation.clipId === 'string' ? animation.clipId.trim() : '';
+        const legacyClip = typeof animation.clip === 'string' ? animation.clip.trim() : '';
+        if (clipId) {
+          if (!clipIds.has(clipId)) output.push(diagnostic(
+            'E_ANIMATION_CLIP_REFERENCE',
+            `Animation Clip does not exist: ${clipId}`,
+            joinPointer(pointer, 'clipId'),
+            { clipId }
+          ));
+          return;
+        }
+        if (legacyClip) {
+          const idMatch = clipIds.has(legacyClip);
+          const nameMatches = clipNames.get(legacyClip.toLocaleLowerCase()) || [];
+          if (!idMatch && nameMatches.length !== 1) {
+            output.push(diagnostic(
+              strict ? 'E_ANIMATION_CLIP_REFERENCE' : 'W_ANIMATION_COMPONENT_LEGACY',
+              nameMatches.length > 1 ? `Legacy Animation Clip name is ambiguous: ${legacyClip}` : `Legacy Animation component does not resolve a Clip asset: ${legacyClip}`,
+              joinPointer(pointer, 'clip'),
+              { clip: legacyClip, matches: nameMatches.length },
+              strict ? 'error' : 'warning'
+            ));
+          } else {
+            output.push(diagnostic(
+              strict ? 'E_ANIMATION_COMPONENT_LEGACY' : 'W_ANIMATION_COMPONENT_LEGACY',
+              'Animation.clip is legacy; use the stable Animation.clipId field',
+              joinPointer(pointer, 'clip'),
+              { clip: legacyClip },
+              strict ? 'error' : 'warning'
+            ));
+          }
+          return;
+        }
+        output.push(diagnostic(
+          strict ? 'E_ANIMATION_COMPONENT_CLIP' : 'W_ANIMATION_COMPONENT_LEGACY',
+          'Animation component has no clipId and will run only as a legacy clock',
+          pointer,
+          undefined,
+          strict ? 'error' : 'warning'
+        ));
+      });
+    }
+  }
+
+  function validateAnimationDocument(document, options = {}) {
+    const output = [];
+    const strict = Boolean(options.strict);
+    // Runtime ECS snapshots intentionally carry only concrete Entity state.
+    // Animation components retain their stable clipId so a Play snapshot can
+    // reconnect to the authoring library on restore, but the reusable Clip
+    // definitions themselves are not part of the lossy snapshot contract.
+    const definitionFreeEcsSnapshot = isPlainObject(document) &&
+      Number(document.version) === 3 && Array.isArray(document.entities) &&
+      document.animations == null;
+    let animations;
+    let basePointer = '/animations';
+    if (Array.isArray(document)) animations = document;
+    else if (isPlainObject(document) && document.format === 'AH2D.Animation') { animations = [document]; basePointer = ''; }
+    else if (isPlainObject(document)) animations = document.animations == null ? [] : document.animations;
+    else return [diagnostic('E_ANIMATION_DOCUMENT', 'Animation document must be a plain object or array', '')];
+    if (!Array.isArray(animations)) return [diagnostic('E_ANIMATIONS_TYPE', 'animations must be an array', basePointer)];
+    const clipIds = new Map();
+    const clipNames = new Map();
+    const hasEntityContext = isPlainObject(document) && document.format !== 'AH2D.Animation';
+    const knownEntityIds = hasEntityContext ? animationKnownEntityIds(document) : new Set();
+    animations.forEach((clip, clipIndex) => {
+      const pointer = basePointer ? joinPointer(basePointer, clipIndex) : '';
+      if (!isPlainObject(clip)) { output.push(diagnostic('E_ANIMATION_CLIP_TYPE', 'Animation Clip must be a plain object', pointer)); return; }
+      output.push(...jsonSafetyDiagnostics(clip, pointer));
+      const id = typeof clip.id === 'string' ? clip.id.trim() : '';
+      if (!id) animationLegacyDiagnostic(output, strict, 'Legacy Animation Clip has no stable id', joinPointer(pointer, 'id'));
+      else if (clipIds.has(id)) output.push(diagnostic('E_ANIMATION_CLIP_ID_DUPLICATE', `Duplicate Animation Clip id: ${id}`, joinPointer(pointer, 'id'), { firstPointer: clipIds.get(id) }));
+      else clipIds.set(id, joinPointer(pointer, 'id'));
+      const name = typeof clip.name === 'string' ? clip.name.trim() : '';
+      if (!name) output.push(diagnostic('E_ANIMATION_CLIP_NAME', 'Animation Clip name must be a non-empty string', joinPointer(pointer, 'name')));
+      else {
+        const folded = name.toLocaleLowerCase();
+        const matches = clipNames.get(folded) || [];
+        if (matches.length) output.push(diagnostic(strict ? 'E_ANIMATION_CLIP_NAME_DUPLICATE' : 'W_ANIMATION_CLIP_NAME_DUPLICATE', `Duplicate Animation Clip name: ${name}`, joinPointer(pointer, 'name'), { firstPointer: matches[0] }, strict ? 'error' : 'warning'));
+        matches.push(joinPointer(pointer, 'name'));
+        clipNames.set(folded, matches);
+      }
+      if (!animationFiniteNumber(clip.fps, strict) || Number(clip.fps) <= 0) output.push(diagnostic('E_ANIMATION_FPS', 'Animation Clip fps must be a number greater than zero', joinPointer(pointer, 'fps')));
+      let frameCount = clip.frameCount;
+      if (frameCount == null && clip.frames != null && !Array.isArray(clip.frames)) {
+        frameCount = clip.frames;
+        animationLegacyDiagnostic(output, strict, 'Legacy frames field must be migrated to frameCount', joinPointer(pointer, 'frames'));
+      }
+      if (!animationInteger(frameCount, strict) || Number(frameCount) < 1) output.push(diagnostic('E_ANIMATION_FRAME_COUNT', 'Animation Clip frameCount must be a positive integer', joinPointer(pointer, clip.frameCount == null ? 'frames' : 'frameCount')));
+      else frameCount = Number(frameCount);
+      if (typeof clip.loop !== 'boolean') output.push(diagnostic('E_ANIMATION_LOOP', 'Animation Clip loop must be boolean', joinPointer(pointer, 'loop')));
+      if (clip.speed != null && !animationFiniteNumber(clip.speed, strict)) output.push(diagnostic('E_ANIMATION_SPEED', 'Animation Clip speed must be a finite number', joinPointer(pointer, 'speed')));
+      if (clip.targetEntityId != null) {
+        if (typeof clip.targetEntityId !== 'string' || !clip.targetEntityId.trim()) output.push(diagnostic('E_ANIMATION_TARGET_ID', 'targetEntityId must be a non-empty string', joinPointer(pointer, 'targetEntityId')));
+        else if (hasEntityContext && !knownEntityIds.has(clip.targetEntityId)) output.push(diagnostic('E_ANIMATION_TARGET_MISSING', `Animation target Entity does not exist: ${clip.targetEntityId}`, joinPointer(pointer, 'targetEntityId')));
+      }
+      let tracks = clip.tracks;
+      if (!Array.isArray(tracks)) {
+        if (Array.isArray(clip.events) || clip.frames != null) {
+          animationLegacyDiagnostic(output, strict, 'Legacy Animation Clip must be migrated to tracks', joinPointer(pointer, 'tracks'));
+          tracks = [];
+        } else {
+          output.push(diagnostic('E_ANIMATION_TRACKS', 'Animation Clip tracks must be an array', joinPointer(pointer, 'tracks')));
+          tracks = [];
+        }
+      }
+      if (Array.isArray(clip.events)) animationLegacyDiagnostic(output, strict, 'Legacy root events must be migrated to an event track', joinPointer(pointer, 'events'));
+      const trackIds = new Map();
+      tracks.forEach((track, trackIndex) => {
+        const trackPointer = joinPointer(joinPointer(pointer, 'tracks'), trackIndex);
+        if (!isPlainObject(track)) { output.push(diagnostic('E_ANIMATION_TRACK_TYPE', 'Animation track must be a plain object', trackPointer)); return; }
+        const trackId = typeof track.id === 'string' ? track.id.trim() : '';
+        if (!trackId) animationLegacyDiagnostic(output, strict, 'Legacy Animation track has no stable id', joinPointer(trackPointer, 'id'));
+        else if (trackIds.has(trackId)) output.push(diagnostic('E_ANIMATION_TRACK_ID_DUPLICATE', `Duplicate Animation track id: ${trackId}`, joinPointer(trackPointer, 'id'), { firstPointer: trackIds.get(trackId) }));
+        else trackIds.set(trackId, joinPointer(trackPointer, 'id'));
+        const authoredType = typeof track.type === 'string' ? track.type.trim() : '';
+        const type = authoredType.toLowerCase();
+        if (!authoredType) output.push(diagnostic('E_ANIMATION_TRACK_KIND', 'Animation track type must be a non-empty string', joinPointer(trackPointer, 'type')));
+        if (track.interpolation != null && typeof track.interpolation !== 'string') output.push(diagnostic('E_ANIMATION_INTERPOLATION', 'Animation track interpolation must be a string', joinPointer(trackPointer, 'interpolation')));
+        if (track.targetEntityId != null) {
+          if (typeof track.targetEntityId !== 'string' || !track.targetEntityId.trim()) output.push(diagnostic('E_ANIMATION_TARGET_ID', 'targetEntityId must be a non-empty string', joinPointer(trackPointer, 'targetEntityId')));
+          else if (hasEntityContext && !knownEntityIds.has(track.targetEntityId)) output.push(diagnostic('E_ANIMATION_TARGET_MISSING', `Animation target Entity does not exist: ${track.targetEntityId}`, joinPointer(trackPointer, 'targetEntityId')));
+        }
+        if (!Array.isArray(track.keyframes)) { output.push(diagnostic('E_ANIMATION_KEYFRAMES', 'Animation track keyframes must be an array', joinPointer(trackPointer, 'keyframes'))); return; }
+        const keyIds = new Map();
+        const frameKeys = new Map();
+        track.keyframes.forEach((keyframe, keyframeIndex) => {
+          const keyPointer = joinPointer(joinPointer(trackPointer, 'keyframes'), keyframeIndex);
+          if (!isPlainObject(keyframe)) { output.push(diagnostic('E_ANIMATION_KEYFRAME_TYPE', 'Animation keyframe must be a plain object', keyPointer)); return; }
+          const keyId = typeof keyframe.id === 'string' ? keyframe.id.trim() : '';
+          if (!keyId) animationLegacyDiagnostic(output, strict, 'Legacy Animation keyframe has no stable id', joinPointer(keyPointer, 'id'));
+          else if (keyIds.has(keyId)) output.push(diagnostic('E_ANIMATION_KEYFRAME_ID_DUPLICATE', `Duplicate Animation keyframe id: ${keyId}`, joinPointer(keyPointer, 'id'), { firstPointer: keyIds.get(keyId) }));
+          else keyIds.set(keyId, joinPointer(keyPointer, 'id'));
+          const frameValid = animationInteger(keyframe.frame, strict);
+          const frame = Number(keyframe.frame);
+          if (!frameValid || frame < 0 || (Number.isInteger(frameCount) && frame >= frameCount)) {
+            output.push(diagnostic('E_ANIMATION_KEYFRAME_FRAME', `Keyframe frame must be an integer between 0 and ${Math.max(0, Number(frameCount) - 1)}`, joinPointer(keyPointer, 'frame')));
+          } else if (type !== 'event' && frameKeys.has(frame)) {
+            output.push(diagnostic('E_ANIMATION_KEYFRAME_FRAME_DUPLICATE', `Track already has a keyframe at frame ${frame}`, joinPointer(keyPointer, 'frame'), { firstPointer: frameKeys.get(frame) }));
+          } else frameKeys.set(frame, joinPointer(keyPointer, 'frame'));
+          if (keyframe.easing != null && typeof keyframe.easing !== 'string') output.push(diagnostic('E_ANIMATION_EASING', 'Animation keyframe easing must be a string', joinPointer(keyPointer, 'easing')));
+          if (!hasOwn(keyframe, 'value')) output.push(diagnostic('E_ANIMATION_KEYFRAME_VALUE', 'Animation keyframe value is required', joinPointer(keyPointer, 'value')));
+          else validateAnimationValue(type, keyframe.value, joinPointer(keyPointer, 'value'), output, strict);
+        });
+      });
+    });
+    if (!definitionFreeEcsSnapshot) {
+      validateAnimationComponentReferences(document, clipIds, clipNames, output, options);
+    }
+    return output;
+  }
+
+  function assertAnimationDocument(document, options = {}) {
+    const diagnostics = validateAnimationDocument(document, options);
+    const errors = diagnostics.filter(item => item.severity === 'error');
+    if (errors.length) {
+      const first = errors[0];
+      throw new ComponentSchemaError(first.code, first.message, { pointer: first.pointer, details: first.details, diagnostics });
+    }
+    return diagnostics;
+  }
 
   function profileName(value) {
     const profile = value || PROFILES.AUTHORING;
@@ -730,7 +1247,7 @@
     { type: 'Camera', schemas: COMPONENT_SCHEMAS.Camera, defaults: {} },
     { type: 'Light', schemas: COMPONENT_SCHEMAS.Light, defaults: {} },
     { type: 'ShadowCaster', schemas: COMPONENT_SCHEMAS.ShadowCaster, defaults: {} },
-    { type: 'Animation', schemas: COMPONENT_SCHEMAS.Animation, defaults: {} },
+    { type: 'Animation', schemas: COMPONENT_SCHEMAS.Animation, defaults: {}, runtimeOnlyFields: ['frame', 'sampledHitboxes', 'completed'] },
     { type: 'Tilemap', schemas: COMPONENT_SCHEMAS.Tilemap, defaults: {} },
     { type: 'ParticleEmitter', schemas: COMPONENT_SCHEMAS.ParticleEmitter, defaults: {} },
     { type: 'BoxCollider', schemas: COMPONENT_SCHEMAS.BoxCollider, defaults: context => colliderDefaults(context, 'box'), normalize: normalizeCollider, runtimeOnlyFields: ['source', '*.source', 'colliders.*.source', 'shapes.*.source'] },
@@ -1800,6 +2317,9 @@
   deepFreeze(PROFILE_SCHEMAS);
   deepFreeze(ENTITY_SCHEMA);
   deepFreeze(PREFAB_ASSET_SCHEMA);
+  deepFreeze(ANIMATION_KEYFRAME_SCHEMA);
+  deepFreeze(ANIMATION_TRACK_SCHEMA);
+  deepFreeze(ANIMATION_CLIP_SCHEMA);
   deepFreeze(JSON_SCHEMAS);
 
   return Object.freeze({
@@ -1809,6 +2329,7 @@
     PROFILES,
     PROFILE_NAMES,
     COMPONENT_NAME_PATTERN,
+    ANIMATION_TRACK_TYPES,
     ComponentSchemaError,
     ComponentSchemaRegistry,
     EntityCodec,
@@ -1819,6 +2340,9 @@
     COMPONENT_MAP_SCHEMA,
     ENTITY_SCHEMA,
     PREFAB_ASSET_SCHEMA,
+    ANIMATION_KEYFRAME_SCHEMA,
+    ANIMATION_TRACK_SCHEMA,
+    ANIMATION_CLIP_SCHEMA,
     JSON_SCHEMAS,
     PREFAB_OVERRIDE_OPERATIONS,
     isSafeComponentName,
@@ -1830,6 +2354,11 @@
     applyPrefabOverrideOperation,
     validatePrefabDocument,
     assertPrefabDocument,
+    normalizeAnimationClip,
+    normalizeAnimationClips,
+    sampleAnimationClip,
+    validateAnimationDocument,
+    assertAnimationDocument,
     createDefaultComponentRegistry,
     createDefaultEntityCodec
   });

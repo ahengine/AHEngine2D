@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const {
   DATA_MODEL_ID, DATA_MODEL_VERSION, COMPONENT_SCHEMA_VERSION, PROFILE_NAMES,
   ComponentSchemaError, EntityCodec, createDefaultComponentRegistry, applyJsonPointerOperation, applyPrefabOverrideOperation, validatePrefabDocument,
-  parseJsonPointer, prefabOverridePathAllowed, jsonPointerLookup, PREFAB_ASSET_SCHEMA
+  validateAnimationDocument, parseJsonPointer, prefabOverridePathAllowed, jsonPointerLookup, PREFAB_ASSET_SCHEMA, ANIMATION_CLIP_SCHEMA
 } = require('../AH2DDataModel.js');
 
 const PROTOCOL = 'ah2d.cli/v1';
@@ -347,6 +347,7 @@ function validateDocument(document, options = {}) {
     }
   }
   validatePrefabContract(document, diagnostics, options);
+  diagnostics.push(...validateAnimationDocument(document, { strict: Boolean(options.strict), entityCodec }));
   for (const key of ['assets', 'folders', 'prefab', 'prefabs', 'animations', 'particles']) if (document[key] != null && !Array.isArray(document[key])) diagnostics.push(diagnostic('error', 'E_RESOURCE_ARRAY', `${key} must be an array`, `/${key}`));
   return diagnostics;
 }
@@ -1627,7 +1628,7 @@ function documentHash(value) {
 module.exports = {
   PROTOCOL, PROJECT_VERSION, RUNTIMES, PHYSICS_BACKENDS, PHYSICS_IMPLEMENTATIONS, BODY_TYPES, COLLIDER_SHAPES, EXIT, DomainError,
   DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES: PROFILE_NAMES, componentRegistry, entityCodec,
-  PREFAB_ASSET_SCHEMA,
+  PREFAB_ASSET_SCHEMA, ANIMATION_CLIP_SCHEMA,
   clone, generateId, detectDialect, createProject, createDefaultPostProcess, migrateDocument, syncActiveMirror,
   validateDocument, assertValid, resolveScene, resolveEntity, entityName,
   applyOperations, applyJsonPatch, mergePatch, setPath, getPointer,

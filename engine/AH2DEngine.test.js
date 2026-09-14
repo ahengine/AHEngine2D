@@ -1810,6 +1810,9 @@ const createFakePixi = ({ asyncInit = false, initDeferred = null, assetDeferred 
       Object.assign(this, { a, b, c, d, tx, ty });
     }
   }
+  class Rectangle {
+    constructor(x = 0, y = 0, width = 0, height = 0) { Object.assign(this, { x, y, width, height }); }
+  }
   class Container {
     constructor() {
       this.children = [];
@@ -1894,10 +1897,15 @@ const createFakePixi = ({ asyncInit = false, initDeferred = null, assetDeferred 
       constructor(options) { this.initOptions = options; setupApplication(this, options); applications.push(this); }
     };
   }
-  const Texture = {
-    WHITE: { id: 'white' },
-    from(source) { return { id: String(source) }; }
-  };
+  class Texture {
+    constructor(options = {}) {
+      if (options && options.source) Object.assign(this, options);
+      else this.source = options;
+    }
+    destroy() { this.destroyed = true; }
+    static from(source) { return new Texture({ source: { id: String(source) }, id: String(source) }); }
+  }
+  Texture.WHITE = new Texture({ source: { id: 'white' }, id: 'white' });
   const Assets = {
     get(key) { return assetCache?.get(key) || null; },
     load(source) {
@@ -1906,7 +1914,7 @@ const createFakePixi = ({ asyncInit = false, initDeferred = null, assetDeferred 
       return assetDeferred ? assetDeferred.promise : Promise.resolve({ id: String(source) });
     }
   };
-  return { Application, Container, Sprite, Graphics, Matrix, Texture, Assets, applications, assetLoads };
+  return { Application, Container, Sprite, Graphics, Matrix, Rectangle, Texture, Assets, applications, assetLoads };
 };
 
 const fakeHost = (width = 960, height = 600) => ({
@@ -2109,6 +2117,45 @@ const testPixiRuntimeMutationsAndAssetStaleness = async () => {
   assert.strictEqual(runtime.nodes.size, 0);
   assert.strictEqual(runtime.textureLoads.size, 0, 'unmount must release the adapter pending-load registry');
   assert.deepStrictEqual(host.children, []);
+};
+
+const testPixiSourceRectSubtextures = () => {
+  const PIXI = createFakePixi();
+  const baseTexture = PIXI.Texture.from('/sprites/actor.png');
+  const engine = new AH2D.Engine({
+    runtime: 'pixijs', physics: 'builtin',
+    runtimeOptions: { PIXI, loadAssets: false, textureResolver: () => baseTexture }
+  });
+  engine.load({ scene: [{ id: 'animated-sprite', components: { Renderable: {
+    imageSrc: '/sprites/actor.png', sourceRect: { x: 0, y: 16, width: 32, height: 24 }
+  } } }] });
+  engine.start(fakeHost(), { restoreOnStop: false });
+  const runtime = engine.runtime;
+  const record = runtime.nodes.get('animated-sprite');
+  const firstTexture = record.visual.texture;
+  const firstKey = record.sourceKey;
+  assert.notStrictEqual(firstTexture, baseTexture);
+  assert.ok(firstTexture.frame instanceof PIXI.Rectangle);
+  assert.deepStrictEqual(
+    { x: firstTexture.frame.x, y: firstTexture.frame.y, width: firstTexture.frame.width, height: firstTexture.frame.height },
+    { x: 0, y: 16, width: 32, height: 24 }
+  );
+  assert.strictEqual(record.visual.width, 32);
+  assert.strictEqual(record.visual.height, 24);
+
+  engine.ecs.get('animated-sprite', 'Renderable').sourceRect.x = 32;
+  runtime.render();
+  const secondTexture = record.visual.texture;
+  assert.notStrictEqual(record.sourceKey, firstKey, 'sourceRect participates in the native texture cache key');
+  assert.notStrictEqual(secondTexture, firstTexture);
+  assert.strictEqual(firstTexture.destroyed, true, 'replaced adapter-owned subtextures are released');
+  assert.strictEqual(secondTexture.frame.x, 32);
+
+  delete engine.ecs.get('animated-sprite', 'Renderable').sourceRect;
+  runtime.render();
+  assert.strictEqual(record.visual.texture, baseTexture);
+  assert.strictEqual(secondTexture.destroyed, true);
+  engine.stop({ restore: false });
 };
 
 const testPixiLiveChildrenSurviveParentDeletion = () => {
@@ -2729,6 +2776,193 @@ const testPrefabArrayOverrideCoordinatesAndStalePromotion = () => {
   assert.strictEqual(entity(staleEngine, 'current').components.PrefabInstance.prefabRevision, 3);
 };
 
+const testRealAnimationClipsAndTimelineSampling = () => {
+  const clip = {
+    id: 'knight-run', name: 'Knight Run', fps: 10, frameCount: 4, loop: false,
+    tracks: [
+      { id: 'position', type: 'position', targetEntityId: 'body', keyframes: [
+        { id: 'position-0', frame: 0, value: { x: 0, y: 0 } },
+        { id: 'position-3', frame: 3, value: { x: 30, y: 6 } }
+      ] },
+      { id: 'rotation', type: 'rotation', targetEntityId: 'body', keyframes: [
+        { id: 'rotation-0', frame: 0, value: 0 },
+        { id: 'rotation-3', frame: 3, value: 90 }
+      ] },
+      { id: 'sprite', type: 'sprite', targetEntityId: 'body', keyframes: [
+        { id: 'sprite-0', frame: 0, value: { spriteFrame: 0 } },
+        { id: 'sprite-2', frame: 2, value: { frame: 2, sourceRect: { x: 64, y: 0, width: 32, height: 32 } } }
+      ] },
+      { id: 'hitbox', type: 'hitbox', targetEntityId: 'body', keyframes: [
+        { id: 'hitbox-1', frame: 1, value: { colliderId: 'attack', enabled: true, width: 18, height: 12 } }
+      ] },
+      { id: 'events', type: 'event', keyframes: [
+        { id: 'footstep-2', frame: 2, value: { name: 'Footstep', payload: { foot: 'left' } } }
+      ] }
+    ]
+  };
+  const objects = [
+    { id: 'root', components: { Animation: { clipId: 'knight-run', playing: true, time: 0, speed: 0, loop: false } } },
+    { id: 'body', parentId: 'root', components: { Transform: { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 }, Renderable: { frame: 0 } } }
+  ];
+  const document = {
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main', meta: { currentSceneId: 'main' },
+    prefabs: [], animations: [clip],
+    scenes: [{ id: 'main', name: 'Main', objects }], scene: JSON.parse(JSON.stringify(objects))
+  };
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  const events = [];
+  const completed = [];
+  engine.events.on('animation:event', event => events.push(event));
+  engine.events.on('animation:complete', event => completed.push(event));
+  engine.load(document);
+  assert.strictEqual(engine.animation.getClip('knight-run').name, 'Knight Run');
+  assert.strictEqual(engine.animation.getClip('Knight Run').id, 'knight-run');
+  const normalizedSpriteValue = engine.animation.getClip('knight-run').tracks.find(track => track.type === 'sprite').keyframes[0].value;
+  assert.strictEqual(normalizedSpriteValue.frame, 0, 'legacy Sprite frame aliases normalize before Runtime sampling');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(normalizedSpriteValue, 'spriteFrame'), false, 'Runtime Clip data stays canonical');
+
+  const legacyLibrary = new AH2D.AnimationSystem(engine);
+  legacyLibrary.load([
+    { name: 'Walk Left', fps: 12, frames: 2, loop: true, events: [] },
+    { name: 'Walk-Left', fps: 12, frames: 2, loop: true, events: [] },
+    { name: 'Walk Left', fps: 12, frames: 2, loop: true, events: [] }
+  ]);
+  assert.deepStrictEqual([...legacyLibrary.clips.keys()], ['walk-left', 'walk-left-2', 'walk-left-3']);
+  assert.strictEqual(legacyLibrary.resolve('Walk Left'), null, 'duplicate legacy display names remain intentionally ambiguous');
+
+  engine.update(0.2);
+  assert.strictEqual(engine.ecs.get('root', 'Animation').time, 0, 'speed zero must freeze playback');
+  assert.strictEqual(engine.ecs.get('body', 'Renderable').frame, 0);
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(engine.ecs.get('body', 'Renderable'), 'spriteFrame'), false);
+  engine.ecs.get('root', 'Animation').speed = 1;
+  engine.update(0.15);
+  near(engine.ecs.get('body', 'Transform').x, 15);
+  near(engine.ecs.get('body', 'Transform').y, 3);
+  near(engine.ecs.get('body', 'Transform').rotation, 45);
+  assert.strictEqual(engine.ecs.get('root', 'Animation').sampledHitboxes[0].colliderId, 'attack');
+  engine.update(0.1);
+  assert.strictEqual(events.length, 1, 'a crossed event must fire exactly once');
+  assert.strictEqual(events[0].name, 'Footstep');
+  assert.strictEqual(events[0].payload.foot, 'left');
+  assert.strictEqual(events[0].hitboxes[0].colliderId, 'attack');
+  assert.strictEqual(engine.ecs.get('body', 'Renderable').frame, 2, 'sprite tracks use step sampling');
+
+  engine.animation.setFrame('root', 3);
+  near(engine.ecs.get('body', 'Transform').x, 30);
+  near(engine.ecs.get('body', 'Transform').rotation, 90);
+  assert.strictEqual(events.length, 1, 'seeking must not emit timeline events by default');
+  engine.animation.play('root');
+  engine.update(0.25);
+  const animation = engine.ecs.get('root', 'Animation');
+  assert.strictEqual(animation.playing, false);
+  assert.strictEqual(animation.completed, true);
+  assert.strictEqual(animation.time, 0.4);
+  assert.strictEqual(animation.frame, 3);
+  assert.strictEqual(completed.length, 1);
+
+  animation.loop = true;
+  animation.playing = true;
+  animation.completed = false;
+  animation.time = 0.35;
+  engine.update(0.1);
+  near(animation.time, 0.05);
+  assert.strictEqual(animation.playing, true, 'looping playback must remain active');
+
+  const playSnapshot = engine.captureSnapshot();
+  const capturedAnimationTime = engine.ecs.get('root', 'Animation').time;
+  assert.strictEqual(playSnapshot.runtime.animations, undefined, 'runtime ECS snapshots remain definition-free');
+  engine.animation.load([]);
+  assert.doesNotThrow(
+    () => engine.restoreSnapshot(playSnapshot),
+    'restoring an animated Play snapshot must accept definition-free runtime data'
+  );
+  assert.strictEqual(engine.animation.getClip('knight-run').name, 'Knight Run', 'snapshot restore must reconnect the authoring clip library');
+  assert.strictEqual(engine.document.animations[0].id, 'knight-run', 'snapshot restore must preserve authored Animation Clips');
+  near(engine.ecs.get('root', 'Animation').time, capturedAnimationTime);
+
+  const bridgeEngine = new AH2D.Engine({ physics: 'builtin' });
+  const bridge = new AH2D.EditorBridge(bridgeEngine);
+  assert.strictEqual(bridge.sync({ scene: objects, animations: [clip] }), true);
+  assert.strictEqual(bridgeEngine.animation.getClip('knight-run').frameCount, 4);
+  assert.strictEqual(bridge.sync({ scene: objects, animations: [clip] }), false, 'Animation Clips participate in bridge change detection');
+};
+
+const testAnimationEventBoundariesAndPrefabTargetResolution = () => {
+  const clip = {
+    id: 'event-boundaries', name: 'Event Boundaries', fps: 10, frameCount: 4, loop: false,
+    tracks: [
+      { id: 'hitbox', type: 'hitbox', keyframes: [
+        { id: 'hitbox-old', frame: 0, value: { colliderId: 'old', enabled: true } },
+        { id: 'hitbox-new', frame: 2, value: { colliderId: 'new', enabled: true } }
+      ] },
+      { id: 'events', type: 'event', keyframes: [
+        { id: 'start', frame: 0, value: { name: 'Start' } },
+        { id: 'middle', frame: 1, value: { name: 'Middle' } },
+        { id: 'late', frame: 3, value: { name: 'Late' } }
+      ] }
+    ]
+  };
+  const objects = [{ id: 'animated', components: { Animation: { clipId: clip.id, playing: true, time: 0, loop: false } } }];
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  const events = [];
+  engine.events.on('animation:event', event => events.push(event));
+  engine.load({
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main', prefabs: [], animations: [clip],
+    scenes: [{ id: 'main', name: 'Main', objects }], scene: JSON.parse(JSON.stringify(objects))
+  });
+
+  engine.update(0.25);
+  assert.deepStrictEqual(events.map(event => event.name), ['Middle']);
+  assert.strictEqual(events[0].hitboxes[0].colliderId, 'old', 'an event samples hitboxes at its own occurrence');
+  assert.strictEqual(engine.ecs.get('animated', 'Animation').sampledHitboxes[0].colliderId, 'new', 'the visible pose remains sampled at the update endpoint');
+  engine.update(0.1);
+  assert.deepStrictEqual(events.map(event => event.name), ['Middle', 'Late']);
+  assert.deepStrictEqual(events.map(event => event.hitboxes[0].colliderId), ['old', 'new']);
+  engine.update(0.1);
+  assert.strictEqual(events.some(event => event.name === 'Start'), false, 'a non-loop frame-zero event must not fire at completion');
+
+  const animation = engine.ecs.get('animated', 'Animation');
+  animation.loop = true;
+  animation.playing = true;
+  animation.completed = false;
+  animation.time = 0.35;
+  events.length = 0;
+  engine.update(0.1);
+  assert.deepStrictEqual(events.map(event => event.name), ['Start'], 'a frame-zero event fires once when a loop boundary is crossed');
+
+  const instanceEngine = new AH2D.Engine({ physics: 'builtin' });
+  const instanceClip = {
+    id: 'prefab-motion', name: 'Prefab Motion', fps: 10, frameCount: 1, loop: true,
+    tracks: [{ id: 'position', type: 'position', targetEntityId: 'body', keyframes: [
+      { id: 'position-0', frame: 0, value: { x: 42, y: 7 } }
+    ] }]
+  };
+  const marker = (sourceEntityId, instanceRootId) => ({ prefabId: 'actor', sourceEntityId, instanceRootId, prefabRevision: 1, overrides: {} });
+  instanceEngine.createEntity({ id: 'actor-a', components: { Animation: { clipId: instanceClip.id, playing: true }, PrefabInstance: marker('root', 'actor-a') } });
+  instanceEngine.createEntity({ id: 'body', parentId: 'actor-a', components: { Transform: { x: 0, y: 0 }, PrefabInstance: marker('body', 'actor-a') } });
+  instanceEngine.createEntity({ id: 'actor-b', components: { Animation: { clipId: instanceClip.id, playing: true }, PrefabInstance: marker('root', 'actor-b') } });
+  instanceEngine.createEntity({ id: 'body-b', parentId: 'actor-b', components: { Transform: { x: 0, y: 0 }, PrefabInstance: marker('body', 'actor-b') } });
+  instanceEngine.animation.load([instanceClip]);
+  instanceEngine.update(0);
+  assert.strictEqual(instanceEngine.ecs.get('body', 'Transform').x, 42);
+  assert.strictEqual(instanceEngine.ecs.get('body-b', 'Transform').x, 42, 'Prefab source targets resolve inside the Animation owner instance');
+
+  const atomicEngine = new AH2D.Engine({ physics: 'builtin' });
+  atomicEngine.load({ scene: [{ id: 'kept' }] });
+  const previousDocument = JSON.stringify(atomicEngine.document);
+  assert.throws(
+    () => atomicEngine.load({ scene: [{ id: 'broken', components: { Animation: { clipId: 'missing', duration: 1 } } }] }),
+    error => error?.code === 'E_ANIMATION_CLIP_REFERENCE'
+  );
+  assert.strictEqual(JSON.stringify(atomicEngine.document), previousDocument, 'a dangling Animation Clip load must be atomic');
+  assert.strictEqual(atomicEngine.ecs.entities.has('kept'), true);
+  assert.strictEqual(atomicEngine.ecs.entities.has('broken'), false);
+};
+
 const testEditorRuntimeContract = () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'AH2DEdtior.html'), 'utf8');
   const inlineScripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)].map(match => match[1]);
@@ -2794,6 +3028,7 @@ const run = async () => {
   testPublicPlayStopRestoresPhysicsBackendState();
   await testPixiV8AsyncMountAndNativeScene();
   await testPixiRuntimeMutationsAndAssetStaleness();
+  testPixiSourceRectSubtextures();
   testPixiLiveChildrenSurviveParentDeletion();
   await testPixiStopWhileInitializationPending();
   await testMultiScenePlaySnapshotRestoreWithPixi();
@@ -2801,6 +3036,8 @@ const run = async () => {
   testPrefabAssetInstanceOverrideApplyRevertAndUnpack();
   testPrefabValidationIsAtomicAndSnapshotsRemainDefinitionFree();
   testPrefabArrayOverrideCoordinatesAndStalePromotion();
+  testRealAnimationClipsAndTimelineSampling();
+  testAnimationEventBoundariesAndPrefabTargetResolution();
   testEditorRuntimeContract();
   console.log('AH2D Engine tests passed');
 };

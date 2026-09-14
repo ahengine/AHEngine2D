@@ -343,7 +343,7 @@ function updateHealthSystem(engine) {
 
 ## Gameplay loop rules
 
-AH2D has built-in Transform, Animation clock, Physics, Camera, Lighting, Shadow, and Tilemap systems. It does not yet have an automatic Script/Behavior scheduler.
+AH2D has built-in Transform, Animation Clip sampling/playback, Physics, Camera, Lighting, Shadow, and Tilemap systems. It does not yet have an automatic Script/Behavior scheduler.
 
 If gameplay must affect the current physics step, run it before `engine.update(dt)`:
 
@@ -450,11 +450,11 @@ Use `designWidth`/`designHeight` or `viewport: { width, height, fit }` for the l
 
 If PixiJS is unavailable or initialization fails, `runtime.backend` reports `editor-bridge` and `runtime.native` is false. Do not claim native rendering based only on `runtime.name`. Handle `runtime:error`, `runtime:fallback`, and `runtime:textureError` when the host needs error UI or recovery.
 
-PixiJS currently maps Transform, Renderable, Hidden, hierarchy, Camera, and resize. Animation frame slicing, Particle rendering, Light/Shadow, Tilemap drawing, and Post Process filters remain host responsibilities.
+PixiJS currently maps Transform, Renderable, Hidden, hierarchy, Camera, and resize. When `Renderable.sourceRect` is present, the adapter creates and reuses a cropped Pixi subtexture for that rectangle. A bare `Renderable.frame` number is not enough to derive a crop without sprite-sheet metadata supplied by the Asset or host. Particle rendering, Light/Shadow, Tilemap drawing, and Post Process filters remain host responsibilities.
 
 ### PhaserJS
 
-Phaser remains host-owned. Selecting `phaserjs` reports native availability when `Phaser.Game` exists, but the project must create and cache Game Objects, synchronize ECS Transform/Renderable state, remove stale objects, and apply Camera, Light, Shadow, Animation, Particle, Tilemap, and Post Process behavior.
+Phaser remains host-owned. Selecting `phaserjs` reports native availability when `Phaser.Game` exists, but the project must create and cache Game Objects, synchronize ECS Transform/Renderable state (including sprite frame/rectangle data), remove stale objects, and apply Camera, Light, Shadow, Particle, Tilemap, and Post Process rendering. The built-in AnimationSystem still evaluates and applies its tracks before that host synchronization.
 
 ```js
 engine.useRuntime('phaserjs', { Phaser: window.Phaser });
@@ -463,8 +463,8 @@ console.log(engine.runtime.backend); // phaserjs or editor-bridge
 
 ## Animation, prefab, and particle rules
 
-- The built-in AnimationSystem advances `{ playing, time, duration, speed }`; the renderer maps time to frames.
-- Animation event dispatch, sprite-sheet slicing, interpolation, and hitbox tracks must be implemented by game code until the serialized asset contract is extended.
+- The built-in AnimationSystem advances each bound clip, samples/interpolates its tracks, applies Position and Rotation to local `Transform`, applies Sprite values to `Renderable`, stores sampled Hitbox state on `Animation`, and dispatches Event Track entries through the Engine event bus.
+- The PixiJS adapter natively turns `Renderable.sourceRect` into a cropped subtexture. Frame-only sprite-sheet values still need Asset/host metadata that resolves the frame number to a rectangle. PhaserJS and Custom runtimes remain responsible for mapping the resulting `Renderable` state to their native renderer objects.
 - Reusable Prefab definitions live in canonical top-level `prefabs`; the legacy `prefab` workspace is not authoritative. Read [`docs/PREFABS.md`](./docs/PREFABS.md) before changing this contract.
 - A connected Instance is an expanded Scene subtree. Every member must map one source Entity through canonical `components.PrefabInstance` fields `prefabId`, `sourceEntityId`, and `instanceRootId`; do not replace it with a renderer placeholder.
 - Keep one `prefabRevision` across every member of an expanded Instance. A stale Instance remains stale as a complete group until it is fully synchronized; never partially stamp its members to a newer Asset revision.

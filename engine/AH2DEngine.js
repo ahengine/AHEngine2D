@@ -643,13 +643,269 @@
   }
 
   class AnimationSystem {
-    constructor(engine) { this.engine = engine; this.time = 0; }
+    constructor(engine) {
+      this.engine = engine;
+      this.time = 0;
+      this.clips = new Map();
+      this.names = new Map();
+    }
+    load(source) {
+      const animations = Array.isArray(source) ? source : (Array.isArray(source?.animations) ? source.animations : []);
+      this.clips.clear();
+      this.names.clear();
+      DataModel.normalizeAnimationClips(animations).forEach(clip => {
+        if (!this.clips.has(clip.id)) this.clips.set(clip.id, clip);
+        const name = String(clip.name || '').trim().toLocaleLowerCase();
+        if (name) {
+          const matches = this.names.get(name) || [];
+          matches.push(clip);
+          this.names.set(name, matches);
+        }
+      });
+      this.time = 0;
+      return this;
+    }
+    resolve(reference) {
+      const key = String(reference == null ? '' : reference).trim();
+      if (!key) return null;
+      if (this.clips.has(key)) return this.clips.get(key);
+      const matches = this.names.get(key.toLocaleLowerCase()) || [];
+      return matches.length === 1 ? matches[0] : null;
+    }
+    getClip(reference) {
+      const clip = this.resolve(reference);
+      return clip ? clone(clip) : null;
+    }
+    _component(entityId, create = false) {
+      if (!this.engine.ecs.entities.has(entityId)) throw new Error(`Unknown Entity: ${entityId}`);
+      let animation = this.engine.ecs.get(entityId, 'Animation');
+      if (!animation && create) {
+        this.engine.ecs.add(entityId, 'Animation', {});
+        animation = this.engine.ecs.get(entityId, 'Animation');
+      }
+      return animation || null;
+    }
+    _clipFor(animation) {
+      return this.resolve(animation?.clipId || animation?.clip);
+    }
+    play(entityId, clipReference, options = {}) {
+      if (clipReference && typeof clipReference === 'object') { options = clipReference; clipReference = null; }
+      const animation = this._component(entityId, true);
+      if (clipReference != null) {
+        const clip = this.resolve(clipReference);
+        if (!clip) throw new Error(`Unknown Animation Clip: ${clipReference}`);
+        animation.clipId = clip.id;
+      }
+      const clip = this._clipFor(animation);
+      if (!clip && !finite(animation.duration, 0)) throw new Error(`Unknown Animation Clip: ${animation.clipId || animation.clip || '(none)'}`);
+      if (options.fromStart || animation.completed) animation.time = options.reverse ? (clip ? clip.frameCount / clip.fps : finite(animation.duration, 0)) : 0;
+      if (options.frame != null && clip) animation.time = finite(options.frame, 0) / clip.fps;
+      else if (options.time != null) animation.time = Math.max(0, finite(options.time, 0));
+      if (options.speed != null) animation.speed = finite(options.speed, 1);
+      if (options.loop != null) animation.loop = Boolean(options.loop);
+      animation.playing = true;
+      animation.completed = false;
+      this._apply(entityId, animation, clip, { emitSample: true });
+      this.engine.events.emit('animation:play', { entityId, clipId: clip?.id || null, animation, engine: this.engine });
+      return animation;
+    }
+    pause(entityId) {
+      const animation = this._component(entityId);
+      if (!animation) return false;
+      animation.playing = false;
+      this.engine.events.emit('animation:pause', { entityId, clipId: this._clipFor(animation)?.id || null, animation, engine: this.engine });
+      return true;
+    }
+    stop(entityId, options = {}) {
+      const animation = this._component(entityId);
+      if (!animation) return false;
+      const clip = this._clipFor(animation);
+      animation.playing = false;
+      animation.completed = false;
+      animation.time = options.reset === false ? Math.max(0, finite(animation.time, 0)) : 0;
+      this._apply(entityId, animation, clip, { emitSample: true });
+      this.engine.events.emit('animation:stop', { entityId, clipId: clip?.id || null, animation, engine: this.engine });
+      return true;
+    }
+    seek(entityId, timeOrFrame, options = {}) {
+      const animation = this._component(entityId, true);
+      const clip = this._clipFor(animation);
+      if (!clip) throw new Error(`Unknown Animation Clip: ${animation.clipId || animation.clip || '(none)'}`);
+      const previous = Math.max(0, finite(animation.time, 0));
+      const next = options.unit === 'frame' ? finite(timeOrFrame, 0) / clip.fps : finite(timeOrFrame, 0);
+      const duration = clip.frameCount / clip.fps;
+      const loop = options.loop == null ? (typeof animation.loop === 'boolean' ? animation.loop : clip.loop) : Boolean(options.loop);
+      animation.time = loop ? this._mod(next, duration) : clamp(next, 0, duration);
+      animation.completed = false;
+      const sample = this._apply(entityId, animation, clip, { emitSample: true });
+      if (options.emitEvents) this._emitEvents(entityId, animation, clip, previous, loop ? next : animation.time, loop);
+      this.engine.events.emit('animation:seek', { entityId, clipId: clip.id, time: animation.time, frame: animation.frame, animation, engine: this.engine });
+      return sample;
+    }
+    setFrame(entityId, frame, options = {}) {
+      return this.seek(entityId, frame, { ...options, unit: 'frame' });
+    }
+    sample(entityId, time = null, options = {}) {
+      const animation = this._component(entityId);
+      if (!animation) return null;
+      const clip = this._clipFor(animation);
+      if (!clip) return null;
+      if (time == null) return this._apply(entityId, animation, clip, { emitSample: options.emit !== false });
+      return DataModel.sampleAnimationClip(clip, time, { unit: options.unit || 'seconds', loop: options.loop ?? (typeof animation.loop === 'boolean' ? animation.loop : clip.loop) });
+    }
+    _mod(value, divisor) {
+      if (!(divisor > 0)) return 0;
+      return ((value % divisor) + divisor) % divisor;
+    }
+    _effectiveSpeed(animation, clip) {
+      if (Number.isFinite(Number(animation.speed))) return Number(animation.speed);
+      if (Number.isFinite(Number(clip?.speed))) return Number(clip.speed);
+      return 1;
+    }
+    _eventOccurrences(clip, start, end, loop) {
+      if (start === end) return [];
+      const duration = clip.frameCount / clip.fps;
+      const direction = end > start ? 1 : -1;
+      const low = Math.min(start, end);
+      const high = Math.max(start, end);
+      const events = [];
+      for (const track of clip.tracks.filter(item => item.type === 'event')) {
+        for (const keyframe of track.keyframes) {
+          const eventTime = keyframe.frame / clip.fps;
+          if (!loop) {
+            const crossed = direction > 0 ? eventTime > start && eventTime <= end : eventTime < start && eventTime >= end;
+            if (crossed) events.push({ occurrence: eventTime, direction, track, keyframe });
+            continue;
+          }
+          const firstCycle = Math.floor((low - eventTime) / duration) - 1;
+          const lastCycle = Math.ceil((high - eventTime) / duration) + 1;
+          for (let cycle = firstCycle; cycle <= lastCycle; cycle += 1) {
+            const occurrence = eventTime + cycle * duration;
+            const crossed = direction > 0 ? occurrence > start && occurrence <= end : occurrence < start && occurrence >= end;
+            if (crossed) events.push({ occurrence, direction, track, keyframe });
+          }
+        }
+      }
+      events.sort((left, right) => direction > 0 ? left.occurrence - right.occurrence : right.occurrence - left.occurrence);
+      return events;
+    }
+    _resolveTrackTarget(entityId, authoredTargetId) {
+      const targetId = String(authoredTargetId == null ? '' : authoredTargetId).trim();
+      if (!targetId) return this.engine.ecs.entities.has(entityId) ? entityId : null;
+      const ownerMarker = this.engine.ecs.get(entityId, 'PrefabInstance');
+      if (ownerMarker?.prefabId && ownerMarker?.instanceRootId) {
+        for (const candidateId of this.engine.ecs.query('PrefabInstance')) {
+          const marker = this.engine.ecs.get(candidateId, 'PrefabInstance');
+          if (marker?.prefabId === ownerMarker.prefabId &&
+              marker?.instanceRootId === ownerMarker.instanceRootId &&
+              marker?.sourceEntityId === targetId) return candidateId;
+        }
+      }
+      return this.engine.ecs.entities.has(targetId) ? targetId : null;
+    }
+    _collectHitboxes(entityId, sample) {
+      const hitboxes = [];
+      for (const track of sample?.tracks || []) {
+        if (track.type !== 'hitbox') continue;
+        const targetId = this._resolveTrackTarget(entityId, track.targetEntityId);
+        if (!targetId) continue;
+        hitboxes.push({ ...clone(track.value), trackId: track.trackId, keyframeId: track.keyframeId, targetEntityId: targetId });
+      }
+      return hitboxes;
+    }
+    _emitEvents(entityId, animation, clip, start, end, loop) {
+      for (const item of this._eventOccurrences(clip, start, end, loop)) {
+        const value = item.keyframe.value && typeof item.keyframe.value === 'object' ? item.keyframe.value : { name: String(item.keyframe.value || 'Event') };
+        const occurrenceSample = DataModel.sampleAnimationClip(clip, item.keyframe.frame, { unit: 'frame', loop: false });
+        const hitboxes = this._collectHitboxes(entityId, occurrenceSample);
+        this.engine.events.emit('animation:event', {
+          entityId,
+          clipId: clip.id,
+          trackId: item.track.id,
+          keyframeId: item.keyframe.id,
+          frame: item.keyframe.frame,
+          time: item.keyframe.frame / clip.fps,
+          name: value.name,
+          payload: clone(value.payload),
+          direction: item.direction,
+          hitboxes: clone(hitboxes),
+          animation,
+          engine: this.engine
+        });
+      }
+    }
+    _apply(entityId, animation, clip, options = {}) {
+      if (!clip) return null;
+      const loop = typeof animation.loop === 'boolean' ? animation.loop : clip.loop;
+      const sample = DataModel.sampleAnimationClip(clip, Math.max(0, finite(animation.time, 0)), { loop });
+      for (const track of sample.tracks) {
+        if (track.type === 'hitbox') continue;
+        const targetId = this._resolveTrackTarget(entityId, track.targetEntityId);
+        if (!targetId) continue;
+        if (track.type === 'position') {
+          const transform = this.engine.ecs.get(targetId, 'Transform');
+          if (transform && track.value && typeof track.value === 'object') {
+            if (Number.isFinite(Number(track.value.x))) transform.x = Number(track.value.x);
+            if (Number.isFinite(Number(track.value.y))) transform.y = Number(track.value.y);
+          }
+        } else if (track.type === 'rotation') {
+          const transform = this.engine.ecs.get(targetId, 'Transform');
+          const rotation = track.value && typeof track.value === 'object' ? track.value.rotation : track.value;
+          if (transform && Number.isFinite(Number(rotation))) transform.rotation = Number(rotation);
+        } else if (track.type === 'sprite' && track.value && typeof track.value === 'object') {
+          const renderable = this.engine.ecs.get(targetId, 'Renderable');
+          if (renderable) Object.assign(renderable, clone(track.value));
+        }
+      }
+      const hitboxes = this._collectHitboxes(entityId, sample);
+      animation.clipId = clip.id;
+      animation.duration = sample.duration;
+      animation.frameCount = clip.frameCount;
+      animation.frame = sample.frame;
+      animation.sampledHitboxes = hitboxes;
+      if (options.emitSample !== false) this.engine.events.emit('animation:sample', { entityId, clipId: clip.id, sample, hitboxes: clone(hitboxes), animation, engine: this.engine });
+      return { ...sample, hitboxes };
+    }
+    _updateLegacy(entityId, animation, dt) {
+      const duration = Math.max(0, finite(animation.duration, 0));
+      if (!animation.playing || !duration) return;
+      const speed = this._effectiveSpeed(animation, null);
+      const next = Math.max(0, finite(animation.time, 0)) + dt * speed;
+      if (animation.loop === false) {
+        if ((speed >= 0 && next >= duration) || (speed < 0 && next <= 0)) {
+          animation.time = speed < 0 ? 0 : duration;
+          animation.playing = false;
+          animation.completed = true;
+          this.engine.events.emit('animation:complete', { entityId, clipId: null, animation, engine: this.engine });
+        } else animation.time = clamp(next, 0, duration);
+      } else animation.time = this._mod(next, duration);
+    }
     update(dt) {
+      dt = Math.max(0, finite(dt, 0));
       this.time += dt;
-      this.engine.ecs.query('Animation').forEach(id => {
-        const a = this.engine.ecs.get(id, 'Animation');
-        if (!a.playing || !a.duration) return;
-        a.time = (a.time + dt * (a.speed || 1)) % a.duration;
+      this.engine.ecs.query('Animation').forEach(entityId => {
+        const animation = this.engine.ecs.get(entityId, 'Animation');
+        const clip = this._clipFor(animation);
+        if (!clip) { this._updateLegacy(entityId, animation, dt); return; }
+        if (animation.playing == null && animation.autoplay) animation.playing = true;
+        const duration = clip.frameCount / clip.fps;
+        const start = clamp(finite(animation.time, 0), 0, duration);
+        const speed = this._effectiveSpeed(animation, clip);
+        const rawEnd = start + (animation.playing ? dt * speed : 0);
+        const loop = typeof animation.loop === 'boolean' ? animation.loop : clip.loop;
+        let completed = false;
+        if (loop) animation.time = this._mod(rawEnd, duration);
+        else {
+          animation.time = clamp(rawEnd, 0, duration);
+          completed = Boolean(animation.playing && ((speed >= 0 && rawEnd >= duration) || (speed < 0 && rawEnd <= 0)));
+        }
+        const sample = this._apply(entityId, animation, clip, { emitSample: true });
+        if (animation.playing && rawEnd !== start) this._emitEvents(entityId, animation, clip, start, loop ? rawEnd : animation.time, loop);
+        if (completed) {
+          animation.playing = false;
+          animation.completed = true;
+          this.engine.events.emit('animation:complete', { entityId, clipId: clip.id, time: animation.time, frame: animation.frame, animation, engine: this.engine });
+        } else if (animation.playing) animation.completed = false;
       });
     }
   }
@@ -2286,7 +2542,7 @@
       visualHost.sortableChildren = false;
       node.addChild(visualHost);
       node.addChild(childrenHost);
-      record = { node, visualHost, childrenHost, visual: null, visualKind: null, sourceKey: null, textureGeneration: 0 };
+      record = { node, visualHost, childrenHost, visual: null, visualKind: null, sourceKey: null, textureGeneration: 0, ownedTexture: null };
       this.nodes.set(id, record);
       return record;
     }
@@ -2294,6 +2550,7 @@
       const record = this.nodes.get(id);
       if (!record) return;
       record.textureGeneration += 1;
+      this._releaseOwnedTexture(record);
       // Entity nodes live below their parent's childrenHost. Detach them before
       // destroying this record so deleting/reparenting a parent cannot
       // recursively destroy DisplayObjects that still exist in the ECS graph.
@@ -2388,11 +2645,21 @@
     }
     _textureSource(renderable) {
       const source = renderable.imageSrc || this._assetSource(renderable.assetId) || renderable.assetId || null;
+      const sourceRect = this._sourceRect(renderable);
+      const frameKey = sourceRect ? `${sourceRect.x},${sourceRect.y},${sourceRect.width},${sourceRect.height}` : '';
       return {
-        key: `${renderable.assetId || ''}|${source == null ? '' : String(source)}`,
+        key: `${renderable.assetId || ''}|${source == null ? '' : String(source)}|${frameKey}`,
         source,
+        sourceRect,
         hasTexture: source != null && source !== ''
       };
+    }
+    _sourceRect(renderable) {
+      const rect = renderable?.sourceRect;
+      if (!rect || typeof rect !== 'object' || Array.isArray(rect)) return null;
+      const x = Number(rect.x), y = Number(rect.y), width = Number(rect.width), height = Number(rect.height);
+      if (![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return null;
+      return { x, y, width, height };
     }
     _resolveTexture(renderable, id, source) {
       const assets = this.PIXI.Assets;
@@ -2421,8 +2688,34 @@
       try { return new this.PIXI.Sprite(texture || this._whiteTexture()); }
       catch (_) { return new this.PIXI.Sprite({ texture: texture || this._whiteTexture() }); }
     }
+    _releaseOwnedTexture(record) {
+      if (!record?.ownedTexture) return;
+      record.ownedTexture.destroy?.(false);
+      record.ownedTexture = null;
+    }
+    _framedTexture(texture, sourceRect) {
+      if (!texture || !sourceRect) return { texture, owned: false };
+      const source = texture.source || texture.baseTexture;
+      if (!source || typeof this.PIXI.Texture !== 'function') return { texture, owned: false };
+      const frame = this.PIXI.Rectangle
+        ? new this.PIXI.Rectangle(sourceRect.x, sourceRect.y, sourceRect.width, sourceRect.height)
+        : { ...sourceRect };
+      try { return { texture: new this.PIXI.Texture({ source, frame }), owned: true }; }
+      catch (_) {
+        try { return { texture: new this.PIXI.Texture(source, frame), owned: true }; }
+        catch (_) { return { texture, owned: false }; }
+      }
+    }
+    _assignTexture(record, texture, sourceRect) {
+      const baseTexture = texture || this._whiteTexture();
+      const framed = this._framedTexture(baseTexture, sourceRect);
+      this._releaseOwnedTexture(record);
+      record.ownedTexture = framed.owned ? framed.texture : null;
+      record.visual.texture = framed.texture || baseTexture;
+    }
     _destroyVisual(record) {
       if (!record.visual) return;
+      this._releaseOwnedTexture(record);
       record.visualHost.removeChild?.(record.visual);
       record.visual.destroy?.({ texture: false, textureSource: false, baseTexture: false });
       record.visual = null;
@@ -2440,7 +2733,7 @@
       return record.visual;
     }
     _setTexture(record, renderable, id) {
-      const { key, source, hasTexture } = this._textureSource(renderable);
+      const { key, source, sourceRect, hasTexture } = this._textureSource(renderable);
       if (record.sourceKey === key && record.visual) return;
       record.sourceKey = key;
       record.textureGeneration += 1;
@@ -2459,17 +2752,18 @@
       this.objects.set(id, record.visual);
       const textureGeneration = ++record.textureGeneration;
       if (resolved && typeof resolved.then === 'function') {
-        record.visual.texture = this._whiteTexture();
+        this._assignTexture(record, this._whiteTexture(), null);
         Promise.resolve(resolved).then(texture => {
           if (this.nodes.get(id) !== record || record.textureGeneration !== textureGeneration || record.sourceKey !== key) return;
-          record.visual.texture = typeof texture === 'string' && this.PIXI.Texture?.from ? this.PIXI.Texture.from(texture) : (texture || this._whiteTexture());
+          const resolvedTexture = typeof texture === 'string' && this.PIXI.Texture?.from ? this.PIXI.Texture.from(texture) : (texture || this._whiteTexture());
+          this._assignTexture(record, resolvedTexture, sourceRect);
           this._renderApplication();
         }).catch(error => {
           if (this.nodes.get(id) === record && record.textureGeneration === textureGeneration) {
             this.engine.events.emit('runtime:textureError', { runtime: this, entityId: id, source, error, engine: this.engine });
           }
         });
-      } else record.visual.texture = resolved || this._whiteTexture();
+      } else this._assignTexture(record, resolved || this._whiteTexture(), sourceRect);
     }
     _drawGraphics(graphics, width, height, color, anchorX = 0.5, anchorY = 0.5) {
       graphics.clear?.();
@@ -2500,8 +2794,9 @@
       const anchorX = finite(renderable.anchorX ?? (Array.isArray(anchor) ? anchor[0] : anchor?.x), finite(this.options.defaultAnchor, 0.5));
       const anchorY = finite(renderable.anchorY ?? (Array.isArray(anchor) ? anchor[1] : anchor?.y), finite(this.options.defaultAnchor, 0.5));
       visual.anchor?.set?.(anchorX, anchorY);
-      const width = finite(renderable.width, 64);
-      const height = finite(renderable.height, 64);
+      const sourceRect = this._sourceRect(renderable);
+      const width = finite(renderable.width, sourceRect?.width ?? 64);
+      const height = finite(renderable.height, sourceRect?.height ?? 64);
       const color = this._color(renderable.tint ?? renderable.color, 0xffffff);
       if (record.visualKind === 'graphics') this._drawGraphics(visual, width, height, color, anchorX, anchorY);
       else {
@@ -3725,6 +4020,7 @@
       if (Number(source.version) === 4 || source.prefabs != null) {
         DataModel.assertPrefabDocument(source, { entityCodec: this.entityCodec });
       }
+      DataModel.assertAnimationDocument(source, { entityCodec: this.entityCodec });
       const scenes = Array.isArray(source.scenes) ? source.scenes : [];
       const requestedSceneId = options.sceneId || source.currentSceneId || source.meta?.currentSceneId || null;
       const activeScene = scenes.length
@@ -3819,6 +4115,7 @@
       stagedGraph.children.forEach((children, id) => this.graph.children.set(id, children));
       this.document = nextDocument;
       this.activeSceneId = activeScene?.id || null;
+      this.animation.load(nextDocument);
       this.postProcess.load(nextPostProcess, { emit: false });
       const transformedEntities = this.transform.update(false, { emit: false });
       const emitCommitted = (type, payload) => {
@@ -3898,6 +4195,7 @@
       if (authoringDocument) {
         this.document = authoringDocument;
         this.activeSceneId = snapshot.activeSceneId || authoringDocument.currentSceneId || null;
+        this.animation.load(authoringDocument);
       }
       this.animation.time = finite(snapshot.animationTime, 0);
       this.camera.active = snapshot.activeCamera || null;
@@ -3988,11 +4286,12 @@
     sync(editorState) {
       const scene = editorState?.scene || [];
       const postProcess = editorState?.postProcess;
+      const animations = Array.isArray(editorState?.animations) ? editorState.animations : undefined;
       const engine = isPlainObject(editorState?.engine) ? editorState.engine : undefined;
-      const signature = JSON.stringify({ scene, postProcess, engine });
+      const signature = JSON.stringify({ scene, postProcess, animations, engine });
       if (signature === this.lastSignature) return false;
       this.lastSignature = signature;
-      this.engine.load({ scene, postProcess, ...(engine ? { engine } : {}) });
+      this.engine.load({ scene, postProcess, ...(animations ? { animations } : {}), ...(engine ? { engine } : {}) });
       return true;
     }
   }
@@ -4004,6 +4303,9 @@
     EntityCodec: DataModel.EntityCodec,
     createDefaultComponentRegistry: DataModel.createDefaultComponentRegistry,
     createDefaultEntityCodec: DataModel.createDefaultEntityCodec,
+    normalizeAnimationClip: DataModel.normalizeAnimationClip,
+    normalizeAnimationClips: DataModel.normalizeAnimationClips,
+    sampleAnimationClip: DataModel.sampleAnimationClip,
     LightingSystem, ShadowSystem, AnimationSystem, PostProcessSystem, TilemapSystem,
     DEFAULT_POST_PROCESS_EFFECTS, createDefaultPostProcess, PrefabSystem,
     BODY_TYPES, COLLIDER_SHAPES, PhysicsAdapter, Box2DPhysicsAdapter,
