@@ -126,6 +126,7 @@ Use the schema commands instead of scraping `--help` or copying assumptions from
 npm run ah2d -- schema list --pretty
 npm run ah2d -- schema show --name project --pretty
 npm run ah2d -- schema show --name prefabAsset --pretty
+npm run ah2d -- schema show --name particleAsset --pretty
 npm run ah2d -- schema show --component Transform --pretty
 npm run ah2d -- schema show --component Skeleton --pretty
 npm run ah2d -- schema show --component Bone --pretty
@@ -134,7 +135,7 @@ npm run ah2d -- schema show --component Skin --pretty
 npm run ah2d -- schema show component:Body --pretty
 ```
 
-`schema list` returns the document schemas (`project`, `prefabAsset`, `operation`, `batch`) and all built-in component types. `schema show --component TYPE` returns the canonical type, aliases, schema version, required/removable/tag flags, defaults, `authoring`/`runtime`/`snapshot` schemas, runtime-only fields, and storage metadata. Aliases resolve to the canonical descriptor, so `component:Body` reports `component:Rigidbody`.
+`schema list` returns the document schemas (`project`, `prefabAsset`, `animationClip`, `particleAsset`, `operation`, `batch`) and all built-in component types. `schema show --component TYPE` returns the canonical type, aliases, schema version, required/removable/tag flags, defaults, `authoring`/`runtime`/`snapshot` schemas, runtime-only fields, and storage metadata. Aliases resolve to the canonical descriptor, so `component:Body` reports `component:Rigidbody`.
 
 ## Components
 

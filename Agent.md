@@ -450,7 +450,7 @@ Use `designWidth`/`designHeight` or `viewport: { width, height, fit }` for the l
 
 If PixiJS is unavailable or initialization fails, `runtime.backend` reports `editor-bridge` and `runtime.native` is false. Do not claim native rendering based only on `runtime.name`. Handle `runtime:error`, `runtime:fallback`, and `runtime:textureError` when the host needs error UI or recovery.
 
-PixiJS currently maps Transform, Renderable, Skin mesh, Hidden, hierarchy, Camera, and resize. When `Renderable.sourceRect` is present, the adapter creates and reuses a cropped Pixi subtexture for that rectangle. A bare `Renderable.frame` number is not enough to derive a crop without sprite-sheet metadata supplied by the Asset or host. Particle rendering, Light/Shadow, Tilemap drawing, and Post Process filters remain host responsibilities.
+PixiJS currently maps Transform, Renderable, Skin mesh, ParticleEmitter visuals, Hidden, hierarchy, Camera, and resize. Particle visuals may be texture-backed through `appearance.assetId` or graphics-backed; the adapter owns their display lifecycle, not shared Asset textures. When `Renderable.sourceRect` is present, the adapter creates and reuses a cropped Pixi subtexture for that rectangle. A bare `Renderable.frame` number is not enough to derive a crop without sprite-sheet metadata supplied by the Asset or host. Light/Shadow, Tilemap drawing, and Post Process filters remain host responsibilities.
 
 ### PhaserJS
 
@@ -477,7 +477,12 @@ console.log(engine.runtime.backend); // phaserjs or editor-bridge
 - Store Overrides as RFC 6901 Entity-relative pointers with explicit `add`, `replace`, or `remove` records. Never write identity, hierarchy, legacy `prefab`, or the `PrefabInstance` marker through an Override.
 - Use `engine.prefabs` at Runtime and `prefab ...` / `prefab.*` operations in the CLI. Apply updates the Asset revision and synchronizes only current Instances without a conflicting Override; stale Instance groups remain untouched. Revert restores the source; Unpack removes markers while preserving Scene data.
 - Structural Overrides and nested Prefab Assets are intentionally unsupported. Unpack before add/remove/reparent of connected members. Reject Asset deletion while Instances are connected unless an explicit unpack-instances policy was requested.
-- Current Particle JSON is emitter configuration. A runtime particle renderer must interpret it; live preview particles are not exported.
+- Reusable definitions live in top-level `particles[]` as canonical Particle Asset v1 records. Scene and Prefab Entities bind them through `components.ParticleEmitter.assetId`; read [`docs/PARTICLES.md`](./docs/PARTICLES.md) before changing this contract.
+- Curve time is normalized `0..1`. `emission` samples emitter-cycle time; `scale`, `speed`, `opacity`, and `hue` sample particle age. Reuse `sampleParticleCurve`; do not create a second sampler with different cubic or endpoint behavior.
+- Keep Asset/Curve/key IDs stable and preserve unknown fields. Use `resource put particle` or atomic `apply` for CLI mutations. Never silently canonicalize a legacy Particle record during a read-only operation.
+- `ParticleEmitter.particles`, `emissionAccumulator`, `completed`, and `rngState` are derived Runtime state. Persist with the authoring profile so they never enter the Universal Project or standalone Particle Asset export.
+- Per-emitter `seed`, fixed-step emission, burst boundaries, capacity, and snapshot/restore are deterministic contracts. Gameplay must not consume a global random stream that makes one emitter depend on another.
+- PixiJS renders particles natively. PhaserJS and Custom hosts must map the same `ParticleEmitter.particles` Runtime state without modifying the authored Asset.
 - Do not invent missing fields during a read-only task. When a requested feature requires a schema extension, update validation, migration, Editor export/load, CLI, runtime consumption, tests, and docs together.
 
 ## Runtime and headless testing

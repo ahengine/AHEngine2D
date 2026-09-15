@@ -138,9 +138,19 @@ try {
   assert.strictEqual(capabilities.prefabs.componentContainerSynthesis, 'direct /components/<Type> add only');
   assert.ok(capabilities.prefabs.operations.includes('prefab.unpack'));
   assert.deepStrictEqual(capabilities.enums.animationTrackType, ['sprite', 'position', 'rotation', 'event', 'hitbox', 'bone', 'ik']);
+  assert.deepStrictEqual(capabilities.enums.particleCurveProperty, ['emission', 'scale', 'speed', 'opacity', 'hue']);
+  assert.deepStrictEqual(capabilities.enums.particleCurveInterpolation, ['linear', 'step', 'cubic']);
+  assert.deepStrictEqual(capabilities.enums.particleShape, ['point', 'circle', 'box']);
+  assert.deepStrictEqual(capabilities.enums.particleBlend, ['normal', 'additive']);
   assert.deepStrictEqual(capabilities.enums.bendDirection, [-1, 1]);
   assert.strictEqual(capabilities.animations.schema, 'animationClip');
   assert.strictEqual(capabilities.animations.stableReference, 'clipId');
+  assert.strictEqual(capabilities.particles.schema, 'particleAsset');
+  assert.strictEqual(capabilities.particles.stableReference, 'assetId');
+  assert.deepStrictEqual(capabilities.particles.normalizedTime, [0, 1]);
+  assert.deepStrictEqual(capabilities.particles.runtimeOnly, [
+    'ParticleEmitter.particles', 'ParticleEmitter.emissionAccumulator', 'ParticleEmitter.completed', 'ParticleEmitter.rngState'
+  ]);
   assert.deepStrictEqual(capabilities.skeletons.components, ['Skeleton', 'Bone', 'IK', 'Skin']);
   assert.strictEqual(capabilities.skeletons.referenceScope, 'same Scene or Prefab Asset');
   assert.deepStrictEqual(capabilities.skeletons.runtimeOnly, ['Skeleton.pose', 'Skeleton.boneMatrices', 'Skin.deformedVertices']);
@@ -150,7 +160,7 @@ try {
 
 
   const schemaIndex = success(['schema', 'list']).data;
-  assert.deepStrictEqual(schemaIndex.schemas, ['project', 'prefabAsset', 'animationClip', 'operation', 'batch']);
+  assert.deepStrictEqual(schemaIndex.schemas, ['project', 'prefabAsset', 'animationClip', 'particleAsset', 'operation', 'batch']);
   assert.ok(schemaIndex.components.includes('Collider'));
   assert.ok(schemaIndex.components.includes('Skeleton'));
   assert.ok(schemaIndex.components.includes('Bone'));
@@ -175,10 +185,19 @@ try {
   assert.ok(projectSchema.$defs.entity.properties.x.description.includes('Local'));
   assert.strictEqual(projectSchema.properties.prefabs.items.$ref, '#/$defs/prefabAsset');
   assert.strictEqual(projectSchema.properties.animations.items.$ref, '#/$defs/animationClip');
+  assert.strictEqual(projectSchema.properties.particles.items.$ref, '#/$defs/particleAsset');
   const prefabAssetSchema = success(['schema', 'show', '--name', 'prefabAsset']).data.schema;
   assert.deepStrictEqual(prefabAssetSchema.required, ['id', 'rootEntityId', 'entities']);
   const animationClipSchema = success(['schema', 'show', '--name', 'animationClip']).data.schema;
   assert.deepStrictEqual(animationClipSchema.required, ['id', 'name', 'fps', 'frameCount', 'loop', 'tracks']);
+  const particleAssetSchema = success(['schema', 'show', '--name', 'particleAsset']).data.schema;
+  assert.deepStrictEqual(particleAssetSchema.required, ['id', 'name', 'duration', 'loop', 'maxParticles', 'emission', 'lifetime', 'velocity', 'shape', 'appearance', 'curves']);
+  assert.deepStrictEqual(particleAssetSchema.properties.curves.items.properties.property.enum, ['emission', 'scale', 'speed', 'opacity', 'hue']);
+  const particleEmitterSchema = success(['schema', 'show', '--component', 'ParticleEmitter']).data.component;
+  assert.strictEqual(particleEmitterSchema.schemas.authoring.properties.assetId.type, 'string');
+  assert.strictEqual(particleEmitterSchema.schemas.authoring.properties.speed.minimum, 0);
+  assert.strictEqual(particleEmitterSchema.schemas.authoring.required, undefined);
+  assert.deepStrictEqual(particleEmitterSchema.runtimeOnlyFields, ['particles', 'emissionAccumulator', 'completed', 'rngState']);
 
 
   const initialized = success(['init', '--file', projectFile, '--name', 'Agent Test']).data;
@@ -204,6 +223,67 @@ try {
   assert.strictEqual(JSON.parse(fs.readFileSync(projectFile, 'utf8')).animations.length, 0, 'Animation dry-run must not mutate the Project');
   success(['resource', 'put', '--file', projectFile, 'animation', '--value', JSON.stringify(clip), '--write']);
   assert.strictEqual(success(['resource', 'get', '--file', projectFile, 'animation', 'idle']).data.value.name, 'Idle');
+
+  const particleAsset = {
+    id: 'sparks', name: 'Sparks', duration: 1.5, loop: true, maxParticles: 128,
+    emission: { rate: 32, burst: 4, futureEmission: true },
+    lifetime: { min: 0.4, max: 0.9 },
+    velocity: { speedMin: 40, speedMax: 90, angle: -90, spread: 45, gravityX: 0, gravityY: 60 },
+    shape: { type: 'circle', radius: 12, width: 0, height: 0 },
+    appearance: { assetId: 'spark-texture', color: '#ffe080', blend: 'additive', baseScale: 1, baseOpacity: 0.9, baseHue: 8 },
+    curves: [{ id: 'opacity', property: 'opacity', interpolation: 'cubic', futureCurve: 'keep', keys: [
+      { id: 'opaque', time: 0, value: 1, outTangent: 0, futureKey: true },
+      { id: 'clear', time: 1, value: 0, inTangent: -1 }
+    ] }],
+    futureAsset: { keep: true }
+  };
+  const particleDryRun = success(['resource', 'put', '--file', projectFile, 'particle', '--value', JSON.stringify(particleAsset), '--dry-run', '--include-document']).data.document;
+  assert.deepStrictEqual(particleDryRun.particles[0], particleAsset, 'generic Particle resource commands must not canonicalize or discard extensions');
+  assert.strictEqual(JSON.parse(fs.readFileSync(projectFile, 'utf8')).particles.length, 0, 'Particle dry-run must not mutate the Project');
+  success(['resource', 'put', '--file', projectFile, 'particle', '--value', JSON.stringify(particleAsset), '--write']);
+  assert.deepStrictEqual(success(['resource', 'get', '--file', projectFile, 'particle', 'sparks']).data.value, particleAsset);
+
+  const projectBeforeRejectedParticle = fs.readFileSync(projectFile, 'utf8');
+  const invalidParticle = { ...particleAsset, id: 'invalid-particle', lifetime: { min: 3, max: 1 } };
+  assert.ok(failure(['resource', 'put', '--file', projectFile, 'particle', '--value', JSON.stringify(invalidParticle), '--write'], 'E_PROJECT_INVALID').payload.diagnostics.some(item => item.code === 'E_PARTICLE_LIFETIME_RANGE'));
+  assert.strictEqual(fs.readFileSync(projectFile, 'utf8'), projectBeforeRejectedParticle, 'rejected Particle resource mutation must be failure-atomic');
+
+  const legacyParticleFile = path.join(tempRoot, 'legacy-particle.ah2d.json');
+  const legacyParticleProject = createProject();
+  const legacyParticle = { name: 'Legacy Spark', amount: 12, rate: 8, lifetime: 1, futureLegacy: { keep: true } };
+  legacyParticleProject.particles = [legacyParticle];
+  fs.writeFileSync(legacyParticleFile, JSON.stringify(legacyParticleProject));
+  assert.ok(success(['validate', '--file', legacyParticleFile]).diagnostics.some(item => item.code === 'W_PARTICLE_ASSET_LEGACY'));
+  assert.ok(failure(['validate', '--file', legacyParticleFile, '--strict'], 'E_PROJECT_INVALID').payload.diagnostics.some(item => item.code === 'E_PARTICLE_ASSET_LEGACY'));
+  assert.deepStrictEqual(success(['resource', 'get', '--file', legacyParticleFile, 'particle', 'Legacy Spark']).data.value, legacyParticle);
+
+  const legacyEmitterFile = path.join(tempRoot, 'legacy-emitter.ah2d.json');
+  const legacyEmitterProject = createProject({ objects: [
+    { id: 'legacy-emitter', components: { ParticleEmitter: { assetId: '', amount: 12, rate: 8, lifetime: 1, speed: 30, futureEmitter: { keep: true } } } }
+  ] });
+  legacyEmitterProject.particles = [particleAsset];
+  fs.writeFileSync(legacyEmitterFile, JSON.stringify(legacyEmitterProject));
+  const legacyEmitterCompat = success(['validate', '--file', legacyEmitterFile]);
+  assert.ok(legacyEmitterCompat.diagnostics.some(item => item.code === 'W_PARTICLE_EMITTER_LEGACY'));
+  assert.strictEqual(legacyEmitterCompat.diagnostics.some(item => item.severity === 'error'), false);
+  assert.ok(failure(['validate', '--file', legacyEmitterFile, '--strict'], 'E_PROJECT_INVALID').payload.diagnostics.some(item => item.code === 'E_PARTICLE_EMITTER_LEGACY'));
+
+  const referencedParticleFile = path.join(tempRoot, 'referenced-particle.ah2d.json');
+  const referencedParticleProject = createProject({ objects: [
+    { id: 'emitter', components: { ParticleEmitter: { assetId: 'sparks', autoplay: true, futureEmitter: true } } }
+  ] });
+  referencedParticleProject.particles = [particleAsset];
+  referencedParticleProject.prefabs = [{
+    id: 'fx-prefab', name: 'FX', rootEntityId: 'source', revision: 1,
+    entities: [{ id: 'source', components: { ParticleEmitter: { assetId: 'sparks' } } }]
+  }];
+  fs.writeFileSync(referencedParticleFile, JSON.stringify(referencedParticleProject));
+  assert.deepStrictEqual(success(['validate', '--file', referencedParticleFile]).diagnostics, []);
+  const beforeRejectedDelete = fs.readFileSync(referencedParticleFile, 'utf8');
+  const rejectedDelete = failure(['resource', 'delete', '--file', referencedParticleFile, 'particle', 'sparks', '--write'], 'E_PROJECT_INVALID');
+  assert.ok(rejectedDelete.payload.diagnostics.some(item => item.code === 'E_PARTICLE_ASSET_REFERENCE' && item.pointer === '/scenes/0/objects/0/components/ParticleEmitter/assetId'));
+  assert.ok(rejectedDelete.payload.diagnostics.some(item => item.code === 'E_PARTICLE_ASSET_REFERENCE' && item.pointer === '/prefabs/0/entities/0/components/ParticleEmitter/assetId'));
+  assert.strictEqual(fs.readFileSync(referencedParticleFile, 'utf8'), beforeRejectedDelete, 'referenced Particle deletion must roll back');
 
   const invalidAnimationFile = path.join(tempRoot, 'invalid-animation.ah2d.json');
   const invalidAnimationProject = createProject();

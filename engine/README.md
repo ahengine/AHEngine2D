@@ -8,7 +8,7 @@ AH2D keeps editor data independent from a specific renderer. The editor can prev
 
 - Scene Graph with cycle-safe nested parent/child relationships
 - Entity Component System (ECS)
-- Transform, Camera, Lighting, Shadow, Animation, Skeleton/FK/IK/Skinning, and Tilemap systems
+- Transform, Camera, Lighting, Shadow, Animation, deterministic Particle, Skeleton/FK/IK/Skinning, and Tilemap systems
 - Native Box2D-compatible backend through Planck with pixel/metre conversion
 - Deterministic built-in 2D physics backend available by explicit selection
 - Runtime adapters for PixiJS, PhaserJS, and custom hosts
@@ -25,7 +25,7 @@ npm run ah2d -- inspect --file game.ah2d.json --pretty
 npm run ah2d -- validate --file game.ah2d.json --engine
 ```
 
-See [`CLI.md`](./CLI.md) for Scene, Entity, component, Prefab, runtime, physics, simulation, JSON Patch, and atomic batch workflows. Prefab lifecycle is documented in [`../docs/PREFABS.md`](../docs/PREFABS.md); skeletal authoring/runtime is documented in [`../docs/SKELETONS.md`](../docs/SKELETONS.md).
+See [`CLI.md`](./CLI.md) for Scene, Entity, component, resource, Prefab, runtime, physics, simulation, JSON Patch, and atomic batch workflows. Prefab lifecycle is documented in [`../docs/PREFABS.md`](../docs/PREFABS.md), skeletal authoring/runtime in [`../docs/SKELETONS.md`](../docs/SKELETONS.md), and Particle Assets/Curves in [`../docs/PARTICLES.md`](../docs/PARTICLES.md).
 
 ## Unified ECS and Component Schema contract
 

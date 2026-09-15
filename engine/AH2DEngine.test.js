@@ -1792,6 +1792,321 @@ const testPublicPlayStopRestoresPhysicsBackendState = () => {
   near(engine.physics.getNativeBody('native-before-play').getPosition().x, 3.5, 1e-8);
 };
 
+const particleAsset = (id, overrides = {}) => {
+  const base = {
+    id,
+    name: id,
+    duration: 1,
+    loop: true,
+    maxParticles: 100,
+    emission: { rate: 10, burst: 0 },
+    lifetime: { min: 1, max: 1 },
+    velocity: { speedMin: 0, speedMax: 0, angle: -90, spread: 0, gravityX: 0, gravityY: 0 },
+    shape: { type: 'point', radius: 0, width: 0, height: 0 },
+    appearance: { assetId: null, color: '#ffffff', blend: 'normal', baseScale: 1, baseOpacity: 1, baseHue: 0 },
+    curves: []
+  };
+  const merge = (left, right) => {
+    const output = { ...left };
+    Object.entries(right || {}).forEach(([key, value]) => {
+      output[key] = value && typeof value === 'object' && !Array.isArray(value) &&
+        output[key] && typeof output[key] === 'object' && !Array.isArray(output[key])
+        ? merge(output[key], value)
+        : value;
+    });
+    return output;
+  };
+  return merge(base, overrides);
+};
+
+const particleDocument = (assets, emitters) => ({
+  format: 'AH2D',
+  version: 4,
+  particles: assets,
+  scene: emitters.map(emitter => ({
+    id: emitter.id,
+    x: emitter.x || 0,
+    y: emitter.y || 0,
+    components: { ParticleEmitter: { assetId: emitter.assetId, ...(emitter.component || {}) } }
+  }))
+});
+
+const testParticleDeterminismShapesAndCapacity = () => {
+  assert.strictEqual(typeof AH2D.ParticleSystem, 'function');
+  assert.strictEqual(AH2D.sampleParticleCurve, AH2D.DataModel.sampleParticleCurve);
+  const randomAsset = particleAsset('seeded-random', {
+    maxParticles: 100,
+    emission: { rate: 80, burst: 4 },
+    lifetime: { min: 0.75, max: 1.25 },
+    velocity: { speedMin: 20, speedMax: 60, angle: -45, spread: 120, gravityX: 3, gravityY: 12 },
+    shape: { type: 'circle', radius: 18 },
+    customAssetData: { retained: true }
+  });
+  const document = particleDocument([randomAsset], [{
+    id: 'seeded-emitter',
+    assetId: 'seeded-random',
+    component: { seed: 12345, overrides: { maxParticles: 7, customOverride: { retained: true } } }
+  }]);
+  const whole = new AH2D.Engine({ physics: 'builtin', particleStep: 1 / 120 });
+  const partitioned = new AH2D.Engine({ physics: 'builtin', particleStep: 1 / 120 });
+  whole.load(document);
+  partitioned.load(document);
+  assert.deepStrictEqual(whole.ecs.get('seeded-emitter', 'ParticleEmitter').particles, [], 'load must initialize consumable Runtime particle state before the first frame');
+  whole.update(0.25);
+  for (let index = 0; index < 5; index += 1) partitioned.update(0.05);
+  const wholeState = whole.particles.getState('seeded-emitter');
+  const partitionedState = partitioned.particles.getState('seeded-emitter');
+  assert.deepStrictEqual(wholeState.particles, partitionedState.particles, 'fixed particle steps must be independent of frame partitioning');
+  assert.strictEqual(wholeState.rngState, partitionedState.rngState, 'the same seed must preserve the exact random stream');
+  assert.strictEqual(wholeState.particles.length, 7, 'burst plus a high rate must respect maxParticles capacity');
+  wholeState.particles.forEach(particle => {
+    assert.ok(Math.hypot(particle.x - particle.baseVx * particle.age - 1.5 * particle.age * particle.age,
+      particle.y - particle.baseVy * particle.age - 6 * particle.age * particle.age) <= 18 + 1e-7,
+    'circle spawn points must remain within the authored radius before motion is removed');
+  });
+  assert.deepStrictEqual(whole.particles.getAsset('seeded-random').customAssetData, { retained: true });
+  assert.deepStrictEqual(whole.particles.effectiveAsset('seeded-emitter').customOverride, { retained: true });
+  assert.deepStrictEqual(whole.document.particles[0].customAssetData, { retained: true }, 'runtime normalization must not rewrite unknown Project data');
+
+  const differentSeed = new AH2D.Engine({ physics: 'builtin', particleStep: 1 / 120 });
+  differentSeed.load(particleDocument([randomAsset], [{
+    id: 'seeded-emitter', assetId: 'seeded-random', component: { seed: 54321, overrides: { maxParticles: 7 } }
+  }]));
+  differentSeed.update(0.25);
+  assert.notDeepStrictEqual(
+    differentSeed.particles.getState('seeded-emitter').particles,
+    wholeState.particles,
+    'a different explicit seed must create a different deterministic simulation'
+  );
+
+  const shapeEngine = new AH2D.Engine({ physics: 'builtin' });
+  shapeEngine.load(particleDocument([
+    particleAsset('point-shape', { emission: { rate: 0, burst: 2 }, shape: { type: 'point' } }),
+    particleAsset('circle-shape', { emission: { rate: 0, burst: 24 }, shape: { type: 'circle', radius: 10 } }),
+    particleAsset('box-shape', { emission: { rate: 0, burst: 24 }, shape: { type: 'box', width: 20, height: 8 } })
+  ], [
+    { id: 'point-emitter', assetId: 'point-shape', component: { seed: 1 } },
+    { id: 'circle-emitter', assetId: 'circle-shape', component: { seed: 2 } },
+    { id: 'box-emitter', assetId: 'box-shape', component: { seed: 3 } }
+  ]));
+  shapeEngine.update(0);
+  shapeEngine.particles.getState('point-emitter').particles.forEach(particle => {
+    assert.strictEqual(particle.x, 0);
+    assert.strictEqual(particle.y, 0);
+  });
+  shapeEngine.particles.getState('circle-emitter').particles.forEach(particle => {
+    assert.ok(Math.hypot(particle.x, particle.y) <= 10 + 1e-10);
+  });
+  shapeEngine.particles.getState('box-emitter').particles.forEach(particle => {
+    assert.ok(particle.x >= -10 && particle.x <= 10);
+    assert.ok(particle.y >= -4 && particle.y <= 4);
+  });
+
+  const validationEngine = new AH2D.Engine({ physics: 'builtin' });
+  validationEngine.load(particleDocument([particleAsset('valid-particles')], [{ id: 'valid-emitter', assetId: 'valid-particles' }]));
+  assert.throws(
+    () => validationEngine.load(particleDocument([particleAsset('other-particles')], [{ id: 'invalid-emitter', assetId: 'missing-particles' }])),
+    error => error.code === 'E_PARTICLE_ASSET_REFERENCE'
+  );
+  assert.ok(validationEngine.ecs.entities.has('valid-emitter'), 'invalid Particle references must fail before replacing the active Runtime Scene');
+
+  const missingRuntimeAsset = new AH2D.Engine({ physics: 'builtin' });
+  missingRuntimeAsset.load({ format: 'AH2D', version: 4, particles: [], scene: [] });
+  missingRuntimeAsset.createEntity({ id: 'late-missing', components: { ParticleEmitter: { assetId: 'not-loaded' } } });
+  let missingEvents = 0;
+  missingRuntimeAsset.events.on('particle:assetMissing', () => { missingEvents += 1; });
+  missingRuntimeAsset.update(0);
+  missingRuntimeAsset.update(0.1);
+  assert.strictEqual(missingEvents, 1, 'a missing Runtime asset must report once until the binding changes');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(
+    missingRuntimeAsset.export().entities[0].components.ParticleEmitter,
+    '_missingAssetNotified'
+  ), false, 'missing-asset event bookkeeping must never leak into component snapshots');
+};
+
+const testLegacyInlineParticleEmitterCompatibility = () => {
+  const engine = new AH2D.Engine({ physics: 'builtin', particleStep: 1 / 120 });
+  engine.load({
+    format: 'AH2D', version: 4, particles: [], scene: [{
+      id: 'legacy-inline-emitter', components: { ParticleEmitter: {
+        name: 'Legacy Spark', amount: 3, rate: 20, lifetime: 1, speed: 40,
+        spread: 0, gravity: 0, radius: 0, scale: 0.75, opacity: 0.8,
+        hue: 15, blend: 'Additive', autoplay: true, seed: 17
+      } }
+    }]
+  });
+  const effective = engine.particles.effectiveAsset('legacy-inline-emitter');
+  assert.match(effective.id, /^legacy-inline:/, 'legacy inline emitters receive an internal effective Asset identity');
+  assert.strictEqual(effective.maxParticles, 3);
+  assert.deepStrictEqual(effective.velocity, {
+    speedMin: 40, speedMax: 40, angle: -90, spread: 0, gravityX: 0, gravityY: 0
+  });
+  assert.strictEqual(effective.appearance.blend, 'additive');
+  engine.update(0.25);
+  const state = engine.particles.getState('legacy-inline-emitter');
+  assert.strictEqual(state.particles.length, 3, 'legacy inline rate and amount must drive the real deterministic simulation');
+  assert.strictEqual(state.speed, 1, 'legacy speed remains particle velocity rather than becoming playback speed');
+  state.particles.forEach(particle => near(Math.hypot(particle.baseVx, particle.baseVy), 40, 1e-8, 'legacy inline particle speed'));
+  const emitter = engine.ecs.get('legacy-inline-emitter', 'ParticleEmitter');
+  engine.particles.play('legacy-inline-emitter', { speed: 2 });
+  assert.strictEqual(emitter.speed, 40, 'playback controls must not overwrite the legacy particle velocity');
+  assert.strictEqual(emitter.timeScale, 2, 'legacy playback speed uses the unambiguous timeScale compatibility field');
+
+  const missing = new AH2D.Engine({ physics: 'builtin' });
+  missing.load({ format: 'AH2D', version: 4, particles: [], scene: [] });
+  missing.createEntity({ id: 'missing-explicit-asset', components: { ParticleEmitter: {
+    assetId: 'missing', name: 'Do Not Fall Back', amount: 4, rate: 100, lifetime: 1, speed: 25
+  } } });
+  let missingEvents = 0;
+  missing.events.on('particle:assetMissing', () => { missingEvents += 1; });
+  missing.update(0.25);
+  assert.strictEqual(missing.particles.effectiveAsset('missing-explicit-asset'), null, 'an explicit stable Asset reference must never fall back to inline fields');
+  assert.strictEqual(missingEvents, 1);
+  assert.strictEqual(missing.particles.getState('missing-explicit-asset').particles.length, 0);
+};
+
+const testParticleCurvesMotionLifecycleAndControls = () => {
+  const curved = particleAsset('curved', {
+    duration: 1,
+    loop: false,
+    maxParticles: 20,
+    emission: { rate: 4, burst: 1 },
+    lifetime: { min: 1, max: 1 },
+    velocity: { speedMin: 10, speedMax: 10, angle: 0, spread: 0, gravityX: 0, gravityY: 8 },
+    appearance: { baseScale: 2, baseOpacity: 0.8, baseHue: 10 },
+    curves: [
+      { id: 'emission-curve', property: 'emission', interpolation: 'linear', keys: [
+        { id: 'emission-a', time: 0, value: 0 }, { id: 'emission-b', time: 1, value: 2 }
+      ] },
+      { id: 'scale-curve', property: 'scale', interpolation: 'linear', keys: [
+        { id: 'scale-a', time: 0, value: 1 }, { id: 'scale-b', time: 1, value: 3 }
+      ] },
+      { id: 'speed-curve', property: 'speed', interpolation: 'linear', keys: [
+        { id: 'speed-a', time: 0, value: 1 }, { id: 'speed-b', time: 1, value: 0 }
+      ] },
+      { id: 'opacity-curve', property: 'opacity', interpolation: 'linear', keys: [
+        { id: 'opacity-a', time: 0, value: 1 }, { id: 'opacity-b', time: 1, value: 0 }
+      ] },
+      { id: 'hue-curve', property: 'hue', interpolation: 'linear', keys: [
+        { id: 'hue-a', time: 0, value: 0 }, { id: 'hue-b', time: 1, value: 180 }
+      ] }
+    ]
+  });
+  const engine = new AH2D.Engine({ physics: 'builtin', particleStep: 1 / 120 });
+  const lifecycle = [];
+  for (const name of ['play', 'emit', 'burst', 'death', 'complete', 'pause', 'stop', 'restart']) {
+    engine.events.on(`particle:${name}`, event => lifecycle.push({ name, id: event.entityId }));
+  }
+  engine.load(particleDocument([curved], [{ id: 'curved-emitter', assetId: 'curved', component: { seed: 9 } }]));
+  engine.update(0.25);
+  engine.update(0.25);
+  let state = engine.particles.getState('curved-emitter');
+  assert.strictEqual(state.particles.length, 2, 'the emission curve integral must contribute one rate particle beside the burst');
+  const burst = state.particles[0];
+  near(burst.age, 0.5, 1e-8, 'burst normalized age');
+  near(burst.scale, 4, 1e-8, 'scale curve multiplies baseScale');
+  near(burst.opacity, 0.4, 1e-8, 'opacity curve multiplies baseOpacity');
+  near(burst.hue, 100, 1e-8, 'hue curve offsets baseHue');
+  near(burst.vx, 5, 1e-8, 'speed curve samples normalized particle lifetime');
+  near(burst.vy, 4, 1e-8, 'gravity updates velocity');
+  near(burst.x, 3.75, 1e-8, 'speed curve integrates motion through deterministic fixed substeps');
+  near(burst.y, 1, 1e-8, 'gravity integrates displacement');
+
+  const frozen = JSON.stringify(state.particles);
+  assert.strictEqual(engine.particles.pause('curved-emitter'), true);
+  engine.update(0.25);
+  assert.strictEqual(JSON.stringify(engine.particles.getState('curved-emitter').particles), frozen, 'pause must freeze live particles and emission time');
+  engine.particles.play('curved-emitter');
+  for (let index = 0; index < 6; index += 1) engine.update(0.25);
+  state = engine.particles.getState('curved-emitter');
+  assert.strictEqual(state.completed, true, 'a non-looping emitter completes after emission and all live particles end');
+  assert.strictEqual(state.playing, false);
+  assert.ok(lifecycle.some(item => item.name === 'play'));
+  assert.ok(lifecycle.some(item => item.name === 'burst'));
+  assert.ok(lifecycle.some(item => item.name === 'death'));
+  assert.ok(lifecycle.some(item => item.name === 'complete'));
+
+  engine.particles.restart('curved-emitter');
+  assert.strictEqual(engine.particles.getState('curved-emitter').particles.length, 1, 'restart must emit the time-zero burst immediately');
+  engine.update(0);
+  const restarted = engine.particles.getState('curved-emitter');
+  assert.strictEqual(restarted.particles.length, 1, 'restart must immediately make the time-zero burst available');
+  assert.strictEqual(restarted.particles[0].id, 'curved-emitter:0');
+  assert.strictEqual(restarted.time, 0);
+  assert.strictEqual(restarted.completed, false);
+  engine.ecs.get('curved-emitter', 'ParticleEmitter').speed = 2;
+  engine.update(0.1);
+  near(engine.particles.getState('curved-emitter').particles[0].age, 0.2, 1e-8, 'emitter speed must scale simulation and playback time');
+  assert.strictEqual(engine.particles.stop('curved-emitter'), true);
+  state = engine.particles.getState('curved-emitter');
+  assert.strictEqual(state.particles.length, 0);
+  assert.strictEqual(state.time, 0);
+  assert.strictEqual(state.playing, false);
+
+  const looping = new AH2D.Engine({ physics: 'builtin', particleStep: 1 / 120 });
+  looping.load(particleDocument([particleAsset('looping', {
+    duration: 0.1, loop: true, maxParticles: 10,
+    emission: { rate: 0, burst: 1 }, lifetime: { min: 1, max: 1 }
+  })], [{ id: 'loop-emitter', assetId: 'looping', component: { seed: 4 } }]));
+  looping.update(0.1);
+  assert.strictEqual(looping.particles.getState('loop-emitter').particles.length, 2, 'a loop burst must be visible at the exact cycle boundary');
+  looping.update(0.11);
+  assert.strictEqual(looping.particles.getState('loop-emitter').particles.length, 3, 'a burst must run once at every loop boundary');
+  looping.ecs.get('loop-emitter', 'ParticleEmitter').emitting = false;
+  looping.update(0.2);
+  assert.strictEqual(looping.particles.getState('loop-emitter').particles.length, 3, 'emitting=false must stop births while existing particles keep simulating');
+};
+
+const testParticleSnapshotRestoreAndSceneReset = () => {
+  const assetA = particleAsset('snapshot-particles', {
+    maxParticles: 50,
+    emission: { rate: 13, burst: 2 },
+    lifetime: { min: 0.4, max: 1.2 },
+    velocity: { speedMin: 5, speedMax: 25, angle: -90, spread: 100, gravityY: 7 },
+    shape: { type: 'box', width: 12, height: 6 }
+  });
+  const assetB = particleAsset('scene-b-particles', { emission: { rate: 0, burst: 1 } });
+  const engine = new AH2D.Engine({ physics: 'builtin', particleStep: 1 / 120 });
+  engine.load({
+    format: 'AH2D', version: 4, currentSceneId: 'scene-a', particles: [assetA, assetB],
+    scenes: [
+      { id: 'scene-a', objects: [{ id: 'snapshot-emitter', components: { ParticleEmitter: { assetId: 'snapshot-particles', seed: 88 } } }] },
+      { id: 'scene-b', objects: [{ id: 'scene-b-emitter', components: { ParticleEmitter: { assetId: 'scene-b-particles', seed: 99 } } }] }
+    ]
+  });
+  engine.update(0.2);
+  const snapshot = engine.captureSnapshot();
+  engine.update(0.2);
+  const expected = engine.particles.getState('snapshot-emitter');
+  assert.strictEqual(engine.restoreSnapshot(snapshot), true);
+  engine.update(0.2);
+  assert.deepStrictEqual(engine.particles.getState('snapshot-emitter'), expected, 'snapshot restore must resume PRNG, emission remainder, and live particle state exactly');
+
+  engine.loadScene('scene-b');
+  assert.strictEqual(engine.activeSceneId, 'scene-b');
+  assert.strictEqual(engine.particles.getState('snapshot-emitter'), null);
+  engine.update(0);
+  assert.strictEqual(engine.particles.getState('scene-b-emitter').particles.length, 1, 'loading another Scene must initialize only that Scene emitter');
+  engine.loadScene('scene-a');
+  engine.update(0);
+  const reset = engine.particles.getState('snapshot-emitter');
+  assert.strictEqual(reset.particles.length, 2, 'returning to a Scene must reset Runtime-only particles to the authored burst');
+  assert.strictEqual(reset.time, 0);
+
+  const bridgeEngine = new AH2D.Engine({ physics: 'builtin' });
+  const bridge = new AH2D.EditorBridge(bridgeEngine);
+  const bridgeState = {
+    scene: [{ id: 'bridge-emitter', components: { ParticleEmitter: { assetId: 'scene-b-particles' } } }],
+    particles: [assetB],
+    assets: [{ id: 'bridge-texture', imageSrc: '/bridge.png' }]
+  };
+  assert.strictEqual(bridge.sync(bridgeState), true);
+  assert.strictEqual(bridgeEngine.particles.getAsset('scene-b-particles').id, 'scene-b-particles');
+  bridgeEngine.update(0);
+  assert.strictEqual(bridgeEngine.particles.getState('bridge-emitter').particles.length, 1);
+  assert.strictEqual(bridge.sync(bridgeState), false, 'Particle Assets must participate in Editor bridge change detection');
+};
+
 const deferred = () => {
   let resolve, reject;
   const promise = new Promise((resolvePromise, rejectPromise) => {
@@ -2180,6 +2495,89 @@ const testPixiSourceRectSubtextures = () => {
   assert.strictEqual(record.visual.texture, baseTexture);
   assert.strictEqual(secondTexture.destroyed, true);
   engine.stop({ restore: false });
+};
+
+const testPixiParticleGraphicsSpritesAndCleanup = async () => {
+  const PIXI = createFakePixi();
+  const host = fakeHost();
+  const engine = new AH2D.Engine({
+    runtime: 'pixijs', physics: 'builtin', particleStep: 1 / 120,
+    runtimeOptions: { PIXI }
+  });
+  engine.load({
+    format: 'AH2D', version: 4,
+    assets: [{ id: 'particle-texture', imageSrc: '/textures/particle.png' }],
+    particles: [
+      particleAsset('graphics-particles', {
+        emission: { rate: 0, burst: 2 }, lifetime: { min: 0.15, max: 0.15 },
+        appearance: { color: '#336699', blend: 'normal', baseScale: 1.5, baseOpacity: 0.6, baseHue: 0 }
+      }),
+      particleAsset('sprite-particles', {
+        emission: { rate: 0, burst: 1 }, lifetime: { min: 1, max: 1 },
+        appearance: { assetId: 'particle-texture', color: '#ff0000', blend: 'additive', baseScale: 2, baseOpacity: 0.5, baseHue: 120 }
+      })
+    ],
+    scene: [
+      { id: 'graphics-emitter', x: 20, y: 30, components: { ParticleEmitter: { assetId: 'graphics-particles', seed: 1 } } },
+      { id: 'sprite-emitter', x: 40, y: 50, components: { ParticleEmitter: { assetId: 'sprite-particles', seed: 2 } } }
+    ]
+  });
+  engine.start(host, { restoreOnStop: false });
+  engine.update(0);
+  const runtime = engine.runtime;
+  runtime.render();
+
+  const graphicsRecord = runtime.nodes.get('graphics-emitter');
+  const spriteRecord = runtime.nodes.get('sprite-emitter');
+  assert.ok(graphicsRecord.particleHost instanceof PIXI.Container, 'each native Entity node must own a dedicated particle Container');
+  assert.strictEqual(graphicsRecord.particleVisuals.size, 2);
+  assert.strictEqual(spriteRecord.particleVisuals.size, 1);
+  assert.strictEqual(runtime.particleObjects.get('graphics-emitter'), graphicsRecord.particleVisuals);
+  const graphicsVisuals = [...graphicsRecord.particleVisuals.values()].map(item => item.visual);
+  graphicsVisuals.forEach(visual => {
+    assert.ok(visual instanceof PIXI.Graphics, 'an untextured particle must reuse native Graphics');
+    assert.deepStrictEqual(visual.commands, [{ x: -2, y: -2, width: 4, height: 4, color: 0xffffff }]);
+    assert.strictEqual(visual.alpha, 0.6);
+    assert.strictEqual(visual.tint, 0x336699);
+    assert.strictEqual(visual.scaleX, 1.5);
+    assert.strictEqual(visual.scaleY, 1.5);
+  });
+  const spriteVisualRecord = [...spriteRecord.particleVisuals.values()][0];
+  const firstSprite = spriteVisualRecord.visual;
+  assert.ok(firstSprite instanceof PIXI.Sprite, 'an appearance assetId must create a native Sprite');
+  assert.deepStrictEqual(PIXI.assetLoads, ['/textures/particle.png']);
+  assert.strictEqual(firstSprite.texture, PIXI.Texture.WHITE);
+  assert.strictEqual(firstSprite.alpha, 0.5);
+  assert.strictEqual(firstSprite.tint, 0x00ff00, 'per-particle hue must rotate the native tint');
+  assert.strictEqual(firstSprite.blendMode, 'add');
+  assert.strictEqual(firstSprite.scaleX, 2);
+  await flushPromises();
+  assert.deepStrictEqual(firstSprite.texture, { id: '/textures/particle.png' });
+
+  engine.update(0.2);
+  runtime.render();
+  assert.strictEqual(graphicsRecord.particleVisuals.size, 0, 'dead particles must be removed from the native Display Tree');
+  graphicsVisuals.forEach(visual => assert.strictEqual(visual.destroyed, true, 'dead particle Graphics must be destroyed exactly once'));
+  assert.strictEqual(spriteRecord.particleVisuals.size, 1);
+
+  engine.particles.stop('sprite-emitter');
+  runtime.render();
+  assert.strictEqual(spriteRecord.particleVisuals.size, 0);
+  assert.strictEqual(firstSprite.destroyed, true, 'stopping and clearing an emitter must destroy its Sprite');
+  engine.particles.restart('sprite-emitter');
+  engine.update(0);
+  runtime.render();
+  const restartedSprite = [...spriteRecord.particleVisuals.values()][0].visual;
+  assert.notStrictEqual(restartedSprite, firstSprite);
+  engine.destroyEntity('sprite-emitter');
+  runtime.render();
+  assert.strictEqual(restartedSprite.destroyed, true, 'destroying an emitter Entity must release every native particle visual');
+  assert.strictEqual(runtime.particleObjects.has('sprite-emitter'), false);
+
+  engine.stop({ restore: false });
+  assert.strictEqual(runtime.nodes.size, 0);
+  assert.strictEqual(runtime.particleObjects.size, 0);
+  assert.deepStrictEqual(host.children, []);
 };
 
 const testPixiLiveChildrenSurviveParentDeletion = () => {
@@ -3721,9 +4119,14 @@ const run = async () => {
   testRealPlanckContactsTriggersFilteringAndMass();
   testDocumentPhysicsSelectionAndNativeSnapshot();
   testPublicPlayStopRestoresPhysicsBackendState();
+  testParticleDeterminismShapesAndCapacity();
+  testLegacyInlineParticleEmitterCompatibility();
+  testParticleCurvesMotionLifecycleAndControls();
+  testParticleSnapshotRestoreAndSceneReset();
   await testPixiV8AsyncMountAndNativeScene();
   await testPixiRuntimeMutationsAndAssetStaleness();
   testPixiSourceRectSubtextures();
+  await testPixiParticleGraphicsSpritesAndCleanup();
   testPixiLiveChildrenSurviveParentDeletion();
   await testPixiStopWhileInitializationPending();
   await testMultiScenePlaySnapshotRestoreWithPixi();

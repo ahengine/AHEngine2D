@@ -1034,6 +1034,631 @@
     }
   }
 
+  const LEGACY_INLINE_PARTICLE_FIELDS = Object.freeze([
+    'name', 'amount', 'rate', 'lifetime', 'speed', 'spread', 'gravity', 'radius', 'scale', 'opacity', 'hue', 'blend'
+  ]);
+
+  /**
+   * Framework-neutral deterministic particle simulation.
+   *
+   * Authored definitions live in the Project's top-level `particles` Asset
+   * library. Scene Entities only carry a ParticleEmitter binding; live
+   * particles and PRNG bookkeeping are Runtime state. Each emitter owns its
+   * random stream so creating or deleting another emitter cannot perturb it.
+   */
+  class ParticleSystem {
+    constructor(engine, options = {}) {
+      this.engine = engine || null;
+      this.assets = new Map();
+      this.names = new Map();
+      this.states = new Map();
+      this.missingAssets = new Map();
+      this.time = 0;
+      this.seed = this._seed(options.seed ?? 0x6d2b79f5);
+      this.fixedStep = clamp(finite(options.fixedStep, 1 / 120), 1 / 1000, 0.25);
+      this.engine?.events.on('entity:destroy', entityId => this.forget(entityId));
+    }
+    _seed(value) {
+      if (Number.isInteger(Number(value)) && Number(value) >= 0) return Number(value) >>> 0;
+      const text = String(value == null ? '' : value);
+      let hash = 2166136261;
+      for (let index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+      }
+      return hash >>> 0;
+    }
+    _emitterSeed(entityId, emitter, asset) {
+      if (Number.isInteger(Number(emitter?.seed)) && Number(emitter.seed) >= 0) return Number(emitter.seed) >>> 0;
+      return this._seed(`${this.seed}:${entityId}:${asset?.id || emitter?.assetId || ''}`);
+    }
+    _random(state, emitter) {
+      state.rngState = (Math.imul(state.rngState >>> 0, 1664525) + 1013904223) >>> 0;
+      emitter.rngState = state.rngState;
+      return state.rngState / 0x100000000;
+    }
+    _range(state, emitter, minimum, maximum) {
+      const min = finite(minimum, 0), max = finite(maximum, min);
+      if (max === min) return min;
+      return min + (max - min) * this._random(state, emitter);
+    }
+    _normalizeAsset(source = {}, index = 0) {
+      const normalizedSource = isPlainObject(source) && typeof DataModel.normalizeParticleAsset === 'function'
+        ? DataModel.normalizeParticleAsset(source, { index })
+        : source;
+      const asset = isPlainObject(normalizedSource) ? clone(normalizedSource) : {};
+      const authoredLifetime = isPlainObject(asset.lifetime) ? asset.lifetime : {};
+      const legacyLifetime = Number.isFinite(Number(asset.lifetime)) ? Number(asset.lifetime) : 1;
+      const emission = isPlainObject(asset.emission) ? asset.emission : {};
+      const velocity = isPlainObject(asset.velocity) ? asset.velocity : {};
+      const shape = isPlainObject(asset.shape) ? asset.shape : {};
+      const appearance = isPlainObject(asset.appearance) ? asset.appearance : {};
+      const legacySpeed = finite(asset.speed, 0);
+      const legacyGravity = finite(asset.gravity, 0);
+      const normalized = {
+        ...asset,
+        id: String(asset.id || `particle-${index + 1}`),
+        name: String(asset.name || asset.id || `Particle ${index + 1}`),
+        duration: Math.max(0, finite(asset.duration, 1)),
+        loop: typeof asset.loop === 'boolean' ? asset.loop : true,
+        maxParticles: Math.max(0, Math.floor(finite(asset.maxParticles ?? asset.amount, 100))),
+        emission: {
+          ...emission,
+          rate: Math.max(0, finite(emission.rate ?? asset.rate, 10)),
+          burst: Math.max(0, Math.floor(finite(emission.burst ?? asset.burst, 0)))
+        },
+        lifetime: {
+          ...authoredLifetime,
+          min: Math.max(0, finite(authoredLifetime.min, legacyLifetime)),
+          max: Math.max(0, finite(authoredLifetime.max, legacyLifetime))
+        },
+        velocity: {
+          ...velocity,
+          speedMin: Math.max(0, finite(velocity.speedMin, legacySpeed)),
+          speedMax: Math.max(0, finite(velocity.speedMax, legacySpeed)),
+          angle: finite(velocity.angle, -90),
+          spread: Math.max(0, finite(velocity.spread ?? asset.spread, 0)),
+          gravityX: finite(velocity.gravityX, 0),
+          gravityY: finite(velocity.gravityY ?? asset.gravity, legacyGravity)
+        },
+        shape: {
+          ...shape,
+          type: ['circle', 'box'].includes(String(shape.type || '').toLowerCase()) ? String(shape.type).toLowerCase() : 'point',
+          radius: Math.max(0, finite(shape.radius ?? asset.radius, 0)),
+          width: Math.max(0, finite(shape.width, 0)),
+          height: Math.max(0, finite(shape.height, 0))
+        },
+        appearance: {
+          ...appearance,
+          color: appearance.color ?? asset.color ?? '#ffffff',
+          blend: appearance.blend ?? asset.blend ?? 'normal',
+          baseScale: Math.max(0, finite(appearance.baseScale ?? asset.scale, 1)),
+          baseOpacity: clamp(finite(appearance.baseOpacity ?? asset.opacity, 1), 0, 1),
+          baseHue: finite(appearance.baseHue ?? asset.hue, 0)
+        },
+        curves: Array.isArray(asset.curves) ? clone(asset.curves) : []
+      };
+      if (normalized.lifetime.max < normalized.lifetime.min) {
+        [normalized.lifetime.min, normalized.lifetime.max] = [normalized.lifetime.max, normalized.lifetime.min];
+      }
+      if (normalized.velocity.speedMax < normalized.velocity.speedMin) {
+        [normalized.velocity.speedMin, normalized.velocity.speedMax] = [normalized.velocity.speedMax, normalized.velocity.speedMin];
+      }
+      return normalized;
+    }
+    _isLegacyInlineEmitter(emitter) {
+      const assetId = typeof emitter?.assetId === 'string' ? emitter.assetId.trim() : '';
+      return !assetId && isPlainObject(emitter) && LEGACY_INLINE_PARTICLE_FIELDS.some(field => Object.prototype.hasOwnProperty.call(emitter, field));
+    }
+    _legacyInlineAsset(emitter) {
+      if (!this._isLegacyInlineEmitter(emitter)) return null;
+      const source = {};
+      for (const field of LEGACY_INLINE_PARTICLE_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(emitter, field)) source[field] = clone(emitter[field]);
+      }
+      const name = String(source.name || 'Legacy Particle').trim() || 'Legacy Particle';
+      const slug = name.toLocaleLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'particle';
+      return this._normalizeAsset({ ...source, id: `legacy-inline:${slug}`, name });
+    }
+    _playbackSpeed(emitter) {
+      const value = this._isLegacyInlineEmitter(emitter) ? emitter.timeScale : (emitter.speed ?? emitter.timeScale);
+      return Math.max(0, finite(value, 1));
+    }
+    _setPlaybackSpeed(emitter, value) {
+      const speed = Math.max(0, finite(value, 1));
+      if (this._isLegacyInlineEmitter(emitter)) emitter.timeScale = speed;
+      else emitter.speed = speed;
+      return speed;
+    }
+    load(source) {
+      const input = Array.isArray(source) ? source : (Array.isArray(source?.particles) ? source.particles : []);
+      let assets = input;
+      if (typeof DataModel.normalizeParticleAssets === 'function') {
+        const normalized = DataModel.normalizeParticleAssets(input);
+        assets = Array.isArray(normalized) ? normalized : (Array.isArray(normalized?.particles) ? normalized.particles : input);
+      }
+      this.assets.clear();
+      this.names.clear();
+      assets.forEach((value, index) => {
+        const asset = this._normalizeAsset(value, index);
+        if (!this.assets.has(asset.id)) this.assets.set(asset.id, asset);
+        const name = String(asset.name || '').trim().toLocaleLowerCase();
+        if (name) {
+          const matches = this.names.get(name) || [];
+          matches.push(asset);
+          this.names.set(name, matches);
+        }
+      });
+      this.states.clear();
+      this.missingAssets.clear();
+      this.time = 0;
+      return this;
+    }
+    initialize() {
+      if (!this.engine) return this;
+      for (const entityId of this.engine.ecs.query('ParticleEmitter')) {
+        const emitter = this.engine.ecs.get(entityId, 'ParticleEmitter');
+        const asset = this.effectiveAsset(emitter);
+        if (asset) this._state(entityId, emitter, asset);
+      }
+      return this;
+    }
+    resolve(reference) {
+      const key = String(reference == null ? '' : reference).trim();
+      if (!key) return null;
+      if (this.assets.has(key)) return this.assets.get(key);
+      const matches = this.names.get(key.toLocaleLowerCase()) || [];
+      return matches.length === 1 ? matches[0] : null;
+    }
+    getAsset(reference) {
+      const asset = this.resolve(reference);
+      return asset ? clone(asset) : null;
+    }
+    _merge(base, override) {
+      if (!isPlainObject(base) || !isPlainObject(override)) return clone(override);
+      const output = clone(base);
+      for (const [key, value] of Object.entries(override)) {
+        output[key] = isPlainObject(value) && isPlainObject(output[key])
+          ? this._merge(output[key], value)
+          : clone(value);
+      }
+      return output;
+    }
+    effectiveAsset(entityOrEmitter) {
+      const emitter = typeof entityOrEmitter === 'string'
+        ? this.engine?.ecs.get(entityOrEmitter, 'ParticleEmitter')
+        : entityOrEmitter;
+      const reference = typeof emitter?.assetId === 'string' ? emitter.assetId.trim() : '';
+      const asset = reference ? this.resolve(reference) : this._legacyInlineAsset(emitter);
+      if (!asset) return null;
+      if (!reference) return asset;
+      const merged = this._merge(asset, isPlainObject(emitter?.overrides) ? emitter.overrides : {});
+      // An instance may override parameters, never the stable Asset identity
+      // selected by ParticleEmitter.assetId.
+      merged.id = asset.id;
+      merged.name = asset.name;
+      return this._normalizeAsset(merged);
+    }
+    _component(entityId) {
+      if (!this.engine?.ecs.entities.has(entityId)) throw new Error(`Unknown Entity: ${entityId}`);
+      return this.engine.ecs.get(entityId, 'ParticleEmitter') || null;
+    }
+    _state(entityId, emitter, asset) {
+      const configuredSeed = this._emitterSeed(entityId, emitter, asset);
+      let state = this.states.get(entityId);
+      if (!state || state.assetId !== asset.id || state.configuredSeed !== configuredSeed) {
+        const bindingChanged = Boolean(state && (state.assetId !== asset.id || state.configuredSeed !== configuredSeed));
+        const authoredParticles = !bindingChanged && Array.isArray(emitter.particles) ? emitter.particles : [];
+        if (bindingChanged) {
+          emitter.particles = authoredParticles;
+          emitter.emissionAccumulator = 0;
+          emitter.completed = false;
+          emitter.time = 0;
+        }
+        const duration = Math.max(0, finite(asset.duration, 0));
+        const loops = typeof emitter.loop === 'boolean' ? emitter.loop : asset.loop !== false;
+        const authoredTime = Math.max(0, finite(emitter.time, 0));
+        const cycle = duration > 1e-12 ? Math.floor(authoredTime / duration) : 0;
+        if (duration > 1e-12) emitter.time = loops ? authoredTime % duration : Math.min(authoredTime, duration);
+        else emitter.time = authoredTime;
+        const nextParticleId = authoredParticles.reduce((maximum, particle) => {
+          const match = String(particle?.id || '').match(/:(\d+)$/);
+          return match ? Math.max(maximum, Number(match[1]) + 1) : maximum;
+        }, authoredParticles.length);
+        const restoredRng = Number.isInteger(Number(emitter.rngState)) && Number(emitter.rngState) >= 0
+          ? Number(emitter.rngState) >>> 0
+          : configuredSeed;
+        state = {
+          assetId: asset.id,
+          configuredSeed,
+          rngState: restoredRng,
+          nextParticleId,
+          remainder: 0,
+          cycle,
+          cycleStarted: finite(emitter.time, 0) > 1e-12,
+          emissionEnded: !loops && duration > 1e-12 && authoredTime >= duration,
+          completionEmitted: Boolean(emitter.completed)
+        };
+        this.states.set(entityId, state);
+        emitter.particles = authoredParticles;
+        emitter.emissionAccumulator = Math.max(0, finite(emitter.emissionAccumulator, 0));
+        emitter.rngState = restoredRng;
+        emitter.completed = Boolean(emitter.completed);
+      }
+      return state;
+    }
+    forget(entityId) {
+      this.missingAssets.delete(entityId);
+      return this.states.delete(entityId);
+    }
+    _reset(entityId, emitter, asset, options = {}) {
+      if (options.clear !== false) emitter.particles = [];
+      if (options.time !== false) emitter.time = Math.max(0, finite(options.at, 0));
+      emitter.emissionAccumulator = 0;
+      emitter.completed = false;
+      const configuredSeed = this._emitterSeed(entityId, emitter, asset);
+      emitter.rngState = configuredSeed;
+      this.states.delete(entityId);
+      const state = this._state(entityId, emitter, asset);
+      state.cycleStarted = finite(emitter.time, 0) > 1e-12;
+      state.emissionEnded = false;
+      state.completionEmitted = false;
+      return state;
+    }
+    play(entityId, options = {}) {
+      const emitter = this._component(entityId);
+      if (!emitter) return false;
+      const asset = this.effectiveAsset(emitter);
+      if (!asset) throw new Error(`Unknown Particle Asset: ${emitter.assetId || '(none)'}`);
+      if (options.fromStart || emitter.completed) this._reset(entityId, emitter, asset, { clear: options.clear !== false });
+      if (options.time != null) {
+        emitter.time = Math.max(0, finite(options.time, 0));
+        this.states.delete(entityId);
+      }
+      if (options.speed != null) this._setPlaybackSpeed(emitter, options.speed);
+      if (options.loop != null) emitter.loop = Boolean(options.loop);
+      emitter.playing = true;
+      emitter.emitting = options.emitting == null ? true : Boolean(options.emitting);
+      emitter.completed = false;
+      const state = this._state(entityId, emitter, asset);
+      state.completionEmitted = false;
+      this.engine.events.emit('particle:play', { entityId, assetId: asset.id, emitter, engine: this.engine });
+      this._beginCycle(entityId, emitter, asset, state);
+      return emitter;
+    }
+    pause(entityId) {
+      const emitter = this._component(entityId);
+      if (!emitter) return false;
+      emitter.playing = false;
+      this.engine.events.emit('particle:pause', { entityId, assetId: emitter.assetId || null, emitter, engine: this.engine });
+      return true;
+    }
+    stop(entityId, options = {}) {
+      const emitter = this._component(entityId);
+      if (!emitter) return false;
+      const asset = this.effectiveAsset(emitter);
+      emitter.playing = false;
+      emitter.emitting = false;
+      if (asset) this._reset(entityId, emitter, asset, {
+        clear: options.clear !== false,
+        time: options.reset !== false,
+        at: options.time
+      });
+      else {
+        if (options.clear !== false) emitter.particles = [];
+        if (options.reset !== false) emitter.time = Math.max(0, finite(options.time, 0));
+        emitter.emissionAccumulator = 0;
+        emitter.completed = false;
+        this.states.delete(entityId);
+      }
+      this.engine.events.emit('particle:stop', { entityId, assetId: emitter.assetId || null, emitter, engine: this.engine });
+      return true;
+    }
+    restart(entityId, options = {}) {
+      const emitter = this._component(entityId);
+      if (!emitter) return false;
+      const asset = this.effectiveAsset(emitter);
+      if (!asset) throw new Error(`Unknown Particle Asset: ${emitter.assetId || '(none)'}`);
+      this._reset(entityId, emitter, asset, { clear: options.clear !== false, at: options.time });
+      emitter.playing = true;
+      emitter.emitting = options.emitting == null ? true : Boolean(options.emitting);
+      if (options.speed != null) this._setPlaybackSpeed(emitter, options.speed);
+      if (options.loop != null) emitter.loop = Boolean(options.loop);
+      this.engine.events.emit('particle:restart', { entityId, assetId: asset.id, emitter, engine: this.engine });
+      this._beginCycle(entityId, emitter, asset, this.states.get(entityId));
+      return emitter;
+    }
+    getState(entityId) {
+      if (!this.engine?.ecs.entities.has(entityId)) return null;
+      const emitter = this._component(entityId);
+      if (!emitter) return null;
+      const asset = this.effectiveAsset(emitter);
+      const state = asset ? this._state(entityId, emitter, asset) : this.states.get(entityId);
+      return {
+        entityId,
+        assetId: emitter.assetId || null,
+        asset,
+        autoplay: emitter.autoplay !== false,
+        playing: emitter.playing === true,
+        emitting: emitter.emitting !== false,
+        loop: typeof emitter.loop === 'boolean' ? emitter.loop : asset?.loop !== false,
+        time: Math.max(0, finite(emitter.time, 0)),
+        speed: this._playbackSpeed(emitter),
+        completed: Boolean(emitter.completed),
+        emissionAccumulator: Math.max(0, finite(emitter.emissionAccumulator, 0)),
+        rngState: Number(emitter.rngState) >>> 0,
+        particles: clone(Array.isArray(emitter.particles) ? emitter.particles : []),
+        simulationRemainder: finite(state?.remainder, 0)
+      };
+    }
+    _curve(asset, property) {
+      const expected = String(property).toLocaleLowerCase();
+      if (Array.isArray(asset?.curves)) {
+        return asset.curves.find(curve => String(curve?.property || curve?.channel || curve?.type || '').toLocaleLowerCase() === expected) || null;
+      }
+      return isPlainObject(asset?.curves) ? (asset.curves[property] || asset.curves[expected] || null) : null;
+    }
+    _sampleCurve(asset, property, time, defaultValue) {
+      const curve = this._curve(asset, property);
+      if (!curve) return defaultValue;
+      if (typeof DataModel.sampleParticleCurve === 'function') {
+        return finite(DataModel.sampleParticleCurve(curve, clamp(time, 0, 1), { defaultValue }), defaultValue);
+      }
+      const keys = (Array.isArray(curve) ? curve : curve.keys)?.filter(key => Number.isFinite(Number(key?.time)) && Number.isFinite(Number(key?.value))) || [];
+      if (!keys.length) return defaultValue;
+      const sorted = keys.slice().sort((left, right) => Number(left.time) - Number(right.time));
+      const at = clamp(time, 0, 1);
+      if (at <= Number(sorted[0].time)) return Number(sorted[0].value);
+      if (at >= Number(sorted[sorted.length - 1].time)) return Number(sorted[sorted.length - 1].value);
+      for (let index = 0; index + 1 < sorted.length; index += 1) {
+        const left = sorted[index], right = sorted[index + 1];
+        if (at > Number(right.time)) continue;
+        if (curve.interpolation === 'step' || left.interpolation === 'step') return Number(left.value);
+        const span = Number(right.time) - Number(left.time);
+        const mix = span > 0 ? (at - Number(left.time)) / span : 0;
+        return Number(left.value) + (Number(right.value) - Number(left.value)) * mix;
+      }
+      return defaultValue;
+    }
+    _applyParticleCurves(particle, asset, normalizedAge) {
+      const t = clamp(normalizedAge, 0, 1);
+      particle.speedScale = this._sampleCurve(asset, 'speed', t, 1);
+      particle.scale = Math.max(0, particle.baseScale * this._sampleCurve(asset, 'scale', t, 1));
+      particle.opacity = clamp(particle.baseOpacity * this._sampleCurve(asset, 'opacity', t, 1), 0, 1);
+      particle.hue = particle.baseHue + this._sampleCurve(asset, 'hue', t, 0);
+      return particle;
+    }
+    _spawnPoint(state, emitter, shape) {
+      if (shape.type === 'circle') {
+        const angle = this._random(state, emitter) * Math.PI * 2;
+        const radius = Math.sqrt(this._random(state, emitter)) * shape.radius;
+        return { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+      }
+      if (shape.type === 'box') {
+        return {
+          x: (this._random(state, emitter) - 0.5) * shape.width,
+          y: (this._random(state, emitter) - 0.5) * shape.height
+        };
+      }
+      return { x: 0, y: 0 };
+    }
+    _spawn(entityId, emitter, asset, state) {
+      const lifetime = this._range(state, emitter, asset.lifetime.min, asset.lifetime.max);
+      const point = this._spawnPoint(state, emitter, asset.shape);
+      const angle = asset.velocity.angle + (this._random(state, emitter) - 0.5) * asset.velocity.spread;
+      const speed = this._range(state, emitter, asset.velocity.speedMin, asset.velocity.speedMax);
+      const radians = angle * Math.PI / 180;
+      const appearance = asset.appearance;
+      const particle = {
+        id: `${entityId}:${state.nextParticleId++}`,
+        x: point.x,
+        y: point.y,
+        vx: Math.cos(radians) * speed,
+        vy: Math.sin(radians) * speed,
+        baseVx: Math.cos(radians) * speed,
+        baseVy: Math.sin(radians) * speed,
+        age: 0,
+        lifetime,
+        rotation: finite(appearance.rotation, appearance.alignToVelocity ? angle : 0),
+        baseScale: Math.max(0, finite(appearance.baseScale, 1)),
+        baseOpacity: clamp(finite(appearance.baseOpacity, 1), 0, 1),
+        baseHue: finite(appearance.baseHue, 0),
+        color: appearance.color,
+        blend: appearance.blend,
+        assetId: appearance.assetId || appearance.textureAssetId || null,
+        imageSrc: appearance.imageSrc || appearance.src || null
+      };
+      this._applyParticleCurves(particle, asset, 0);
+      particle.vx = particle.baseVx * particle.speedScale;
+      particle.vy = particle.baseVy * particle.speedScale;
+      emitter.particles.push(particle);
+      this.engine.events.emit('particle:emit', { entityId, assetId: asset.id, particle, emitter, engine: this.engine });
+      return particle;
+    }
+    _emitCount(entityId, emitter, asset, state, requested, reason) {
+      const available = Math.max(0, asset.maxParticles - emitter.particles.length);
+      const count = Math.min(available, Math.max(0, Math.floor(finite(requested, 0))));
+      for (let index = 0; index < count; index += 1) this._spawn(entityId, emitter, asset, state);
+      if (count && reason === 'burst') {
+        this.engine.events.emit('particle:burst', { entityId, assetId: asset.id, count, emitter, engine: this.engine });
+      }
+      return count;
+    }
+    _beginCycle(entityId, emitter, asset, state) {
+      if (state.cycleStarted) return;
+      state.cycleStarted = true;
+      if (emitter.emitting !== false) this._emitCount(entityId, emitter, asset, state, asset.emission.burst, 'burst');
+    }
+    _ageParticles(entityId, emitter, asset, dt) {
+      if (!(dt > 0) || !emitter.particles.length) return;
+      const alive = [];
+      for (const particle of emitter.particles) {
+        const age = Math.max(0, finite(particle.age, 0));
+        const lifetime = Math.max(0, finite(particle.lifetime, 0));
+        const aliveDt = Math.max(0, Math.min(dt, lifetime - age));
+        const gravityX = asset.velocity.gravityX, gravityY = asset.velocity.gravityY;
+        const currentScale = finite(particle.speedScale, this._sampleCurve(asset, 'speed', lifetime > 0 ? age / lifetime : 1, 1));
+        if (!Number.isFinite(Number(particle.baseVx))) particle.baseVx = (finite(particle.vx, 0) - gravityX * age) / (Math.abs(currentScale) > 1e-12 ? currentScale : 1);
+        if (!Number.isFinite(Number(particle.baseVy))) particle.baseVy = (finite(particle.vy, 0) - gravityY * age) / (Math.abs(currentScale) > 1e-12 ? currentScale : 1);
+        if (aliveDt > 0) {
+          const midpointAge = age + aliveDt * 0.5;
+          const midpoint = lifetime > 0 ? midpointAge / lifetime : 1;
+          const speedScale = this._sampleCurve(asset, 'speed', midpoint, 1);
+          particle.x = finite(particle.x, 0) + particle.baseVx * speedScale * aliveDt + gravityX * (age * aliveDt + aliveDt * aliveDt * 0.5);
+          particle.y = finite(particle.y, 0) + particle.baseVy * speedScale * aliveDt + gravityY * (age * aliveDt + aliveDt * aliveDt * 0.5);
+          particle.age = age + aliveDt;
+          this._applyParticleCurves(particle, asset, lifetime > 0 ? particle.age / lifetime : 1);
+          particle.vx = particle.baseVx * particle.speedScale + gravityX * particle.age;
+          particle.vy = particle.baseVy * particle.speedScale + gravityY * particle.age;
+          if (asset.appearance.alignToVelocity) particle.rotation = Math.atan2(particle.vy, particle.vx) * 180 / Math.PI;
+        }
+        if (lifetime > 0 && particle.age + 1e-12 < lifetime) alive.push(particle);
+        else {
+          particle.age = lifetime;
+          this.engine.events.emit('particle:death', { entityId, assetId: asset.id, particle: clone(particle), emitter, engine: this.engine });
+        }
+      }
+      emitter.particles = alive;
+    }
+    _emitContinuous(entityId, emitter, asset, state, startTime, dt) {
+      if (!(dt > 0) || emitter.emitting === false) return;
+      const duration = Math.max(0, asset.duration);
+      const normalized = duration > 1e-12 ? clamp((startTime + dt * 0.5) / duration, 0, 1) : 0;
+      const rateScale = Math.max(0, this._sampleCurve(asset, 'emission', normalized, 1));
+      emitter.emissionAccumulator += Math.max(0, asset.emission.rate) * rateScale * dt;
+      const count = Math.floor(emitter.emissionAccumulator + 1e-10);
+      if (!count) return;
+      emitter.emissionAccumulator = Math.max(0, emitter.emissionAccumulator - count);
+      this._emitCount(entityId, emitter, asset, state, count, 'rate');
+    }
+    _stepEmitter(entityId, emitter, asset, state, step) {
+      let remaining = step;
+      const duration = Math.max(0, asset.duration);
+      const loop = typeof emitter.loop === 'boolean' ? emitter.loop : asset.loop !== false;
+      this._beginCycle(entityId, emitter, asset, state);
+      if (duration <= 1e-12 && !loop) state.emissionEnded = true;
+      while (remaining > 1e-12) {
+        if (state.emissionEnded) {
+          this._ageParticles(entityId, emitter, asset, remaining);
+          remaining = 0;
+          break;
+        }
+        const time = Math.max(0, finite(emitter.time, 0));
+        const untilBoundary = duration > 1e-12 ? Math.max(0, duration - time) : remaining;
+        const segment = Math.min(remaining, untilBoundary || remaining);
+        this._ageParticles(entityId, emitter, asset, segment);
+        this._emitContinuous(entityId, emitter, asset, state, time, segment);
+        emitter.time = time + segment;
+        remaining -= segment;
+        if (duration > 1e-12 && emitter.time + 1e-12 >= duration) {
+          if (loop) {
+            emitter.time = 0;
+            state.cycle += 1;
+            state.cycleStarted = false;
+            // A loop begins at the boundary itself. Emitting its burst here
+            // keeps an update ending exactly on `duration` equivalent to the
+            // same interval split across two calls.
+            this._beginCycle(entityId, emitter, asset, state);
+          } else {
+            emitter.time = duration;
+            state.emissionEnded = true;
+          }
+        }
+      }
+    }
+    _finishIfComplete(entityId, emitter, asset, state) {
+      if (!state.emissionEnded || emitter.particles.length || emitter.completed) return false;
+      emitter.playing = false;
+      emitter.emitting = false;
+      emitter.completed = true;
+      if (!state.completionEmitted) {
+        state.completionEmitted = true;
+        this.engine.events.emit('particle:complete', { entityId, assetId: asset.id, emitter, engine: this.engine });
+      }
+      return true;
+    }
+    update(dt) {
+      dt = clamp(finite(dt, 0), 0, 0.25);
+      this.time += dt;
+      const live = new Set(this.engine.ecs.query('ParticleEmitter'));
+      for (const entityId of [...this.states.keys()]) if (!live.has(entityId)) this.states.delete(entityId);
+      for (const entityId of [...this.missingAssets.keys()]) if (!live.has(entityId)) this.missingAssets.delete(entityId);
+      for (const entityId of live) {
+        const emitter = this.engine.ecs.get(entityId, 'ParticleEmitter');
+        const asset = this.effectiveAsset(emitter);
+        if (!asset) {
+          const missingAssetId = emitter.assetId || null;
+          if (this.missingAssets.get(entityId) !== missingAssetId) {
+            this.missingAssets.set(entityId, missingAssetId);
+            this.engine.events.emit('particle:assetMissing', { entityId, assetId: emitter.assetId || null, emitter, engine: this.engine });
+          }
+          continue;
+        }
+        this.missingAssets.delete(entityId);
+        const state = this._state(entityId, emitter, asset);
+        if (emitter.playing == null && emitter.autoplay !== false) {
+          emitter.playing = true;
+          emitter.completed = false;
+          state.completionEmitted = false;
+          this.engine.events.emit('particle:play', { entityId, assetId: asset.id, emitter, autoplay: true, engine: this.engine });
+        }
+        if (emitter.playing !== true) continue;
+        this._beginCycle(entityId, emitter, asset, state);
+        const speed = this._playbackSpeed(emitter);
+        state.remainder += dt * speed;
+        let steps = 0;
+        while (state.remainder + 1e-12 >= this.fixedStep && steps < 30000) {
+          this._stepEmitter(entityId, emitter, asset, state, this.fixedStep);
+          state.remainder = Math.max(0, state.remainder - this.fixedStep);
+          steps += 1;
+        }
+        emitter.rngState = state.rngState;
+        this._finishIfComplete(entityId, emitter, asset, state);
+        this.engine.events.emit('particle:update', {
+          entityId,
+          assetId: asset.id,
+          dt,
+          simulatedDt: steps * this.fixedStep,
+          emitter,
+          particles: emitter.particles,
+          engine: this.engine
+        });
+      }
+      return this;
+    }
+    snapshot() {
+      return {
+        time: this.time,
+        seed: this.seed,
+        fixedStep: this.fixedStep,
+        emitters: this.engine.ecs.query('ParticleEmitter').map(entityId => ({
+          entityId,
+          component: clone(this.engine.ecs.get(entityId, 'ParticleEmitter')),
+          state: clone(this.states.get(entityId) || null)
+        }))
+      };
+    }
+    restore(snapshot = {}) {
+      this.time = Math.max(0, finite(snapshot.time, 0));
+      if (Number.isInteger(Number(snapshot.seed)) && Number(snapshot.seed) >= 0) this.seed = Number(snapshot.seed) >>> 0;
+      if (Number.isFinite(Number(snapshot.fixedStep))) this.fixedStep = clamp(Number(snapshot.fixedStep), 1 / 1000, 0.25);
+      this.states.clear();
+      this.missingAssets.clear();
+      for (const entry of Array.isArray(snapshot.emitters) ? snapshot.emitters : []) {
+        const entityId = String(entry?.entityId || '');
+        const emitter = this.engine.ecs.get(entityId, 'ParticleEmitter');
+        if (!emitter) continue;
+        if (isPlainObject(entry.component)) {
+          Object.keys(emitter).forEach(key => delete emitter[key]);
+          Object.assign(emitter, clone(entry.component));
+        }
+        if (isPlainObject(entry.state)) this.states.set(entityId, clone(entry.state));
+      }
+      this.engine.events.emit('particle:restore', { snapshot, particles: this, engine: this.engine });
+      return this;
+    }
+  }
+
   /**
    * Framework-neutral 2D skeletal runtime.
    *
@@ -3296,6 +3921,7 @@
       this.options = { ...options };
       delete this.options.PIXI;
       this.objects = new Map();
+      this.particleObjects = new Map();
       this.nodes = new Map();
       this.textureLoads = new Map();
       this.app = null;
@@ -3448,16 +4074,21 @@
       if (record) return record;
       const node = this._container(`AH2D Entity ${id}`);
       const visualHost = this._container(`AH2D Visual ${id}`);
+      const particleHost = this._container(`AH2D Particles ${id}`);
       const childrenHost = this._container(`AH2D Children ${id}`);
       visualHost.sortableChildren = false;
+      particleHost.sortableChildren = false;
       node.addChild(visualHost);
+      node.addChild(particleHost);
       node.addChild(childrenHost);
       record = {
-        node, visualHost, childrenHost,
+        node, visualHost, particleHost, childrenHost,
         visual: null, visualKind: null, sourceKey: null,
-        textureGeneration: 0, ownedTexture: null, ownedGeometry: null, geometryKey: null
+        textureGeneration: 0, ownedTexture: null, ownedGeometry: null, geometryKey: null,
+        particleVisuals: new Map()
       };
       this.nodes.set(id, record);
+      this.particleObjects.set(id, record.particleVisuals);
       return record;
     }
     _removeNode(id) {
@@ -3465,6 +4096,7 @@
       if (!record) return;
       record.textureGeneration += 1;
       this._destroyVisual(record);
+      this._clearParticleVisuals(record);
       // Entity nodes live below their parent's childrenHost. Detach them before
       // destroying this record so deleting/reparenting a parent cannot
       // recursively destroy DisplayObjects that still exist in the ECS graph.
@@ -3476,6 +4108,7 @@
       record.node.destroy?.({ children: true, texture: false, textureSource: false, baseTexture: false });
       this.nodes.delete(id);
       this.objects.delete(id);
+      this.particleObjects.delete(id);
     }
     _setChildIndex(parent, child, index) {
       if (!parent || child.parent !== parent || typeof parent.setChildIndex !== 'function') return;
@@ -3601,6 +4234,167 @@
     _createSprite(texture) {
       try { return new this.PIXI.Sprite(texture || this._whiteTexture()); }
       catch (_) { return new this.PIXI.Sprite({ texture: texture || this._whiteTexture() }); }
+    }
+    _destroyParticleVisual(record, particleId) {
+      const visualRecord = record?.particleVisuals?.get(particleId);
+      if (!visualRecord) return;
+      visualRecord.textureGeneration += 1;
+      this._releaseOwnedTexture(visualRecord);
+      record.particleHost?.removeChild?.(visualRecord.visual);
+      visualRecord.visual?.destroy?.({ texture: false, textureSource: false, baseTexture: false });
+      record.particleVisuals.delete(particleId);
+    }
+    _clearParticleVisuals(record) {
+      for (const particleId of [...(record?.particleVisuals?.keys() || [])]) this._destroyParticleVisual(record, particleId);
+    }
+    _particleSize(appearance) {
+      const radius = Math.max(0, finite(appearance?.radius, 0));
+      const size = Math.max(0, finite(appearance?.size, radius > 0 ? radius * 2 : 4));
+      return {
+        width: Math.max(0, finite(appearance?.width, size || 4)) || 4,
+        height: Math.max(0, finite(appearance?.height, size || 4)) || 4,
+        circle: appearance?.shape !== 'box' && appearance?.particleShape !== 'box'
+      };
+    }
+    _drawParticleGraphics(graphics, appearance) {
+      const size = this._particleSize(appearance);
+      graphics.clear?.();
+      if (size.circle && typeof graphics.circle === 'function' && typeof graphics.fill === 'function') {
+        graphics.circle(0, 0, Math.max(size.width, size.height) * 0.5).fill(0xffffff);
+      } else this._drawGraphics(graphics, size.width, size.height, 0xffffff, 0.5, 0.5);
+      return size;
+    }
+    _colorWithHue(value, hue) {
+      const color = this._color(value, 0xffffff) >>> 0;
+      const shift = finite(hue, 0);
+      if (Math.abs(shift) <= 1e-12) return color;
+      let r = ((color >> 16) & 255) / 255;
+      let g = ((color >> 8) & 255) / 255;
+      let b = (color & 255) / 255;
+      const max = Math.max(r, g, b), min = Math.min(r, g, b), delta = max - min;
+      let h = 0;
+      if (delta > 1e-12) {
+        if (max === r) h = ((g - b) / delta) % 6;
+        else if (max === g) h = (b - r) / delta + 2;
+        else h = (r - g) / delta + 4;
+        h /= 6;
+      }
+      h = ((h + shift / 360) % 1 + 1) % 1;
+      const saturation = max <= 1e-12 ? 0 : delta / max;
+      const valueChannel = max;
+      const sector = h * 6, index = Math.floor(sector), fraction = sector - index;
+      const p = valueChannel * (1 - saturation);
+      const q = valueChannel * (1 - saturation * fraction);
+      const t = valueChannel * (1 - saturation * (1 - fraction));
+      if (index === 0) [r, g, b] = [valueChannel, t, p];
+      else if (index === 1) [r, g, b] = [q, valueChannel, p];
+      else if (index === 2) [r, g, b] = [p, valueChannel, t];
+      else if (index === 3) [r, g, b] = [p, q, valueChannel];
+      else if (index === 4) [r, g, b] = [t, p, valueChannel];
+      else [r, g, b] = [valueChannel, p, q];
+      return (Math.round(r * 255) << 16) | (Math.round(g * 255) << 8) | Math.round(b * 255);
+    }
+    _particleBlendMode(value) {
+      const normalized = String(value || 'normal').trim().toLowerCase();
+      if (normalized === 'additive' || normalized === 'add') return this.PIXI.BLEND_MODES?.ADD ?? 'add';
+      if (normalized === 'multiply') return this.PIXI.BLEND_MODES?.MULTIPLY ?? 'multiply';
+      if (normalized === 'screen') return this.PIXI.BLEND_MODES?.SCREEN ?? 'screen';
+      return value || 'normal';
+    }
+    _createParticleVisual(entityId, record, particle, appearance) {
+      const textureInput = {
+        ...appearance,
+        assetId: particle.assetId || appearance.assetId || appearance.textureAssetId,
+        imageSrc: particle.imageSrc || appearance.imageSrc || appearance.src
+      };
+      const textureData = this._textureSource(textureInput);
+      const kind = textureData.hasTexture || !this.PIXI.Graphics ? 'sprite' : 'graphics';
+      const styleKey = `${kind}|${textureData.key}|${JSON.stringify(this._particleSize(appearance))}`;
+      const visual = kind === 'graphics' ? new this.PIXI.Graphics() : this._createSprite(this._whiteTexture());
+      const visualRecord = {
+        visual,
+        kind,
+        styleKey,
+        sourceKey: textureData.key,
+        textureGeneration: 0,
+        ownedTexture: null,
+        baseSize: this._particleSize(appearance)
+      };
+      record.particleVisuals.set(particle.id, visualRecord);
+      record.particleHost.addChild(visual);
+      if (kind === 'graphics') this._drawParticleGraphics(visual, appearance);
+      else {
+        visual.anchor?.set?.(finite(appearance.anchorX, 0.5), finite(appearance.anchorY, 0.5));
+        let resolved;
+        try { resolved = this._resolveTexture(textureInput, entityId, textureData.source); }
+        catch (error) {
+          resolved = this._whiteTexture();
+          this.engine.events.emit('runtime:textureError', { runtime: this, entityId, source: textureData.source, error, engine: this.engine });
+        }
+        const generation = ++visualRecord.textureGeneration;
+        if (resolved && typeof resolved.then === 'function') {
+          this._assignTexture(visualRecord, this._whiteTexture(), null);
+          Promise.resolve(resolved).then(texture => {
+            if (record.particleVisuals.get(particle.id) !== visualRecord || visualRecord.textureGeneration !== generation) return;
+            const resolvedTexture = typeof texture === 'string' && this.PIXI.Texture?.from
+              ? this.PIXI.Texture.from(texture)
+              : (texture || this._whiteTexture());
+            this._assignTexture(visualRecord, resolvedTexture, textureData.sourceRect);
+            this._renderApplication();
+          }).catch(error => {
+            if (record.particleVisuals.get(particle.id) === visualRecord && visualRecord.textureGeneration === generation) {
+              this.engine.events.emit('runtime:textureError', { runtime: this, entityId, source: textureData.source, error, engine: this.engine });
+            }
+          });
+        } else this._assignTexture(visualRecord, resolved || this._whiteTexture(), textureData.sourceRect);
+      }
+      return visualRecord;
+    }
+    _syncParticleDisplay(entityId, record, particle, appearance) {
+      const textureInput = {
+        ...appearance,
+        assetId: particle.assetId || appearance.assetId || appearance.textureAssetId,
+        imageSrc: particle.imageSrc || appearance.imageSrc || appearance.src
+      };
+      const textureData = this._textureSource(textureInput);
+      const kind = textureData.hasTexture || !this.PIXI.Graphics ? 'sprite' : 'graphics';
+      const styleKey = `${kind}|${textureData.key}|${JSON.stringify(this._particleSize(appearance))}`;
+      let visualRecord = record.particleVisuals.get(particle.id);
+      if (!visualRecord || visualRecord.styleKey !== styleKey) {
+        if (visualRecord) this._destroyParticleVisual(record, particle.id);
+        visualRecord = this._createParticleVisual(entityId, record, particle, appearance);
+      }
+      const visual = visualRecord.visual;
+      if (visual.position?.set) visual.position.set(finite(particle.x, 0), finite(particle.y, 0));
+      else { visual.x = finite(particle.x, 0); visual.y = finite(particle.y, 0); }
+      visual.rotation = finite(particle.rotation, 0) * DEG_TO_RAD;
+      const scale = Math.max(0, finite(particle.scale, 1));
+      if (visual.scale?.set) visual.scale.set(scale, scale);
+      else { visual.scaleX = scale; visual.scaleY = scale; }
+      visual.alpha = clamp(finite(particle.opacity, 1), 0, 1);
+      visual.tint = this._colorWithHue(particle.color ?? appearance.color, particle.hue);
+      visual.blendMode = this._particleBlendMode(particle.blend ?? appearance.blend);
+      visual.zIndex = Math.max(0, Math.floor(finite(particle.id, 0)));
+      return visual;
+    }
+    _syncParticles(id, record) {
+      const emitter = this.engine.ecs.get(id, 'ParticleEmitter');
+      const asset = emitter ? this.engine.particles?.effectiveAsset(emitter) : null;
+      const particles = Array.isArray(emitter?.particles) ? emitter.particles : [];
+      if (!emitter || !asset || !particles.length) {
+        this._clearParticleVisuals(record);
+        record.particleHost.visible = Boolean(emitter && asset);
+        return;
+      }
+      record.particleHost.visible = true;
+      record.particleHost.zIndex = finite(asset.appearance?.layer ?? asset.appearance?.zIndex, 0);
+      const live = new Set();
+      for (const particle of particles) {
+        if (!particle || particle.id == null) continue;
+        live.add(particle.id);
+        this._syncParticleDisplay(id, record, particle, asset.appearance || {});
+      }
+      for (const particleId of [...record.particleVisuals.keys()]) if (!live.has(particleId)) this._destroyParticleVisual(record, particleId);
     }
     _releaseOwnedTexture(record) {
       if (!record?.ownedTexture) return;
@@ -3909,6 +4703,7 @@
         const transform = this.engine.ecs.get(id, 'Transform');
         this._applyMatrix(record.node, this._localFromWorld(id), transform);
         this._syncRenderable(id, record);
+        this._syncParticles(id, record);
       }
       this._syncViewport();
       return true;
@@ -3958,6 +4753,7 @@
       this.app = null;
       this._appendedCanvas = null;
       this.objects.clear();
+      this.particleObjects.clear();
       this.nodes.clear();
       this.textureLoads.clear();
       this._assetDocument = null;
@@ -5061,6 +5857,10 @@
       this.lighting = new LightingSystem(this);
       this.shadows = new ShadowSystem(this);
       this.animation = new AnimationSystem(this);
+      this.particles = new ParticleSystem(this, {
+        seed: options.particleSeed ?? options.seed,
+        fixedStep: options.particleStep
+      });
       this.skeleton = new SkeletonSystem(this);
       this.postProcess = new PostProcessSystem(this);
       this.tilemap = new TilemapSystem(this);
@@ -5236,6 +6036,9 @@
         DataModel.assertPrefabDocument(source, { entityCodec: this.entityCodec });
       }
       DataModel.assertAnimationDocument(source, { entityCodec: this.entityCodec });
+      if (typeof DataModel.assertParticleDocument === 'function') {
+        DataModel.assertParticleDocument(source, { entityCodec: this.entityCodec });
+      }
       if (typeof DataModel.assertSkeletonDocument === 'function') {
         DataModel.assertSkeletonDocument(source, { entityCodec: this.entityCodec });
       }
@@ -5336,6 +6139,7 @@
       this.document = nextDocument;
       this.activeSceneId = activeScene?.id || null;
       this.animation.load(nextDocument);
+      this.particles.load(nextDocument).initialize();
       this.postProcess.load(nextPostProcess, { emit: false });
       const transformedEntities = this.transform.update(false, { emit: false });
       const emitCommitted = (type, payload) => {
@@ -5400,6 +6204,7 @@
       this.physics.step(dt, this);
       this.physics.sync(this, 'after');
       this.transform.update();
+      this.particles.update(dt);
       this.skeleton.deform();
       this.skeleton._refreshPoses();
       this.events.emit('engine:update', { dt, engine: this });
@@ -5413,6 +6218,7 @@
         physics: clone(this.physics.snapshot()),
         physicsAdapter: this.physics.name,
         skeleton: clone(this.skeleton.snapshot()),
+        particles: clone(this.particles.snapshot()),
         animationTime: this.animation.time,
         activeCamera: this.camera.active,
         activeSceneId: this.activeSceneId
@@ -5429,11 +6235,13 @@
         this.document = authoringDocument;
         this.activeSceneId = snapshot.activeSceneId || authoringDocument.currentSceneId || null;
         this.animation.load(authoringDocument);
+        this.particles.load(authoringDocument);
       }
       this.animation.time = finite(snapshot.animationTime, 0);
       this.camera.active = snapshot.activeCamera || null;
       this.transform.update();
       if (snapshot.skeleton) this.skeleton.restore(snapshot.skeleton);
+      if (snapshot.particles) this.particles.restore(snapshot.particles);
       this.physics.sync(this, 'before');
       if (snapshot.physics) this.physics.restore(snapshot.physics);
       this.physics.sync(this, 'after');
@@ -5523,11 +6331,20 @@
       const scene = editorState?.scene || [];
       const postProcess = editorState?.postProcess;
       const animations = Array.isArray(editorState?.animations) ? editorState.animations : undefined;
+      const particles = Array.isArray(editorState?.particles) ? editorState.particles : undefined;
+      const assets = Array.isArray(editorState?.assets) ? editorState.assets : undefined;
       const engine = isPlainObject(editorState?.engine) ? editorState.engine : undefined;
-      const signature = JSON.stringify({ scene, postProcess, animations, engine });
+      const signature = JSON.stringify({ scene, postProcess, animations, particles, assets, engine });
       if (signature === this.lastSignature) return false;
       this.lastSignature = signature;
-      this.engine.load({ scene, postProcess, ...(animations ? { animations } : {}), ...(engine ? { engine } : {}) });
+      this.engine.load({
+        scene,
+        postProcess,
+        ...(animations ? { animations } : {}),
+        ...(particles ? { particles } : {}),
+        ...(assets ? { assets } : {}),
+        ...(engine ? { engine } : {})
+      });
       return true;
     }
   }
@@ -5542,7 +6359,10 @@
     normalizeAnimationClip: DataModel.normalizeAnimationClip,
     normalizeAnimationClips: DataModel.normalizeAnimationClips,
     sampleAnimationClip: DataModel.sampleAnimationClip,
-    LightingSystem, ShadowSystem, AnimationSystem, SkeletonSystem, PostProcessSystem, TilemapSystem,
+    normalizeParticleAsset: DataModel.normalizeParticleAsset,
+    normalizeParticleAssets: DataModel.normalizeParticleAssets,
+    sampleParticleCurve: DataModel.sampleParticleCurve,
+    LightingSystem, ShadowSystem, AnimationSystem, ParticleSystem, SkeletonSystem, PostProcessSystem, TilemapSystem,
     DEFAULT_POST_PROCESS_EFFECTS, createDefaultPostProcess, PrefabSystem,
     BODY_TYPES, COLLIDER_SHAPES, PhysicsAdapter, Box2DPhysicsAdapter,
     RuntimeAdapter, PixiRuntimeAdapter, PhaserRuntimeAdapter, CustomRuntimeAdapter,

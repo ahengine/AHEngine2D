@@ -16,6 +16,8 @@
     SNAPSHOT: 'snapshot'
   });
   const ANIMATION_TRACK_TYPES = Object.freeze(['sprite', 'position', 'rotation', 'event', 'hitbox', 'bone', 'ik']);
+  const PARTICLE_CURVE_PROPERTIES = Object.freeze(['emission', 'scale', 'speed', 'opacity', 'hue']);
+  const PARTICLE_CURVE_INTERPOLATIONS = Object.freeze(['linear', 'step', 'cubic']);
   const PROFILE_NAMES = Object.freeze(Object.values(PROFILES));
   const COMPONENT_NAME_PATTERN = '^[A-Z][A-Za-z0-9]*$';
   const COMPONENT_NAME_RE = new RegExp(COMPONENT_NAME_PATTERN);
@@ -408,10 +410,28 @@
     tileWidth: number({ exclusiveMinimum: 0 }), tileHeight: number({ exclusiveMinimum: 0 }),
     width: integer({ minimum: 0 }), height: integer({ minimum: 0 }), tiles: { type: 'array', items: { type: 'array' } }, assetId: nullableString()
   });
-  const PARTICLE_SCHEMA = object({
-    name: string(), amount: integer({ minimum: 0 }), rate: number({ minimum: 0 }), lifetime: number({ minimum: 0 }), speed: number(),
-    spread: number(), gravity: number(), radius: number({ minimum: 0 }), scale: number({ minimum: 0 }), opacity: number({ minimum: 0, maximum: 1 }),
-    hue: number(), blend: string(), playing: boolean(), loop: boolean()
+  const PARTICLE_EMITTER_AUTHORING_SCHEMA = object({
+    // Empty/missing values are classified by cross-resource validation so
+    // legacy inline emitters can remain compatible without weakening new ones.
+    assetId: string(),
+    autoplay: boolean(), playing: boolean(), loop: boolean(), time: number({ minimum: 0 }), speed: number({ minimum: 0 }), emitting: boolean(),
+    overrides: object(), seed: integer({ minimum: 0 }),
+    // Legacy inline emitter configuration remains describable and lossless;
+    // canonical authoring uses assetId plus the playback fields above.
+    name: string(), amount: integer({ minimum: 0 }), rate: number({ minimum: 0 }), lifetime: number({ minimum: 0 }),
+    spread: number(), gravity: number(), radius: number({ minimum: 0 }), scale: number({ minimum: 0 }),
+    opacity: number({ minimum: 0, maximum: 1 }), hue: number(), blend: string()
+  });
+  const PARTICLE_RUNTIME_RECORD_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    x: number(), y: number(), vx: number(), vy: number(), age: number({ minimum: 0 }), lifetime: number({ minimum: 0 }), rotation: number(),
+    baseScale: number({ minimum: 0 }), baseOpacity: number({ minimum: 0, maximum: 1 }), baseHue: number(),
+    scale: number({ minimum: 0 }), opacity: number({ minimum: 0, maximum: 1 }), hue: number()
+  });
+  const PARTICLE_EMITTER_RUNTIME_SCHEMA = object({
+    ...PARTICLE_EMITTER_AUTHORING_SCHEMA.properties,
+    particles: { type: 'array', items: PARTICLE_RUNTIME_RECORD_SCHEMA },
+    emissionAccumulator: number({ minimum: 0 }), completed: boolean(), rngState: integer({ minimum: 0 })
   });
 
   const COMPONENT_SCHEMAS = {
@@ -432,7 +452,7 @@
     IK: profileSet(IK_SCHEMA),
     Skin: profileSet(SKIN_AUTHORING_SCHEMA, SKIN_RUNTIME_SCHEMA),
     Tilemap: profileSet(TILEMAP_SCHEMA),
-    ParticleEmitter: profileSet(PARTICLE_SCHEMA),
+    ParticleEmitter: profileSet(PARTICLE_EMITTER_AUTHORING_SCHEMA, PARTICLE_EMITTER_RUNTIME_SCHEMA),
     BoxCollider: profileSet(COLLIDER_SCHEMA),
     BoxCollider2D: profileSet(COLLIDER_SCHEMA),
     CircleCollider: profileSet(COLLIDER_SCHEMA),
@@ -504,6 +524,45 @@
     targetEntityId: string({ minLength: 1, pattern: '\\S' }),
     tracks: { type: 'array', items: ANIMATION_TRACK_SCHEMA }
   }, { required: ['id', 'name', 'fps', 'frameCount', 'loop', 'tracks'] });
+  const PARTICLE_CURVE_KEY_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    time: number({ minimum: 0, maximum: 1 }),
+    value: number(),
+    inTangent: number(),
+    outTangent: number()
+  }, { required: ['id', 'time', 'value'] });
+  const PARTICLE_CURVE_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    property: { type: 'string', enum: PARTICLE_CURVE_PROPERTIES },
+    interpolation: { type: 'string', enum: PARTICLE_CURVE_INTERPOLATIONS },
+    keys: { type: 'array', items: PARTICLE_CURVE_KEY_SCHEMA }
+  }, { required: ['id', 'property', 'interpolation', 'keys'] });
+  const PARTICLE_ASSET_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    name: string({ minLength: 1, pattern: '\\S' }),
+    duration: number({ exclusiveMinimum: 0 }),
+    loop: boolean(),
+    maxParticles: integer({ minimum: 0 }),
+    emission: object({
+      rate: number({ minimum: 0 }), burst: integer({ minimum: 0 })
+    }, { required: ['rate', 'burst'] }),
+    lifetime: object({
+      min: number({ minimum: 0 }), max: number({ minimum: 0 })
+    }, { required: ['min', 'max'] }),
+    velocity: object({
+      speedMin: number({ minimum: 0 }), speedMax: number({ minimum: 0 }), angle: number(), spread: number({ minimum: 0 }),
+      gravityX: number(), gravityY: number()
+    }, { required: ['speedMin', 'speedMax', 'angle', 'spread', 'gravityX', 'gravityY'] }),
+    shape: object({
+      type: { type: 'string', enum: ['point', 'circle', 'box'] },
+      radius: number({ minimum: 0 }), width: number({ minimum: 0 }), height: number({ minimum: 0 })
+    }, { required: ['type', 'radius', 'width', 'height'] }),
+    appearance: object({
+      assetId: nullableString(), color: string({ minLength: 1 }), blend: { type: 'string', enum: ['normal', 'additive'] },
+      baseScale: number({ minimum: 0 }), baseOpacity: number({ minimum: 0, maximum: 1 }), baseHue: number()
+    }, { required: ['color', 'blend', 'baseScale', 'baseOpacity', 'baseHue'] }),
+    curves: { type: 'array', items: PARTICLE_CURVE_SCHEMA }
+  }, { required: ['id', 'name', 'duration', 'loop', 'maxParticles', 'emission', 'lifetime', 'velocity', 'shape', 'appearance', 'curves'] });
   const JSON_SCHEMAS = {
     components: COMPONENT_SCHEMAS,
     componentProfiles: PROFILE_SCHEMAS,
@@ -513,8 +572,578 @@
     prefabAsset: PREFAB_ASSET_SCHEMA,
     animationKeyframe: ANIMATION_KEYFRAME_SCHEMA,
     animationTrack: ANIMATION_TRACK_SCHEMA,
-    animationClip: ANIMATION_CLIP_SCHEMA
+    animationClip: ANIMATION_CLIP_SCHEMA,
+    particleCurveKey: PARTICLE_CURVE_KEY_SCHEMA,
+    particleCurve: PARTICLE_CURVE_SCHEMA,
+    particleAsset: PARTICLE_ASSET_SCHEMA
   };
+
+  const PARTICLE_ASSET_DEFAULTS = deepFreeze({
+    duration: 1,
+    loop: true,
+    maxParticles: 100,
+    emission: { rate: 10, burst: 0 },
+    lifetime: { min: 1, max: 1 },
+    velocity: { speedMin: 0, speedMax: 0, angle: -90, spread: 0, gravityX: 0, gravityY: 0 },
+    shape: { type: 'point', radius: 0, width: 0, height: 0 },
+    appearance: { color: '#ffffff', blend: 'normal', baseScale: 1, baseOpacity: 1, baseHue: 0 },
+    curves: []
+  });
+  const PARTICLE_LEGACY_FIELDS = Object.freeze([
+    'amount', 'rate', 'lifetime', 'speed', 'spread', 'gravity', 'radius', 'scale', 'opacity', 'hue', 'blend', 'playing'
+  ]);
+  const PARTICLE_EMITTER_LEGACY_FIELDS = Object.freeze([
+    'name', 'amount', 'rate', 'lifetime', 'speed', 'spread', 'gravity', 'radius', 'scale', 'opacity', 'hue', 'blend'
+  ]);
+  function particleSlug(value, fallback = 'particle') {
+    const slug = String(value == null ? '' : value)
+      .trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    return slug || fallback;
+  }
+
+  function particleGeneratedId(base, used, fallback) {
+    const stem = particleSlug(base, fallback);
+    let candidate = stem;
+    let suffix = 2;
+    while (used.has(candidate)) candidate = `${stem}-${suffix++}`;
+    used.add(candidate);
+    return candidate;
+  }
+
+  function particleNumber(value, fallback, options = {}) {
+    let result = Number(value);
+    if (!Number.isFinite(result)) result = fallback;
+    if (options.integer) result = Math.floor(result);
+    if (options.minimum != null) result = Math.max(options.minimum, result);
+    if (options.maximum != null) result = Math.min(options.maximum, result);
+    return result;
+  }
+
+  function particleRange(minimum, maximum, fallbackMinimum, fallbackMaximum, options = {}) {
+    let min = particleNumber(minimum, fallbackMinimum, options);
+    let max = particleNumber(maximum, fallbackMaximum, options);
+    if (min > max) [min, max] = [max, min];
+    return { min, max };
+  }
+
+  function normalizeParticleCurve(input, options = {}) {
+    const source = isPlainObject(input) ? cloneJson(input) : {};
+    const output = source;
+    const index = Number.isInteger(options.index) && options.index >= 0 ? options.index : 0;
+    const usedCurveIds = options.usedCurveIds instanceof Set ? options.usedCurveIds : new Set();
+    const propertySource = source.property ?? source.channel ?? source.type;
+    const authoredProperty = typeof propertySource === 'string' && propertySource.trim()
+      ? propertySource.trim().toLowerCase()
+      : PARTICLE_CURVE_PROPERTIES[index % PARTICLE_CURVE_PROPERTIES.length];
+    output.property = authoredProperty;
+    if (typeof source.id === 'string' && source.id.trim()) {
+      output.id = source.id.trim();
+      usedCurveIds.add(output.id);
+    } else output.id = particleGeneratedId(authoredProperty, usedCurveIds, `curve-${index + 1}`);
+    const authoredInterpolation = typeof source.interpolation === 'string' && source.interpolation.trim()
+      ? source.interpolation.trim().toLowerCase()
+      : 'linear';
+    output.interpolation = authoredInterpolation;
+    const rawKeys = Array.isArray(source.keys)
+      ? source.keys
+      : (Array.isArray(source.keyframes) ? source.keyframes : []);
+    const keyEntries = rawKeys.filter(isPlainObject);
+    const reservedKeyIds = new Set(keyEntries
+      .map(key => typeof key.id === 'string' ? key.id.trim() : '')
+      .filter(Boolean));
+    const usedKeyIds = new Set(reservedKeyIds);
+    output.keys = keyEntries.map((rawKey, keyIndex) => {
+      const key = cloneJson(rawKey);
+      const defaultTime = keyEntries.length > 1 ? keyIndex / (keyEntries.length - 1) : 0;
+      key.time = particleNumber(key.time, defaultTime, { minimum: 0, maximum: 1 });
+      key.value = particleNumber(key.value, 0);
+      if (hasOwn(key, 'inTangent')) key.inTangent = particleNumber(key.inTangent, 0);
+      if (hasOwn(key, 'outTangent')) key.outTangent = particleNumber(key.outTangent, 0);
+      if (typeof key.id === 'string' && key.id.trim()) key.id = key.id.trim();
+      else key.id = particleGeneratedId(`${output.id}-${key.time}`, usedKeyIds, `key-${keyIndex + 1}`);
+      return key;
+    }).sort((left, right) => left.time - right.time);
+    return output;
+  }
+
+  function normalizeParticleAsset(input, options = {}) {
+    if (Number.isInteger(options)) options = { index: options };
+    const source = isPlainObject(input) ? cloneJson(input) : {};
+    const output = source;
+    const index = Number.isInteger(options.index) && options.index >= 0 ? options.index : 0;
+    const name = typeof source.name === 'string' && source.name.trim()
+      ? source.name.trim()
+      : (typeof source.id === 'string' && source.id.trim() ? source.id.trim() : `Particle ${index + 1}`);
+    output.id = typeof source.id === 'string' && source.id.trim()
+      ? source.id.trim()
+      : particleSlug(name, `particle-${index + 1}`);
+    output.name = name;
+    output.duration = Number.isFinite(Number(source.duration)) && Number(source.duration) > 0
+      ? Number(source.duration)
+      : PARTICLE_ASSET_DEFAULTS.duration;
+    output.loop = typeof source.loop === 'boolean' ? source.loop : PARTICLE_ASSET_DEFAULTS.loop;
+    output.maxParticles = particleNumber(source.maxParticles ?? source.amount, PARTICLE_ASSET_DEFAULTS.maxParticles, { integer: true, minimum: 0 });
+
+    const emissionSource = isPlainObject(source.emission) ? cloneJson(source.emission) : {};
+    emissionSource.rate = particleNumber(emissionSource.rate ?? source.rate, PARTICLE_ASSET_DEFAULTS.emission.rate, { minimum: 0 });
+    emissionSource.burst = particleNumber(emissionSource.burst, PARTICLE_ASSET_DEFAULTS.emission.burst, { integer: true, minimum: 0 });
+    output.emission = emissionSource;
+
+    const lifetimeSource = isPlainObject(source.lifetime) ? cloneJson(source.lifetime) : {};
+    const legacyLifetime = !isPlainObject(source.lifetime) ? source.lifetime : undefined;
+    const lifetime = particleRange(
+      lifetimeSource.min ?? legacyLifetime,
+      lifetimeSource.max ?? legacyLifetime,
+      PARTICLE_ASSET_DEFAULTS.lifetime.min,
+      PARTICLE_ASSET_DEFAULTS.lifetime.max,
+      { minimum: 0 }
+    );
+    lifetimeSource.min = lifetime.min;
+    lifetimeSource.max = lifetime.max;
+    output.lifetime = lifetimeSource;
+
+    const velocitySource = isPlainObject(source.velocity) ? cloneJson(source.velocity) : {};
+    const speed = particleRange(
+      velocitySource.speedMin ?? source.speed,
+      velocitySource.speedMax ?? source.speed,
+      PARTICLE_ASSET_DEFAULTS.velocity.speedMin,
+      PARTICLE_ASSET_DEFAULTS.velocity.speedMax,
+      { minimum: 0 }
+    );
+    velocitySource.speedMin = speed.min;
+    velocitySource.speedMax = speed.max;
+    velocitySource.angle = particleNumber(velocitySource.angle, PARTICLE_ASSET_DEFAULTS.velocity.angle);
+    velocitySource.spread = particleNumber(velocitySource.spread ?? source.spread, PARTICLE_ASSET_DEFAULTS.velocity.spread, { minimum: 0 });
+    velocitySource.gravityX = particleNumber(velocitySource.gravityX, PARTICLE_ASSET_DEFAULTS.velocity.gravityX);
+    velocitySource.gravityY = particleNumber(velocitySource.gravityY ?? source.gravity, PARTICLE_ASSET_DEFAULTS.velocity.gravityY);
+    output.velocity = velocitySource;
+
+    const shapeSource = isPlainObject(source.shape) ? cloneJson(source.shape) : {};
+    const defaultShape = source.radius != null ? 'circle' : PARTICLE_ASSET_DEFAULTS.shape.type;
+    shapeSource.type = typeof shapeSource.type === 'string' && shapeSource.type.trim()
+      ? shapeSource.type.trim().toLowerCase()
+      : defaultShape;
+    shapeSource.radius = particleNumber(shapeSource.radius ?? source.radius, PARTICLE_ASSET_DEFAULTS.shape.radius, { minimum: 0 });
+    shapeSource.width = particleNumber(shapeSource.width, PARTICLE_ASSET_DEFAULTS.shape.width, { minimum: 0 });
+    shapeSource.height = particleNumber(shapeSource.height, PARTICLE_ASSET_DEFAULTS.shape.height, { minimum: 0 });
+    output.shape = shapeSource;
+
+    const appearanceSource = isPlainObject(source.appearance) ? cloneJson(source.appearance) : {};
+    if (hasOwn(appearanceSource, 'assetId')) {
+      appearanceSource.assetId = typeof appearanceSource.assetId === 'string' && appearanceSource.assetId.trim()
+        ? appearanceSource.assetId.trim()
+        : null;
+    }
+    appearanceSource.color = typeof (appearanceSource.color ?? source.color) === 'string' && String(appearanceSource.color ?? source.color).trim()
+      ? String(appearanceSource.color ?? source.color).trim()
+      : PARTICLE_ASSET_DEFAULTS.appearance.color;
+    const blend = String(appearanceSource.blend ?? source.blend ?? PARTICLE_ASSET_DEFAULTS.appearance.blend).trim().toLowerCase();
+    appearanceSource.blend = blend === 'add' ? 'additive' : blend;
+    appearanceSource.baseScale = particleNumber(appearanceSource.baseScale ?? source.scale, PARTICLE_ASSET_DEFAULTS.appearance.baseScale, { minimum: 0 });
+    appearanceSource.baseOpacity = particleNumber(appearanceSource.baseOpacity ?? source.opacity, PARTICLE_ASSET_DEFAULTS.appearance.baseOpacity, { minimum: 0, maximum: 1 });
+    appearanceSource.baseHue = particleNumber(appearanceSource.baseHue ?? source.hue, PARTICLE_ASSET_DEFAULTS.appearance.baseHue);
+    output.appearance = appearanceSource;
+
+    const rawCurves = Array.isArray(source.curves) ? source.curves : [];
+    const curveEntries = rawCurves.filter(isPlainObject);
+    const reservedCurveIds = new Set(curveEntries
+      .map(curve => typeof curve.id === 'string' ? curve.id.trim() : '')
+      .filter(Boolean));
+    const usedCurveIds = new Set(reservedCurveIds);
+    output.curves = curveEntries.map((curve, curveIndex) => normalizeParticleCurve(curve, { index: curveIndex, usedCurveIds }));
+    return output;
+  }
+
+  function normalizeParticleAssets(input, options = {}) {
+    const source = Array.isArray(input) ? input : [];
+    const entries = source.map((asset, index) => ({ asset, index })).filter(entry => isPlainObject(entry.asset));
+    const reservedIds = new Set(entries
+      .map(entry => typeof entry.asset.id === 'string' ? entry.asset.id.trim() : '')
+      .filter(Boolean));
+    const usedIds = new Set(reservedIds);
+    return entries.map(({ asset: rawAsset, index }) => {
+      const asset = normalizeParticleAsset(rawAsset, { ...options, index });
+      if (typeof rawAsset.id !== 'string' || !rawAsset.id.trim()) {
+        asset.id = particleGeneratedId(asset.id, usedIds, `particle-${index + 1}`);
+      }
+      return asset;
+    });
+  }
+
+  function sampleParticleCurve(curve, time = 0, options = {}) {
+    const fallback = Number.isFinite(Number(options.defaultValue)) ? Number(options.defaultValue) : 0;
+    if (!isPlainObject(curve) || !Array.isArray(curve.keys)) return fallback;
+    const keys = curve.keys
+      .filter(key => isPlainObject(key) && Number.isFinite(Number(key.time)) && Number.isFinite(Number(key.value)))
+      .map(key => ({ ...key, time: Number(key.time), value: Number(key.value) }))
+      .sort((left, right) => left.time - right.time);
+    if (!keys.length) return fallback;
+    const requested = Number.isFinite(Number(time)) ? Number(time) : 0;
+    const sampleTime = Math.max(0, Math.min(1, requested));
+    if (sampleTime <= keys[0].time) return keys[0].value;
+    if (sampleTime >= keys[keys.length - 1].time) return keys[keys.length - 1].value;
+    const exact = keys.find(key => Math.abs(key.time - sampleTime) <= 1e-12);
+    if (exact) return exact.value;
+    let left = keys[0];
+    let right = keys[keys.length - 1];
+    for (let index = 1; index < keys.length; index += 1) {
+      if (keys[index].time >= sampleTime) {
+        left = keys[index - 1];
+        right = keys[index];
+        break;
+      }
+    }
+    const span = right.time - left.time;
+    if (!(span > 0)) return right.value;
+    const amount = (sampleTime - left.time) / span;
+    const interpolation = String(curve.interpolation || 'linear').trim().toLowerCase();
+    if (interpolation === 'step') return left.value;
+    if (interpolation !== 'cubic') return left.value + (right.value - left.value) * amount;
+    const slope = (right.value - left.value) / span;
+    const outTangent = Number.isFinite(Number(left.outTangent)) ? Number(left.outTangent) : slope;
+    const inTangent = Number.isFinite(Number(right.inTangent)) ? Number(right.inTangent) : slope;
+    const t2 = amount * amount;
+    const t3 = t2 * amount;
+    const h00 = (2 * t3) - (3 * t2) + 1;
+    const h10 = t3 - (2 * t2) + amount;
+    const h01 = (-2 * t3) + (3 * t2);
+    const h11 = t3 - t2;
+    return (h00 * left.value) + (h10 * span * outTangent) + (h01 * right.value) + (h11 * span * inTangent);
+  }
+
+  function particleLegacyDiagnostic(output, strict, message, pointer, details) {
+    output.push(diagnostic(
+      strict ? 'E_PARTICLE_ASSET_LEGACY' : 'W_PARTICLE_ASSET_LEGACY',
+      message,
+      pointer,
+      details,
+      strict ? 'error' : 'warning'
+    ));
+  }
+
+  function particleFiniteNumber(value, strict) {
+    if (typeof value === 'number' && Number.isFinite(value)) return true;
+    return !strict && typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value));
+  }
+
+  function particleInteger(value, strict) {
+    if (Number.isInteger(value)) return true;
+    return !strict && typeof value === 'string' && value.trim() !== '' && Number.isInteger(Number(value));
+  }
+
+  function particleHasCanonicalAssetFields(asset) {
+    if (!isPlainObject(asset)) return false;
+    return ['duration', 'maxParticles', 'emission', 'velocity', 'shape', 'appearance', 'curves'].some(field => hasOwn(asset, field)) ||
+      isPlainObject(asset.lifetime);
+  }
+
+  function particleLegacyAsset(asset) {
+    if (!isPlainObject(asset)) return false;
+    return !particleHasCanonicalAssetFields(asset) && PARTICLE_LEGACY_FIELDS.some(field => hasOwn(asset, field));
+  }
+
+  function particleEntityCollections(document) {
+    if (!isPlainObject(document) || document.format === 'AH2D.Particle') return [];
+    const collections = [];
+    if (Array.isArray(document.scenes) && document.scenes.length) {
+      document.scenes.forEach((scene, sceneIndex) => collections.push({
+        entities: Array.isArray(scene?.objects) ? scene.objects : [],
+        pointer: `/scenes/${sceneIndex}/objects`
+      }));
+    } else if (Array.isArray(document.entities)) collections.push({ entities: document.entities, pointer: '/entities' });
+    else if (Array.isArray(document.scene)) collections.push({ entities: document.scene, pointer: '/scene' });
+    for (let prefabIndex = 0; prefabIndex < (Array.isArray(document.prefabs) ? document.prefabs.length : 0); prefabIndex += 1) {
+      const prefab = document.prefabs[prefabIndex];
+      collections.push({
+        entities: Array.isArray(prefab?.entities) ? prefab.entities : [],
+        pointer: `/prefabs/${prefabIndex}/entities`
+      });
+    }
+    return collections;
+  }
+
+  function validateParticleEmitterReferences(document, particleIds, particleAssets, output, options = {}) {
+    const strict = Boolean(options.strict);
+    const codec = options.entityCodec instanceof EntityCodec ? options.entityCodec : createDefaultEntityCodec();
+    for (const collection of particleEntityCollections(document)) {
+      collection.entities.forEach((entity, entityIndex) => {
+        if (!isPlainObject(entity)) return;
+        let resolved;
+        try { resolved = codec.resolve(entity, 'ParticleEmitter'); }
+        catch (_) { return; }
+        if (!resolved.found || !isPlainObject(resolved.value)) return;
+        const emitter = resolved.value;
+        const pointer = `${collection.pointer}/${entityIndex}${pointerForStorage(resolved.storage)}`;
+        const assetId = typeof emitter.assetId === 'string' ? emitter.assetId.trim() : '';
+        if (!assetId) {
+          const legacyFields = PARTICLE_EMITTER_LEGACY_FIELDS.filter(field => hasOwn(emitter, field));
+          if (legacyFields.length) {
+            output.push(diagnostic(
+              strict ? 'E_PARTICLE_EMITTER_LEGACY' : 'W_PARTICLE_EMITTER_LEGACY',
+              'Legacy inline ParticleEmitter configuration should be moved to a Particle Asset and referenced by assetId',
+              pointer,
+              { fields: legacyFields },
+              strict ? 'error' : 'warning'
+            ));
+          } else {
+            output.push(diagnostic(
+              'E_PARTICLE_EMITTER_ASSET',
+              'ParticleEmitter.assetId must reference a Particle Asset',
+              joinPointer(pointer, 'assetId')
+            ));
+          }
+        } else if (!particleIds.has(assetId)) {
+          output.push(diagnostic(
+            'E_PARTICLE_ASSET_REFERENCE',
+            `Particle Asset does not exist: ${assetId}`,
+            joinPointer(pointer, 'assetId'),
+            { assetId }
+          ));
+        } else if (isPlainObject(emitter.overrides) && Object.keys(emitter.overrides).length) {
+          const overridesPointer = joinPointer(pointer, 'overrides');
+          for (const identityField of ['id', 'name']) {
+            if (hasOwn(emitter.overrides, identityField)) {
+              output.push(diagnostic(
+                'E_PARTICLE_OVERRIDE_IDENTITY',
+                `ParticleEmitter overrides cannot replace Particle Asset ${identityField}`,
+                joinPointer(overridesPointer, identityField),
+                { assetId, field: identityField }
+              ));
+            }
+          }
+          const sourceAsset = particleAssets.get(assetId);
+          if (sourceAsset) {
+            const effectiveAsset = deepMerge(sourceAsset, emitter.overrides);
+            effectiveAsset.id = sourceAsset.id;
+            effectiveAsset.name = sourceAsset.name;
+            const overrideDiagnostics = validateParticleDocument([effectiveAsset], {
+              strict,
+              entityCodec: codec
+            });
+            for (const item of overrideDiagnostics) {
+              const suffix = String(item.pointer || '').replace(/^\/particles\/0/, '');
+              const topLevelField = suffix.split('/')[1] || '';
+              if (!topLevelField || !hasOwn(emitter.overrides, topLevelField)) continue;
+              output.push({
+                ...item,
+                pointer: `${overridesPointer}${suffix}`,
+                details: { ...(item.details || {}), assetId }
+              });
+            }
+          }
+        }
+      });
+    }
+  }
+
+  function validateParticleDocument(document, options = {}) {
+    const output = [];
+    const strict = Boolean(options.strict);
+    const standaloneParticle = isPlainObject(document) && document.format === 'AH2D.Particle';
+    const projectShapedDocument = isPlainObject(document) && (
+      document.format === 'AH2D' || hasOwn(document, 'particles') || hasOwn(document, 'currentSceneId') ||
+      Array.isArray(document.scenes) || Array.isArray(document.scene) || Array.isArray(document.entities)
+    );
+    const declaredParticleDialect = isPlainObject(document) && typeof document.format === 'string' &&
+      document.format.trim().toLowerCase().startsWith('ah2d.particle');
+    const standaloneParticleCandidate = standaloneParticle || (isPlainObject(document) && !projectShapedDocument && (
+      declaredParticleDialect || particleLegacyAsset(document) ||
+      (particleHasCanonicalAssetFields(document) && (hasOwn(document, 'id') || hasOwn(document, 'name')))
+    ));
+    if (standaloneParticleCandidate && !standaloneParticle) {
+      output.push(diagnostic(
+        'E_PARTICLE_DOCUMENT_FORMAT',
+        'Standalone Particle Asset format must be AH2D.Particle',
+        '/format',
+        { expected: 'AH2D.Particle', actual: document.format ?? null }
+      ));
+    }
+    if (standaloneParticleCandidate && (!particleInteger(document.version, strict) || Number(document.version) !== 1)) {
+      output.push(diagnostic(
+        'E_PARTICLE_DOCUMENT_VERSION',
+        'AH2D.Particle version must be 1',
+        '/version',
+        { expected: 1, actual: document.version }
+      ));
+    }
+    const definitionFreeEcsSnapshot = isPlainObject(document) &&
+      Number(document.version) === 3 && Array.isArray(document.entities) && document.particles == null;
+    let particles;
+    let basePointer = '/particles';
+    if (Array.isArray(document)) particles = document;
+    else if (standaloneParticleCandidate) { particles = [document]; basePointer = ''; }
+    else if (isPlainObject(document)) particles = document.particles == null ? [] : document.particles;
+    else return [diagnostic('E_PARTICLE_DOCUMENT', 'Particle document must be a plain object or array', '')];
+    if (!Array.isArray(particles)) return [diagnostic('E_PARTICLES_TYPE', 'particles must be an array', basePointer)];
+
+    const particleIds = new Map();
+    const particleAssets = new Map();
+    particles.forEach((asset, assetIndex) => {
+      const pointer = basePointer ? joinPointer(basePointer, assetIndex) : '';
+      if (!isPlainObject(asset)) {
+        output.push(diagnostic('E_PARTICLE_ASSET_TYPE', 'Particle Asset must be a plain object', pointer));
+        return;
+      }
+      output.push(...jsonSafetyDiagnostics(asset, pointer));
+      const legacyAsset = particleLegacyAsset(asset) ||
+        (asset.format === 'AH2D.Particle' && !particleHasCanonicalAssetFields(asset));
+      const id = typeof asset.id === 'string' ? asset.id.trim() : '';
+      if (!id) {
+        if (legacyAsset) particleLegacyDiagnostic(output, strict, 'Particle Asset has no stable id', joinPointer(pointer, 'id'));
+        else output.push(diagnostic('E_PARTICLE_ASSET_ID', 'Particle Asset id must be a non-empty stable ID', joinPointer(pointer, 'id')));
+      }
+      else if (particleIds.has(id)) output.push(diagnostic(
+        'E_PARTICLE_ASSET_ID_DUPLICATE',
+        `Duplicate Particle Asset id: ${id}`,
+        joinPointer(pointer, 'id'),
+        { firstPointer: particleIds.get(id) }
+      ));
+      else {
+        particleIds.set(id, joinPointer(pointer, 'id'));
+        particleAssets.set(id, asset);
+      }
+
+      const name = typeof asset.name === 'string' ? asset.name.trim() : '';
+      if (!name) output.push(diagnostic('E_PARTICLE_ASSET_NAME', 'Particle Asset name must be a non-empty string', joinPointer(pointer, 'name')));
+
+      if (legacyAsset) {
+        particleLegacyDiagnostic(output, strict, 'Legacy flat Particle configuration must be normalized to the Particle Asset v1 contract', pointer);
+        const numericFields = [
+          ['rate', 0, null], ['lifetime', 0, null], ['speed', null, null], ['spread', 0, null], ['gravity', null, null],
+          ['radius', 0, null], ['scale', 0, null], ['opacity', 0, 1], ['hue', null, null]
+        ];
+        if (hasOwn(asset, 'amount') && (!particleInteger(asset.amount, strict) || Number(asset.amount) < 0)) {
+          output.push(diagnostic('E_PARTICLE_MAX_PARTICLES', 'Legacy amount must be a non-negative integer', joinPointer(pointer, 'amount')));
+        }
+        for (const [field, minimum, maximum] of numericFields) {
+          if (!hasOwn(asset, field)) continue;
+          const value = Number(asset[field]);
+          if (!particleFiniteNumber(asset[field], strict) || (minimum != null && value < minimum) || (maximum != null && value > maximum)) {
+            output.push(diagnostic('E_PARTICLE_LEGACY_VALUE', `Legacy ${field} is outside its supported numeric range`, joinPointer(pointer, field), { field }));
+          }
+        }
+        if (hasOwn(asset, 'loop') && typeof asset.loop !== 'boolean') output.push(diagnostic('E_PARTICLE_LOOP', 'Particle loop must be boolean', joinPointer(pointer, 'loop')));
+        if (hasOwn(asset, 'playing') && typeof asset.playing !== 'boolean') output.push(diagnostic('E_PARTICLE_PLAYING', 'Legacy playing must be boolean', joinPointer(pointer, 'playing')));
+        if (hasOwn(asset, 'blend') && (typeof asset.blend !== 'string' || !['normal', 'additive', 'add'].includes(asset.blend.trim().toLowerCase()))) {
+          output.push(diagnostic('E_PARTICLE_BLEND', 'Legacy blend must be Normal or Additive', joinPointer(pointer, 'blend')));
+        }
+        return;
+      }
+
+      if (!particleFiniteNumber(asset.duration, strict) || Number(asset.duration) <= 0) output.push(diagnostic('E_PARTICLE_DURATION', 'Particle Asset duration must be greater than zero', joinPointer(pointer, 'duration')));
+      if (typeof asset.loop !== 'boolean') output.push(diagnostic('E_PARTICLE_LOOP', 'Particle Asset loop must be boolean', joinPointer(pointer, 'loop')));
+      if (!particleInteger(asset.maxParticles, strict) || Number(asset.maxParticles) < 0) output.push(diagnostic('E_PARTICLE_MAX_PARTICLES', 'Particle Asset maxParticles must be a non-negative integer', joinPointer(pointer, 'maxParticles')));
+
+      const emissionPointer = joinPointer(pointer, 'emission');
+      if (!isPlainObject(asset.emission)) output.push(diagnostic('E_PARTICLE_EMISSION', 'Particle Asset emission must be an object', emissionPointer));
+      else {
+        if (!particleFiniteNumber(asset.emission.rate, strict) || Number(asset.emission.rate) < 0) output.push(diagnostic('E_PARTICLE_EMISSION_RATE', 'Emission rate must be a non-negative number', joinPointer(emissionPointer, 'rate')));
+        if (!particleInteger(asset.emission.burst, strict) || Number(asset.emission.burst) < 0) output.push(diagnostic('E_PARTICLE_EMISSION_BURST', 'Emission burst must be a non-negative integer', joinPointer(emissionPointer, 'burst')));
+      }
+
+      const lifetimePointer = joinPointer(pointer, 'lifetime');
+      if (!isPlainObject(asset.lifetime)) output.push(diagnostic('E_PARTICLE_LIFETIME', 'Particle Asset lifetime must be an object', lifetimePointer));
+      else {
+        const minValid = particleFiniteNumber(asset.lifetime.min, strict) && Number(asset.lifetime.min) >= 0;
+        const maxValid = particleFiniteNumber(asset.lifetime.max, strict) && Number(asset.lifetime.max) >= 0;
+        if (!minValid) output.push(diagnostic('E_PARTICLE_LIFETIME_MIN', 'Lifetime min must be a non-negative number', joinPointer(lifetimePointer, 'min')));
+        if (!maxValid) output.push(diagnostic('E_PARTICLE_LIFETIME_MAX', 'Lifetime max must be a non-negative number', joinPointer(lifetimePointer, 'max')));
+        if (minValid && maxValid && Number(asset.lifetime.min) > Number(asset.lifetime.max)) output.push(diagnostic('E_PARTICLE_LIFETIME_RANGE', 'Lifetime min must not exceed max', lifetimePointer));
+      }
+
+      const velocityPointer = joinPointer(pointer, 'velocity');
+      if (!isPlainObject(asset.velocity)) output.push(diagnostic('E_PARTICLE_VELOCITY', 'Particle Asset velocity must be an object', velocityPointer));
+      else {
+        const speedMinValid = particleFiniteNumber(asset.velocity.speedMin, strict) && Number(asset.velocity.speedMin) >= 0;
+        const speedMaxValid = particleFiniteNumber(asset.velocity.speedMax, strict) && Number(asset.velocity.speedMax) >= 0;
+        if (!speedMinValid) output.push(diagnostic('E_PARTICLE_SPEED_MIN', 'Velocity speedMin must be a non-negative number', joinPointer(velocityPointer, 'speedMin')));
+        if (!speedMaxValid) output.push(diagnostic('E_PARTICLE_SPEED_MAX', 'Velocity speedMax must be a non-negative number', joinPointer(velocityPointer, 'speedMax')));
+        if (speedMinValid && speedMaxValid && Number(asset.velocity.speedMin) > Number(asset.velocity.speedMax)) output.push(diagnostic('E_PARTICLE_SPEED_RANGE', 'Velocity speedMin must not exceed speedMax', velocityPointer));
+        for (const field of ['angle', 'gravityX', 'gravityY']) {
+          if (!particleFiniteNumber(asset.velocity[field], strict)) output.push(diagnostic('E_PARTICLE_VELOCITY_VALUE', `Velocity ${field} must be a finite number`, joinPointer(velocityPointer, field), { field }));
+        }
+        if (!particleFiniteNumber(asset.velocity.spread, strict) || Number(asset.velocity.spread) < 0) output.push(diagnostic('E_PARTICLE_SPREAD', 'Velocity spread must be a non-negative number', joinPointer(velocityPointer, 'spread')));
+      }
+
+      const shapePointer = joinPointer(pointer, 'shape');
+      if (!isPlainObject(asset.shape)) output.push(diagnostic('E_PARTICLE_SHAPE', 'Particle Asset shape must be an object', shapePointer));
+      else {
+        if (!['point', 'circle', 'box'].includes(asset.shape.type)) output.push(diagnostic('E_PARTICLE_SHAPE_TYPE', 'Particle shape type must be point, circle, or box', joinPointer(shapePointer, 'type')));
+        for (const field of ['radius', 'width', 'height']) {
+          if (!particleFiniteNumber(asset.shape[field], strict) || Number(asset.shape[field]) < 0) output.push(diagnostic('E_PARTICLE_SHAPE_SIZE', `Particle shape ${field} must be a non-negative number`, joinPointer(shapePointer, field), { field }));
+        }
+      }
+
+      const appearancePointer = joinPointer(pointer, 'appearance');
+      if (!isPlainObject(asset.appearance)) output.push(diagnostic('E_PARTICLE_APPEARANCE', 'Particle Asset appearance must be an object', appearancePointer));
+      else {
+        if (asset.appearance.assetId != null && (typeof asset.appearance.assetId !== 'string' || !asset.appearance.assetId.trim())) output.push(diagnostic('E_PARTICLE_APPEARANCE_ASSET', 'Appearance assetId must be null or a non-empty string', joinPointer(appearancePointer, 'assetId')));
+        if (typeof asset.appearance.color !== 'string' || !asset.appearance.color.trim()) output.push(diagnostic('E_PARTICLE_COLOR', 'Appearance color must be a non-empty string', joinPointer(appearancePointer, 'color')));
+        if (!['normal', 'additive'].includes(asset.appearance.blend)) output.push(diagnostic('E_PARTICLE_BLEND', 'Appearance blend must be normal or additive', joinPointer(appearancePointer, 'blend')));
+        if (!particleFiniteNumber(asset.appearance.baseScale, strict) || Number(asset.appearance.baseScale) < 0) output.push(diagnostic('E_PARTICLE_BASE_SCALE', 'Appearance baseScale must be a non-negative number', joinPointer(appearancePointer, 'baseScale')));
+        if (!particleFiniteNumber(asset.appearance.baseOpacity, strict) || Number(asset.appearance.baseOpacity) < 0 || Number(asset.appearance.baseOpacity) > 1) output.push(diagnostic('E_PARTICLE_BASE_OPACITY', 'Appearance baseOpacity must be between zero and one', joinPointer(appearancePointer, 'baseOpacity')));
+        if (!particleFiniteNumber(asset.appearance.baseHue, strict)) output.push(diagnostic('E_PARTICLE_BASE_HUE', 'Appearance baseHue must be a finite number', joinPointer(appearancePointer, 'baseHue')));
+      }
+
+      const curvesPointer = joinPointer(pointer, 'curves');
+      if (!Array.isArray(asset.curves)) output.push(diagnostic('E_PARTICLE_CURVES', 'Particle Asset curves must be an array', curvesPointer));
+      else {
+        const curveIds = new Map();
+        const curveProperties = new Map();
+        asset.curves.forEach((curve, curveIndex) => {
+          const curvePointer = joinPointer(curvesPointer, curveIndex);
+          if (!isPlainObject(curve)) { output.push(diagnostic('E_PARTICLE_CURVE_TYPE', 'Particle curve must be a plain object', curvePointer)); return; }
+          const curveId = typeof curve.id === 'string' ? curve.id.trim() : '';
+          if (!curveId) output.push(diagnostic('E_PARTICLE_CURVE_ID', 'Particle curve id must be a non-empty string', joinPointer(curvePointer, 'id')));
+          else if (curveIds.has(curveId)) output.push(diagnostic('E_PARTICLE_CURVE_ID_DUPLICATE', `Duplicate Particle curve id: ${curveId}`, joinPointer(curvePointer, 'id'), { firstPointer: curveIds.get(curveId) }));
+          else curveIds.set(curveId, joinPointer(curvePointer, 'id'));
+          if (!PARTICLE_CURVE_PROPERTIES.includes(curve.property)) output.push(diagnostic('E_PARTICLE_CURVE_PROPERTY', `Particle curve property must be one of: ${PARTICLE_CURVE_PROPERTIES.join(', ')}`, joinPointer(curvePointer, 'property')));
+          else if (curveProperties.has(curve.property)) output.push(diagnostic('E_PARTICLE_CURVE_PROPERTY_DUPLICATE', `Particle Asset already has a ${curve.property} curve`, joinPointer(curvePointer, 'property'), { firstPointer: curveProperties.get(curve.property) }));
+          else curveProperties.set(curve.property, joinPointer(curvePointer, 'property'));
+          if (!PARTICLE_CURVE_INTERPOLATIONS.includes(curve.interpolation)) output.push(diagnostic('E_PARTICLE_CURVE_INTERPOLATION', 'Particle curve interpolation must be linear, step, or cubic', joinPointer(curvePointer, 'interpolation')));
+          const keysPointer = joinPointer(curvePointer, 'keys');
+          if (!Array.isArray(curve.keys)) { output.push(diagnostic('E_PARTICLE_CURVE_KEYS', 'Particle curve keys must be an array', keysPointer)); return; }
+          const keyIds = new Map();
+          const keyTimes = new Map();
+          let previousTime = -Infinity;
+          curve.keys.forEach((key, keyIndex) => {
+            const keyPointer = joinPointer(keysPointer, keyIndex);
+            if (!isPlainObject(key)) { output.push(diagnostic('E_PARTICLE_CURVE_KEY_TYPE', 'Particle curve key must be a plain object', keyPointer)); return; }
+            const keyId = typeof key.id === 'string' ? key.id.trim() : '';
+            if (!keyId) output.push(diagnostic('E_PARTICLE_CURVE_KEY_ID', 'Particle curve key id must be a non-empty string', joinPointer(keyPointer, 'id')));
+            else if (keyIds.has(keyId)) output.push(diagnostic('E_PARTICLE_CURVE_KEY_ID_DUPLICATE', `Duplicate Particle curve key id: ${keyId}`, joinPointer(keyPointer, 'id'), { firstPointer: keyIds.get(keyId) }));
+            else keyIds.set(keyId, joinPointer(keyPointer, 'id'));
+            const timeValid = particleFiniteNumber(key.time, strict) && Number(key.time) >= 0 && Number(key.time) <= 1;
+            const keyTime = Number(key.time);
+            if (!timeValid) output.push(diagnostic('E_PARTICLE_CURVE_KEY_TIME', 'Particle curve key time must be between zero and one', joinPointer(keyPointer, 'time')));
+            else {
+              if (keyTimes.has(keyTime)) output.push(diagnostic('E_PARTICLE_CURVE_KEY_TIME_DUPLICATE', `Particle curve already has a key at time ${keyTime}`, joinPointer(keyPointer, 'time'), { firstPointer: keyTimes.get(keyTime) }));
+              else keyTimes.set(keyTime, joinPointer(keyPointer, 'time'));
+              if (keyTime < previousTime) output.push(diagnostic('E_PARTICLE_CURVE_KEY_ORDER', 'Particle curve keys must be sorted by ascending time', joinPointer(keyPointer, 'time')));
+              previousTime = keyTime;
+            }
+            if (!particleFiniteNumber(key.value, strict)) output.push(diagnostic('E_PARTICLE_CURVE_KEY_VALUE', 'Particle curve key value must be a finite number', joinPointer(keyPointer, 'value')));
+            for (const tangent of ['inTangent', 'outTangent']) {
+              if (hasOwn(key, tangent) && !particleFiniteNumber(key[tangent], strict)) output.push(diagnostic('E_PARTICLE_CURVE_KEY_TANGENT', `${tangent} must be a finite number`, joinPointer(keyPointer, tangent), { tangent }));
+            }
+          });
+        });
+      }
+    });
+
+    if (!definitionFreeEcsSnapshot) validateParticleEmitterReferences(document, particleIds, particleAssets, output, options);
+    return output;
+  }
+
+  function assertParticleDocument(document, options = {}) {
+    const diagnostics = validateParticleDocument(document, options);
+    const errors = diagnostics.filter(item => item.severity === 'error');
+    if (errors.length) {
+      const first = errors[0];
+      throw new ComponentSchemaError(first.code, first.message, { pointer: first.pointer, details: first.details, diagnostics });
+    }
+    return diagnostics;
+  }
 
   function animationSlug(value, fallback = 'animation') {
     const slug = String(value == null ? '' : value)
@@ -1855,7 +2484,11 @@
     { type: 'IK', schemas: COMPONENT_SCHEMAS.IK, defaults: {} },
     { type: 'Skin', schemas: COMPONENT_SCHEMAS.Skin, defaults: {}, runtimeOnlyFields: ['deformedVertices'] },
     { type: 'Tilemap', schemas: COMPONENT_SCHEMAS.Tilemap, defaults: {} },
-    { type: 'ParticleEmitter', schemas: COMPONENT_SCHEMAS.ParticleEmitter, defaults: {} },
+    {
+      type: 'ParticleEmitter', schemas: COMPONENT_SCHEMAS.ParticleEmitter,
+      defaults: { autoplay: true, time: 0, speed: 1, emitting: true, overrides: {} },
+      runtimeOnlyFields: ['particles', 'emissionAccumulator', 'completed', 'rngState']
+    },
     { type: 'BoxCollider', schemas: COMPONENT_SCHEMAS.BoxCollider, defaults: context => colliderDefaults(context, 'box'), normalize: normalizeCollider, runtimeOnlyFields: ['source', '*.source', 'colliders.*.source', 'shapes.*.source'] },
     { type: 'BoxCollider2D', schemas: COMPONENT_SCHEMAS.BoxCollider2D, defaults: context => colliderDefaults(context, 'box'), normalize: normalizeCollider, runtimeOnlyFields: ['source', '*.source', 'colliders.*.source', 'shapes.*.source'] },
     { type: 'CircleCollider', schemas: COMPONENT_SCHEMAS.CircleCollider, defaults: context => colliderDefaults(context, 'circle'), normalize: normalizeCollider, runtimeOnlyFields: ['source', '*.source', 'colliders.*.source', 'shapes.*.source'] },
@@ -2926,6 +3559,9 @@
   deepFreeze(ANIMATION_KEYFRAME_SCHEMA);
   deepFreeze(ANIMATION_TRACK_SCHEMA);
   deepFreeze(ANIMATION_CLIP_SCHEMA);
+  deepFreeze(PARTICLE_CURVE_KEY_SCHEMA);
+  deepFreeze(PARTICLE_CURVE_SCHEMA);
+  deepFreeze(PARTICLE_ASSET_SCHEMA);
   deepFreeze(JSON_SCHEMAS);
 
   return Object.freeze({
@@ -2936,6 +3572,9 @@
     PROFILE_NAMES,
     COMPONENT_NAME_PATTERN,
     ANIMATION_TRACK_TYPES,
+    PARTICLE_CURVE_PROPERTIES,
+    PARTICLE_CURVE_INTERPOLATIONS,
+    PARTICLE_ASSET_DEFAULTS,
     ComponentSchemaError,
     ComponentSchemaRegistry,
     EntityCodec,
@@ -2949,6 +3588,9 @@
     ANIMATION_KEYFRAME_SCHEMA,
     ANIMATION_TRACK_SCHEMA,
     ANIMATION_CLIP_SCHEMA,
+    PARTICLE_CURVE_KEY_SCHEMA,
+    PARTICLE_CURVE_SCHEMA,
+    PARTICLE_ASSET_SCHEMA,
     JSON_SCHEMAS,
     PREFAB_OVERRIDE_OPERATIONS,
     isSafeComponentName,
@@ -2967,6 +3609,11 @@
     assertAnimationDocument,
     validateSkeletonDocument,
     assertSkeletonDocument,
+    normalizeParticleAsset,
+    normalizeParticleAssets,
+    sampleParticleCurve,
+    validateParticleDocument,
+    assertParticleDocument,
     createDefaultComponentRegistry,
     createDefaultEntityCodec
   });

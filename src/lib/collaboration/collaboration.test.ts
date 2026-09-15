@@ -427,6 +427,7 @@ async function main(): Promise<void> {
     assert.match(frameSource, /AH2D_SAVE_REQUEST/);
     assert.match(frameSource, /AH2D_EDITOR_COMMAND/);
     assert.match(frameSource, /merged\.animations\s*=\s*mergeAnimations\(baseProject\.animations, editorDocument\.animations\)/);
+    assert.match(frameSource, /merged\.particles\s*=\s*mergeParticles\(baseProject\.particles, editorDocument\.particles\)/);
     assert.doesNotMatch(frameSource, /!Array\.isArray\(baseProject\.animations\)/);
 
     const bridgeSource = frameSource.match(
@@ -447,6 +448,7 @@ async function main(): Promise<void> {
       projectData: () => editorSnapshot,
       loadProject(project: Record<string, unknown>) {
         const sourceClip = (project.animations as Array<Record<string, unknown>>)[0];
+        const sourceParticle = (project.particles as Array<Record<string, unknown>>)[0];
         editorSnapshot = {
           ...structuredClone(project),
           animations: [
@@ -465,6 +467,43 @@ async function main(): Promise<void> {
               frameCount: 2,
               loop: false,
               tracks: [],
+            },
+          ],
+          particles: [
+            {
+              id: sourceParticle.id ?? "spark",
+              name: sourceParticle.name,
+              duration: 2,
+              loop: sourceParticle.loop,
+              maxParticles: sourceParticle.maxParticles,
+              emission: { rate: 48, burst: 2 },
+              lifetime: structuredClone(sourceParticle.lifetime),
+              velocity: structuredClone(sourceParticle.velocity),
+              shape: structuredClone(sourceParticle.shape),
+              appearance: structuredClone(sourceParticle.appearance),
+              curves: (sourceParticle.curves as Array<Record<string, unknown>>).map((curve) => ({
+                id: curve.id,
+                property: curve.property,
+                interpolation: curve.interpolation,
+                keys: (curve.keys as Array<Record<string, unknown>>).map((key) => ({
+                  id: key.id,
+                  time: key.time,
+                  value: key.value,
+                })),
+              })),
+            },
+            {
+              id: "new-particle",
+              name: "New Particle",
+              duration: 1,
+              loop: false,
+              maxParticles: 20,
+              emission: { rate: 5, burst: 0 },
+              lifetime: { min: 0.25, max: 0.5 },
+              velocity: { speedMin: 10, speedMax: 20, angle: -90, spread: 20, gravityX: 0, gravityY: 10 },
+              shape: { type: "point", radius: 0, width: 0, height: 0 },
+              appearance: { color: "#ffffff", blend: "normal", baseScale: 1, baseOpacity: 1, baseHue: 0 },
+              curves: [],
             },
           ],
         };
@@ -521,6 +560,43 @@ async function main(): Promise<void> {
           tracks: [],
         },
       ],
+      particles: [
+        {
+          name: "Spark",
+          duration: 1,
+          loop: true,
+          maxParticles: 100,
+          emission: { rate: 12, burst: 1, futureEmissionExtension: "keep-emission" },
+          lifetime: { min: 0.5, max: 1 },
+          velocity: { speedMin: 20, speedMax: 40, angle: -90, spread: 30, gravityX: 0, gravityY: 20 },
+          shape: { type: "circle", radius: 8, width: 0, height: 0 },
+          appearance: { color: "#80bfff", blend: "additive", baseScale: 1, baseOpacity: 1, baseHue: 0 },
+          curves: [{
+            id: "spark-opacity",
+            property: "opacity",
+            interpolation: "linear",
+            futureCurveExtension: "keep-curve",
+            keys: [
+              { id: "spark-opacity-start", time: 0, value: 1, outTangent: 3, futureKeyExtension: "keep-key" },
+              { id: "spark-opacity-end", time: 1, value: 0 },
+            ],
+          }],
+          futureParticleExtension: { renderer: "keep-me" },
+        },
+        {
+          id: "delete-particle",
+          name: "Deleted in Editor",
+          duration: 1,
+          loop: false,
+          maxParticles: 5,
+          emission: { rate: 0, burst: 1 },
+          lifetime: { min: 1, max: 1 },
+          velocity: { speedMin: 0, speedMax: 0, angle: 0, spread: 0, gravityX: 0, gravityY: 0 },
+          shape: { type: "point", radius: 0, width: 0, height: 0 },
+          appearance: { color: "#ffffff", blend: "normal", baseScale: 1, baseOpacity: 1, baseHue: 0 },
+          curves: [],
+        },
+      ],
     };
     const messageListener = bridgeListeners.get("message")?.[0];
     assert(messageListener, "the bridge must subscribe to parent messages");
@@ -557,6 +633,39 @@ async function main(): Promise<void> {
       false,
       "clips removed by the Editor must not be restored by the bridge",
     );
+    const savedParticles = (saveMessage.document as {
+      particles: Array<Record<string, unknown>>;
+    }).particles;
+    assert.equal(savedParticles.length, 2, "the authored particle library owns additions and deletions");
+    assert.equal(savedParticles[0].id, "spark");
+    assert.equal(savedParticles[0].duration, 2);
+    assert.deepEqual(savedParticles[0].emission, {
+      rate: 48,
+      burst: 2,
+      futureEmissionExtension: "keep-emission",
+    });
+    assert.equal(
+      (savedParticles[0].emission as Record<string, unknown>).futureEmissionExtension,
+      "keep-emission",
+    );
+    assert.deepEqual(
+      savedParticles[0].futureParticleExtension,
+      { renderer: "keep-me" },
+      "unknown legacy Particle Asset fields must survive ID normalization and the Editor/bridge round-trip",
+    );
+    const savedParticleCurves = savedParticles[0].curves as Array<Record<string, unknown>>;
+    assert.equal(savedParticleCurves[0].futureCurveExtension, "keep-curve");
+    assert.equal(
+      ((savedParticleCurves[0].keys as Array<Record<string, unknown>>)[0]).futureKeyExtension,
+      "keep-key",
+    );
+    assert.equal(
+      "outTangent" in (savedParticleCurves[0].keys as Array<Record<string, unknown>>)[0],
+      false,
+      "clearing an optional Curve tangent in the Editor must not resurrect it during hosted merge",
+    );
+    assert.equal(savedParticles[1].id, "new-particle");
+    assert.equal(savedParticles.some((asset) => asset.id === "delete-particle"), false);
     assert.equal(saveMessage.targetOrigin, "http://localhost");
 
     const routeProjectResponse = await createProjectRoute(new Request("http://localhost/api/projects", {

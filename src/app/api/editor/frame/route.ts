@@ -74,6 +74,89 @@ const WORKSPACE_BRIDGE = String.raw`
     });
   }
 
+  function mergeParticles(baseParticles, authoredParticles) {
+    if (!Array.isArray(authoredParticles)) return clone(baseParticles);
+    const originalsById = new Map();
+    const originalsByName = new Map();
+    const legacyOriginalsByName = new Map();
+    for (const asset of Array.isArray(baseParticles) ? baseParticles : []) {
+      if (!asset || typeof asset !== "object" || Array.isArray(asset)) continue;
+      const id = asset.id != null ? String(asset.id).trim() : "";
+      const name = asset.name != null ? String(asset.name).trim() : "";
+      if (id && !originalsById.has(id)) originalsById.set(id, asset);
+      if (name && !originalsByName.has(name)) originalsByName.set(name, asset);
+      if (!id && name && !legacyOriginalsByName.has(name)) legacyOriginalsByName.set(name, asset);
+    }
+    return authoredParticles.map((asset) => {
+      const id = asset && typeof asset === "object" && asset.id != null ? String(asset.id).trim() : "";
+      const name = asset && typeof asset === "object" && asset.name != null ? String(asset.name).trim() : "";
+      // Canonical IDs always win. Name matching is only a migration bridge
+      // when one side has no ID, never a way to merge two different IDs.
+      const original = id
+        ? (originalsById.get(id) || (name ? legacyOriginalsByName.get(name) : null))
+        : (name ? originalsByName.get(name) : null);
+      if (!asset || typeof asset !== "object" || Array.isArray(asset)) return clone(asset);
+      const merged = mergeRecord(original, asset);
+      for (const field of ["emission", "lifetime", "velocity", "shape", "appearance"]) {
+        if (asset[field] !== undefined) merged[field] = mergeRecord(original && original[field], asset[field]);
+      }
+      if (Array.isArray(asset.curves)) {
+        const originalCurves = Array.isArray(original && original.curves) ? original.curves : [];
+        const curvesById = new Map();
+        const curvesByProperty = new Map();
+        const legacyCurvesByProperty = new Map();
+        for (const curve of originalCurves) {
+          if (!curve || typeof curve !== "object" || Array.isArray(curve)) continue;
+          const curveId = curve.id != null ? String(curve.id).trim() : "";
+          const property = curve.property != null ? String(curve.property).trim() : "";
+          if (curveId && !curvesById.has(curveId)) curvesById.set(curveId, curve);
+          if (property && !curvesByProperty.has(property)) curvesByProperty.set(property, curve);
+          if (!curveId && property && !legacyCurvesByProperty.has(property)) legacyCurvesByProperty.set(property, curve);
+        }
+        merged.curves = asset.curves.map((curve) => {
+          if (!curve || typeof curve !== "object" || Array.isArray(curve)) return clone(curve);
+          const curveId = curve.id != null ? String(curve.id).trim() : "";
+          const property = curve.property != null ? String(curve.property).trim() : "";
+          const originalCurve = curveId
+            ? (curvesById.get(curveId) || (property ? legacyCurvesByProperty.get(property) : null))
+            : (property ? curvesByProperty.get(property) : null);
+          const mergedCurve = mergeRecord(originalCurve, curve);
+          if (!Array.isArray(curve.keys)) return mergedCurve;
+          const originalKeys = Array.isArray(originalCurve && originalCurve.keys) ? originalCurve.keys : [];
+          const keysById = new Map();
+          const keysByTime = new Map();
+          const legacyKeysByTime = new Map();
+          for (const key of originalKeys) {
+            if (!key || typeof key !== "object" || Array.isArray(key)) continue;
+            const keyId = key.id != null ? String(key.id).trim() : "";
+            const time = Number(key.time);
+            if (keyId && !keysById.has(keyId)) keysById.set(keyId, key);
+            if (Number.isFinite(time) && !keysByTime.has(time)) keysByTime.set(time, key);
+            if (!keyId && Number.isFinite(time) && !legacyKeysByTime.has(time)) legacyKeysByTime.set(time, key);
+          }
+          mergedCurve.keys = curve.keys.map((key) => {
+            if (!key || typeof key !== "object" || Array.isArray(key)) return clone(key);
+            const keyId = key.id != null ? String(key.id).trim() : "";
+            const time = Number(key.time);
+            const originalKey = keyId
+              ? (keysById.get(keyId) || (Number.isFinite(time) ? legacyKeysByTime.get(time) : null))
+              : (Number.isFinite(time) ? keysByTime.get(time) : null);
+            const mergedKey = mergeRecord(originalKey, key);
+            // Tangents are optional authored values. Omitting one is the
+            // Editor's explicit "use automatic segment slope" operation, so
+            // a hosted merge must not resurrect the previous tangent.
+            for (const tangent of ["inTangent", "outTangent"]) {
+              if (!Object.prototype.hasOwnProperty.call(key, tangent)) delete mergedKey[tangent];
+            }
+            return mergedKey;
+          });
+          return mergedCurve;
+        });
+      }
+      return merged;
+    });
+  }
+
   // Merge the fields authored by the current editor into the original
   // universal document. Runtime extensions and future schema fields must
   // survive an editor autosave even when this UI cannot render them yet.
@@ -109,11 +192,11 @@ const WORKSPACE_BRIDGE = String.raw`
       merged.animations = mergeAnimations(baseProject.animations, editorDocument.animations);
     }
 
-    // Particle UI authors the first system; additional systems remain opaque.
+    // Particle Assets are authored as a stable-ID library. Matching records
+    // retain extension fields the current Editor does not understand, while
+    // additions, deletions, ordering, and known values come from the Editor.
     if (Array.isArray(editorDocument.particles)) {
-      merged.particles = Array.isArray(baseProject.particles) && baseProject.particles.length > 1
-        ? [clone(editorDocument.particles[0]), ...clone(baseProject.particles.slice(1))]
-        : clone(editorDocument.particles);
+      merged.particles = mergeParticles(baseProject.particles, editorDocument.particles);
     }
 
     // Keep non-image/runtime asset descriptors the editor cannot display.

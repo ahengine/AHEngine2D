@@ -15,7 +15,7 @@ AH2D Editor (Next.js)
 └── AH2D Engine
     ├── Scene Graph + ECS
     ├── Transform / Camera / Lighting / Shadow
-    ├── Animation / Skeleton / IK / Skinning
+    ├── Animation / Particle / Skeleton / IK / Skinning
     ├── Post Process / Tilemap
     ├── Native Box2D-compatible Physics (Planck) + explicit built-in fallback
     ├── PixiJS / PhaserJS / Custom adapters
@@ -37,6 +37,7 @@ AH2D Editor (Next.js)
 - `docs/LOCAL_PROJECTS.md`: قرارداد پوشهٔ پروژه، مرورگرهای پشتیبانی‌شده و رفتار Save.
 - `docs/ANIMATIONS.md`: قرارداد Clip/Track/Keyframe، Timeline، binding و Runtime Animation.
 - `docs/SKELETONS.md`: قرارداد Skeleton/Bone/IK/Skin، Bind Pose، Timeline، Prefab و Rendererها.
+- `docs/PARTICLES.md`: قرارداد Particle Asset/Emitter، Curveها، شبیه‌سازی و rendererها.
 - `docs/DEPLOYMENT.md`: اجرای Production و محدودیت storage محلی.
 - `docs/PHYSICS.md`: قرارداد کامل Box2D، واحدها، fixtureها، contactها، Play Mode و API بومی.
 - `Agent.md`: راهنمای توسعهٔ بازی توسط Agent.
@@ -125,7 +126,7 @@ Editor تعبیه‌شده عمومی است، اما در iframe با origin ا
 - نسخهٔ standalone فایل `AH2DEdtior.html` همچنان از `localStorage` با کلید `AH2D.Project.v4` استفاده می‌کند.
 - `Export Universal JSON` فایل `AH2D_Project.json` را دانلود می‌کند. این فایل منبع اصلی و قابل‌حمل پروژه است.
 - `Export Animation JSON` کل Clip انتخاب‌شده را همراه Trackها و Keyframeها در فایل `<clip>.animation.json` می‌سازد.
-- `Export Particle JSON` فایل `<effect>.particle.json` می‌سازد.
+- `Export Particle JSON` کل Particle Asset انتخاب‌شده را همراه Curveها و Keyframeها در فایل `<effect>.particle.json` می‌سازد.
 - تصاویر Importشده به شکل Data URL/Base64 داخل JSON قرار می‌گیرند. این خروجی self-contained است، اما تصاویر بزرگ حجم فایل را زیاد می‌کنند و در نسخهٔ standalone مصرف `localStorage` را نیز بالا می‌برند.
 - اگر هنگام Play ذخیره یا Export انجام شود، Editor وضعیت Authoring قبل از Play را می‌نویسد، نه Transformهای موقت حاصل از simulation.
 
@@ -138,7 +139,7 @@ Editor تعبیه‌شده عمومی است، اما در iframe با origin ا
 | Editor Universal JSON | 4 | تمام Sceneها، assets، Prefab Asset/Instance/Override، animationها، particleها، Post Process و تنظیمات Engine | منبع اصلی پروژه، Save/Load و ادامهٔ ویرایش |
 | `Engine.export()` یا `ah2d ecs export` | 3 | فقط Entity/Componentهای Scene فعال در Runtime | Debug، تست یا انتقال snapshot فعال |
 | Animation asset | 1 | Clip کامل شامل FPS، frame count، Trackها، Keyframeها، easing، sprite/event/hitbox و Bone/IK | Import/اشتراک Asset و مصرف توسط AnimationSystem/SkeletonSystem |
-| Particle asset | 1 | پارامترهای emitter | مصرف توسط renderer/particle system بازی |
+| Particle asset | 1 | emission، lifetime، velocity، shape، appearance و Curveهای keyframe‌دار | مصرف توسط ParticleSystem و renderer بازی |
 
 هیچ‌وقت فایل Universal نسخهٔ ۴ را با نتیجهٔ `Engine.export()` جایگزین نکنید؛ snapshot نسخهٔ ۳ Sceneها و resourceهای پروژه را ندارد.
 
@@ -1010,7 +1011,7 @@ class GameScene extends Phaser.Scene {
 }
 ```
 
-PixiJS adapter اکنون Display Tree، Sprite/Graphics/Mesh، Transform، visibility، Camera، Skin deformation، asset loading پایه و برش native مقدار `Renderable.sourceRect` را مستقیماً از ECS ایجاد و Render می‌کند. مقدار `Renderable.frame` به‌تنهایی ابعاد و مختصات برش را تعیین نمی‌کند و به metadata مربوط به Asset یا host نیاز دارد. PhaserJS همچنان یک adapter انتخاب/سازگاری است و ساخت Game Objectها، همگام‌سازی ECS و `Skin.deformedVertices` و Camera/renderer mapping آن باید توسط پروژهٔ بازی انجام شود؛ مثال `createPhaserObjectsFromECS` بالا host-owned است. Particle rendering، Light/Shadow و Post Process filters نیز در PhaserJS/Custom به نگاشت اختصاصی host نیاز دارند.
+PixiJS adapter اکنون Display Tree، Sprite/Graphics/Mesh، Transform، visibility، Camera، Skin deformation، Particleهای texture/graphics، asset loading پایه و برش native مقدار `Renderable.sourceRect` را مستقیماً از ECS ایجاد و Render می‌کند. مقدار `Renderable.frame` به‌تنهایی ابعاد و مختصات برش را تعیین نمی‌کند و به metadata مربوط به Asset یا host نیاز دارد. PhaserJS همچنان یک adapter انتخاب/سازگاری است و ساخت Game Objectها، همگام‌سازی ECS و `Skin.deformedVertices`، `ParticleEmitter.particles` و Camera/renderer mapping آن باید توسط پروژهٔ بازی انجام شود؛ مثال `createPhaserObjectsFromECS` بالا host-owned است. Light/Shadow و Post Process filters نیز در PhaserJS/Custom به نگاشت اختصاصی host نیاز دارند.
 
 ### اجرای Headless در Node.js
 
@@ -1096,6 +1097,18 @@ engine.skeleton.solve(ikOrSkeletonId)
 engine.skeleton.deform(skinOrSkeletonId)
 engine.skeleton.rebind(skinOrSkeletonId)
 
+engine.particles.load(projectOrAssets)
+engine.particles.resolve(idOrUniqueName)
+engine.particles.getAsset(idOrUniqueName)
+engine.particles.effectiveAsset(entityIdOrEmitter)
+engine.particles.play(entityId, options)
+engine.particles.pause(entityId)
+engine.particles.stop(entityId, options)
+engine.particles.restart(entityId, options)
+engine.particles.getState(entityId)
+engine.particles.snapshot()
+engine.particles.restore(snapshot)
+
 engine.postProcess.load(config)
 engine.postProcess.get(idOrType)
 engine.postProcess.configure(idOrType, values)
@@ -1115,15 +1128,15 @@ engine.events.emit(type, payload)
 
 - نام پروژه در خروجی مستقیم Editor فعلاً `Demo Project` است؛ CLI می‌تواند `meta.name` را بدون از دست رفتن داده تغییر دهد.
 - Loader فعلی Editor فیلدهای ناشناختهٔ سند، Scene، `meta`، `engine`، Asset و Entity را هنگام Load/Save حفظ می‌کند؛ بخش‌هایی که Editor واقعاً مدل می‌کند با state فعال به‌روزرسانی می‌شوند. برای mutation اتمیک و قابل‌شرط‌گذاری با hash همچنان از CLI استفاده کنید.
-- Project Load تمام `animations[]` را به state Animator برمی‌گرداند و تغییر Clip/Track/Keyframe را در Save بعدی حفظ می‌کند. Particle Editor فعلاً فقط `particles[0]` را مدل می‌کند و Assetها بر اساس ID merge می‌شوند.
+- Project Load تمام `animations[]` و `particles[]` را به state ادیتور برمی‌گرداند. Particle Editor روی Asset انتخاب‌شده کار می‌کند، Assetها با ID پایدار merge می‌شوند و Curve/Keyframeها در Save بعدی حفظ می‌شوند.
 - Skeleton/Bone/IK/Skin در همان Entity/Componentهای Scene یا Prefab ذخیره می‌شوند؛ Timeline Trackهای Bone و IK را نگه می‌دارد و داده‌های pose/deformation مشتق‌شده وارد Authoring نمی‌شوند.
 - standalone animation/particle JSON ورودی مستقیم Project Load نیستند.
 - layout پنل‌ها، selection، undo history، grid/snap، commentهای محلی داخل canvas و وضعیت دوربین Prefab در Universal JSON ذخیره نمی‌شوند. Commentهای مشارکتی Studio جداگانه در Project API ذخیره می‌شوند.
 - Prefabهای canonical از Asset/Instance/Override/Apply/Revert/Unpack پشتیبانی می‌کنند؛ nested Prefab Asset و structural override هنوز پشتیبانی نمی‌شوند و برای تغییر hierarchy یک Instance متصل باید ابتدا Unpack انجام شود.
 - Sprite Track اطلاعات canonical `frame`/`sourceRect` را ذخیره می‌کند. PixiJS adapter مستقیماً `sourceRect` را به subtexture تبدیل می‌کند؛ `frame` بدون rectangle به متادیتای Sprite Sheet از Asset/host نیاز دارد و نگاشت PhaserJS/Custom همچنان host-owned است.
-- Particle export پارامترهای emitter را ذخیره می‌کند؛ texture، gradient، curve keyها و live particleها صادر نمی‌شوند.
+- Particle export قرارداد مستقل `AH2D.Particle` نسخهٔ ۱ را همراه texture reference و Curve keyها ذخیره می‌کند؛ فقط ذرات زنده و bookkeeping شبیه‌سازی صادر نمی‌شوند.
 - Editor چند fixture مستقل box/circle را روی یک Entity مدیریت می‌کند. polygon/chain/joint هنوز قرارداد Authoring داخل Universal JSON ندارند؛ در صورت نیاز بازی از handle بومی Runtime استفاده کند.
-- دادهٔ `playing` در Particle export وضعیت Preview Editor است و نباید به‌تنهایی مبنای lifecycle Runtime قرار گیرد.
+- lifecycle هر Instance در `ParticleEmitter` نگه‌داری می‌شود و داده‌های `particles`، `emissionAccumulator`، `completed` و `rngState` فقط Runtime هستند.
 
 این محدودیت‌ها باید هنگام نوشتن importer یا Runtime سفارشی لحاظ شوند؛ مستندات قابلیت‌هایی را که هنوز در خروجی وجود ندارند تضمین نمی‌کند.
 
@@ -1137,6 +1150,8 @@ npm test
 npm run ah2d -- validate --file game.ah2d.json --engine --pretty
 ```
 
-Test suite شامل hierarchy عمیق و چندریشه، local/world Transform، propagation، traversal، تشخیص cycle/ID تکراری، Reparent و Delete با preserve-world، rollback اتمیک برای shear/singular، Multi-Scene، Runtime selection، Rigidbody، multi-fixture box/circle، trigger، contact بومی، collision filtering، auto mass، force/torque/impulse، kinematic body، sleeping، Skeleton/FK، CCD IK، LBS، Prefab Rig reference، Pixi Mesh، Bone/IK animation، snapshot/restore، substep، lifecycle و قرارداد Editor است.
+Test suite شامل hierarchy عمیق و چندریشه، local/world Transform، propagation، traversal، تشخیص cycle/ID تکراری، Reparent و Delete با preserve-world، rollback اتمیک برای shear/singular، Multi-Scene، Runtime selection، Rigidbody، multi-fixture box/circle، trigger، contact بومی، collision filtering، auto mass، force/torque/impulse، kinematic body، sleeping، Skeleton/FK، CCD IK، LBS، Prefab Rig reference، Pixi Mesh، Bone/IK animation، Particle Asset/Curve، deterministic emission، Pixi Particle lifecycle، snapshot/restore، substep، lifecycle و قرارداد Editor است.
+
+قرارداد کامل Particle Asset، معنای Curveها، API شبیه‌سازی و workflow ابزارها در [`docs/PARTICLES.md`](./docs/PARTICLES.md) آمده است.
 
 برای workflow استاندارد توسعه توسط Agent، [`Agent.md`](./Agent.md) را بخوانید.

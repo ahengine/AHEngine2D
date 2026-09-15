@@ -35,7 +35,17 @@ const {
   validateAnimationDocument,
   assertAnimationDocument,
   validateSkeletonDocument,
-  assertSkeletonDocument
+  assertSkeletonDocument,
+  PARTICLE_ASSET_SCHEMA,
+  PARTICLE_CURVE_SCHEMA,
+  PARTICLE_CURVE_KEY_SCHEMA,
+  PARTICLE_CURVE_PROPERTIES,
+  PARTICLE_CURVE_INTERPOLATIONS,
+  normalizeParticleAsset,
+  normalizeParticleAssets,
+  sampleParticleCurve,
+  validateParticleDocument,
+  assertParticleDocument
 } = DataModel;
 
 const tests = [];
@@ -52,6 +62,7 @@ test('exports stable constants, schemas, and a browser global', () => {
   assert.strictEqual(ENTITY_SCHEMA.properties.id.pattern, '\\S');
   assert.strictEqual(JSON_SCHEMAS.components, COMPONENT_SCHEMAS);
   assert.strictEqual(JSON_SCHEMAS.prefabAsset, PREFAB_ASSET_SCHEMA);
+  assert.strictEqual(JSON_SCHEMAS.particleAsset, PARTICLE_ASSET_SCHEMA);
   assert.deepStrictEqual(PREFAB_OVERRIDE_OPERATIONS, ['add', 'replace', 'remove']);
 
   const source = fs.readFileSync(path.join(__dirname, 'AH2DDataModel.js'), 'utf8');
@@ -61,6 +72,7 @@ test('exports stable constants, schemas, and a browser global', () => {
   assert.strictEqual(typeof browser.AH2DDataModel.createDefaultEntityCodec, 'function');
   assert.strictEqual(typeof browser.AH2DDataModel.validatePrefabDocument, 'function');
   assert.strictEqual(typeof browser.AH2DDataModel.validateSkeletonDocument, 'function');
+  assert.strictEqual(typeof browser.AH2DDataModel.sampleParticleCurve, 'function');
 });
 
 test('applies canonical Prefab override pointers safely and protects instance identity', () => {
@@ -761,6 +773,16 @@ test('filters runtime-derived fields from authoring but retains them in runtime 
   const rigidbody = registry.normalize('Rigidbody', { mass: 1, inverseMass: 1, inertia: 8, extension: 2 }, { profile: 'authoring' });
   assert.deepStrictEqual(rigidbody, { mass: 1, extension: 2 });
 
+  const particleEmitter = {
+    assetId: 'sparks', autoplay: true, particles: [{ id: 'p1' }], emissionAccumulator: 0.5,
+    completed: false, rngState: 42, extension: { keep: true }
+  };
+  const authoredEmitter = registry.normalize('ParticleEmitter', particleEmitter, { profile: 'authoring' });
+  const runtimeEmitter = registry.normalize('ParticleEmitter', particleEmitter, { profile: 'runtime' });
+  assert.deepStrictEqual(authoredEmitter, { assetId: 'sparks', autoplay: true, extension: { keep: true } });
+  assert.deepStrictEqual(runtimeEmitter, particleEmitter);
+  assert.deepStrictEqual(registry.describe('ParticleEmitter').runtimeOnlyFields, ['particles', 'emissionAccumulator', 'completed', 'rngState']);
+
   const colliders = registry.normalize('Collider', [
     { shape: 'box', source: { runtime: true }, extension: 1 }
   ], { profile: 'authoring' });
@@ -795,6 +817,206 @@ test('rejects circular and otherwise non-JSON component data', () => {
     const diagnostics = registry.validate('CustomData', value);
     assert(diagnostics.some(item => item.code === expectedCode), `${expectedCode} not reported`);
   }
+});
+
+test('normalizes legacy Particle Assets into the canonical v1 contract without mutating extensions', () => {
+  assert.deepStrictEqual(PARTICLE_CURVE_PROPERTIES, ['emission', 'scale', 'speed', 'opacity', 'hue']);
+  assert.deepStrictEqual(PARTICLE_CURVE_INTERPOLATIONS, ['linear', 'step', 'cubic']);
+  assert.strictEqual(PARTICLE_ASSET_SCHEMA.properties.curves.items, PARTICLE_CURVE_SCHEMA);
+  assert.strictEqual(PARTICLE_CURVE_SCHEMA.properties.keys.items, PARTICLE_CURVE_KEY_SCHEMA);
+  assert.deepStrictEqual(PARTICLE_ASSET_SCHEMA.required, [
+    'id', 'name', 'duration', 'loop', 'maxParticles', 'emission', 'lifetime', 'velocity', 'shape', 'appearance', 'curves'
+  ]);
+
+  const legacy = {
+    name: 'Magic Sparkle', amount: 140, rate: 90, lifetime: 1.6, speed: 120, spread: 55,
+    gravity: 65, radius: 70, scale: 1.25, opacity: 0.8, hue: 42, blend: 'Additive', playing: true, loop: true,
+    futureAsset: { keep: true }, curves: [
+      { property: 'opacity', interpolation: 'cubic', futureCurve: 7, keys: [
+        { time: 1, value: 0, inTangent: -2, futureKey: true },
+        { time: 0, value: 1, outTangent: 0 }
+      ] }
+    ]
+  };
+  const before = JSON.stringify(legacy);
+  const normalized = normalizeParticleAsset(legacy);
+  assert.strictEqual(JSON.stringify(legacy), before, 'Particle normalization must not mutate its input');
+  assert.strictEqual(normalized.id, 'magic-sparkle');
+  assert.strictEqual(normalized.maxParticles, 140);
+  assert.deepStrictEqual(normalized.emission, { rate: 90, burst: 0 });
+  assert.deepStrictEqual(normalized.lifetime, { min: 1.6, max: 1.6 });
+  assert.deepStrictEqual(normalized.velocity, { speedMin: 120, speedMax: 120, angle: -90, spread: 55, gravityX: 0, gravityY: 65 });
+  assert.deepStrictEqual(normalized.shape, { type: 'circle', radius: 70, width: 0, height: 0 });
+  assert.deepStrictEqual(normalized.appearance, { color: '#ffffff', blend: 'additive', baseScale: 1.25, baseOpacity: 0.8, baseHue: 42 });
+  assert.strictEqual(normalized.futureAsset.keep, true);
+  assert.strictEqual(normalized.curves[0].futureCurve, 7);
+  assert.deepStrictEqual(normalized.curves[0].keys.map(key => key.time), [0, 1]);
+  assert.strictEqual(normalized.curves[0].keys[1].futureKey, true);
+  assert(normalized.curves[0].id);
+  assert(normalized.curves[0].keys.every(key => key.id));
+  assert.deepStrictEqual(validateParticleDocument([normalized]), []);
+  const burstOnly = normalizeParticleAsset({ id: 'burst', name: 'Burst', duration: 0, emission: { rate: 0, burst: 8 } });
+  assert.strictEqual(burstOnly.duration, 1, 'invalid zero duration falls back to the canonical default');
+  assert.deepStrictEqual(validateParticleDocument([burstOnly]), []);
+
+  const collisionSafe = normalizeParticleAssets([
+    { name: 'Smoke', rate: 1 },
+    { name: 'Smoke', rate: 2 },
+    { ...normalizeParticleAsset({ name: 'Explicit' }), id: 'smoke' }
+  ]);
+  assert.deepStrictEqual(collisionSafe.map(asset => asset.id), ['smoke-2', 'smoke-3', 'smoke']);
+});
+
+test('samples linear, step, and cubic Particle curves in normalized time', () => {
+  const keys = [{ id: 'a', time: 0, value: 0, outTangent: 0 }, { id: 'b', time: 1, value: 1, inTangent: 0 }];
+  const source = JSON.stringify(keys);
+  assert.strictEqual(sampleParticleCurve({ interpolation: 'linear', keys }, 0.25), 0.25);
+  assert.strictEqual(sampleParticleCurve({ interpolation: 'step', keys }, 0.75), 0);
+  assert.strictEqual(sampleParticleCurve({ interpolation: 'cubic', keys }, 0.25), 0.15625);
+  assert.strictEqual(sampleParticleCurve({ interpolation: 'cubic', keys }, -1), 0);
+  assert.strictEqual(sampleParticleCurve({ interpolation: 'cubic', keys }, 2), 1);
+  assert.strictEqual(sampleParticleCurve({ interpolation: 'linear', keys: [{ id: 'only', time: 0.5, value: 7 }] }, 0.1), 7);
+  assert.strictEqual(sampleParticleCurve({ interpolation: 'step', keys: [
+    { id: 'first', time: 0, value: 2 }, { id: 'middle', time: 0.5, value: 5 }, { id: 'last', time: 1, value: 9 }
+  ] }, 0.5), 5, 'an exact step key samples that key rather than the previous segment');
+  assert.strictEqual(sampleParticleCurve({ interpolation: 'linear', keys: [] }, 0.5, { defaultValue: 3 }), 3);
+  assert.strictEqual(JSON.stringify(keys), source, 'Curve sampling must not reorder or mutate authored keys');
+
+  const linearTangents = [{ id: 'a', time: 0.2, value: 4 }, { id: 'b', time: 0.8, value: 10 }];
+  assert.ok(Math.abs(sampleParticleCurve({ interpolation: 'cubic', keys: linearTangents }, 0.5) - 7) < 1e-12, 'missing cubic tangents fall back to the segment slope');
+});
+
+test('validates Particle Asset ranges, unique curves, sorted keys, and Scene/Prefab emitter references', () => {
+  const asset = normalizeParticleAsset({
+    id: 'sparks', name: 'Sparks', futureAsset: true,
+    curves: [{ id: 'opacity', property: 'opacity', interpolation: 'linear', keys: [
+      { id: 'opaque', time: 0, value: 1 }, { id: 'clear', time: 1, value: 0 }
+    ] }]
+  });
+  const project = {
+    format: 'AH2D', version: 4, particles: [asset],
+    scenes: [{ id: 'main', objects: [{ id: 'scene-emitter', components: { ParticleEmitter: { assetId: 'sparks', autoplay: true } } }] }],
+    currentSceneId: 'main', scene: [],
+    prefabs: [{ id: 'fx', rootEntityId: 'source', revision: 0, entities: [
+      { id: 'source', components: { ParticleEmitter: { assetId: 'sparks', loop: false } } }
+    ] }]
+  };
+  const before = JSON.stringify(project);
+  assert.deepStrictEqual(validateParticleDocument(project), []);
+  assert.deepStrictEqual(assertParticleDocument(project), []);
+  assert.strictEqual(JSON.stringify(project), before, 'Particle validation must be non-mutating');
+
+  const missingBinding = JSON.parse(JSON.stringify(project));
+  delete missingBinding.scenes[0].objects[0].components.ParticleEmitter.assetId;
+  assert(validateParticleDocument(missingBinding).some(item => item.code === 'E_PARTICLE_EMITTER_ASSET'));
+
+  const legacyEmitter = JSON.parse(JSON.stringify(project));
+  legacyEmitter.scenes[0].objects[0].components.ParticleEmitter = {
+    assetId: '  ', name: 'Inline sparks', amount: 20, rate: 4, lifetime: 0.5, speed: 12, futureEmitter: true
+  };
+  const legacyEmitterCompat = validateParticleDocument(legacyEmitter);
+  assert(legacyEmitterCompat.some(item => item.code === 'W_PARTICLE_EMITTER_LEGACY' && item.severity === 'warning'));
+  assert.strictEqual(legacyEmitterCompat.some(item => item.severity === 'error'), false);
+  assert(validateParticleDocument(legacyEmitter, { strict: true }).some(item => item.code === 'E_PARTICLE_EMITTER_LEGACY'));
+
+  const dangling = JSON.parse(JSON.stringify(project));
+  dangling.prefabs[0].entities[0].components.ParticleEmitter.assetId = 'missing';
+  assert(validateParticleDocument(dangling).some(item => item.code === 'E_PARTICLE_ASSET_REFERENCE' && item.pointer === '/prefabs/0/entities/0/components/ParticleEmitter/assetId'));
+
+  const emptyScenesWithActiveMirror = {
+    format: 'AH2D', version: 4, particles: [asset], scenes: [],
+    scene: [{ id: 'mirror-emitter', components: { ParticleEmitter: { assetId: 'missing' } } }]
+  };
+  assert(validateParticleDocument(emptyScenesWithActiveMirror).some(item => (
+    item.code === 'E_PARTICLE_ASSET_REFERENCE'
+    && item.pointer === '/scene/0/components/ParticleEmitter/assetId'
+  )), 'an empty Scenes collection must fall back to the active Scene mirror used by Engine.load');
+
+  const nonemptyScenesSuppressStaleMirror = JSON.parse(JSON.stringify(project));
+  nonemptyScenesSuppressStaleMirror.scene = [{ id: 'stale-mirror', components: { ParticleEmitter: { assetId: 'missing' } } }];
+  assert.strictEqual(
+    validateParticleDocument(nonemptyScenesSuppressStaleMirror).some(item => item.pointer.startsWith('/scene/')),
+    false,
+    'non-empty canonical Scenes remain authoritative over the active Scene mirror'
+  );
+
+  const invalidOverrides = JSON.parse(JSON.stringify(project));
+  invalidOverrides.scenes[0].objects[0].components.ParticleEmitter.overrides = {
+    id: 'replacement-is-forbidden',
+    emission: { rate: -4 },
+    lifetime: { min: 9, max: 1 },
+    shape: { type: 'triangle' }
+  };
+  const overrideDiagnostics = validateParticleDocument(invalidOverrides, { strict: true });
+  assert(overrideDiagnostics.some(item => item.code === 'E_PARTICLE_OVERRIDE_IDENTITY' && item.pointer === '/scenes/0/objects/0/components/ParticleEmitter/overrides/id'));
+  assert(overrideDiagnostics.some(item => item.code === 'E_PARTICLE_EMISSION_RATE' && item.pointer === '/scenes/0/objects/0/components/ParticleEmitter/overrides/emission/rate'));
+  assert(overrideDiagnostics.some(item => item.code === 'E_PARTICLE_LIFETIME_RANGE' && item.pointer === '/scenes/0/objects/0/components/ParticleEmitter/overrides/lifetime'));
+  assert(overrideDiagnostics.some(item => item.code === 'E_PARTICLE_SHAPE_TYPE' && item.pointer === '/scenes/0/objects/0/components/ParticleEmitter/overrides/shape/type'));
+
+  const validOverrides = JSON.parse(JSON.stringify(project));
+  validOverrides.scenes[0].objects[0].components.ParticleEmitter.overrides = {
+    emission: { rate: 24 }, appearance: { baseOpacity: 0.5 }, futureOverride: { keep: true }
+  };
+  assert.deepStrictEqual(validateParticleDocument(validOverrides, { strict: true }), []);
+
+  const malformed = JSON.parse(JSON.stringify(asset));
+  malformed.lifetime = { min: 3, max: 1 };
+  malformed.velocity = { ...malformed.velocity, speedMin: 10, speedMax: 2 };
+  malformed.curves.push({
+    id: 'opacity', property: 'opacity', interpolation: 'cubic', keys: [
+      { id: 'same', time: 0.75, value: 0 },
+      { id: 'same', time: 0.25, value: 1 },
+      { id: 'third', time: 0.25, value: 2 }
+    ]
+  });
+  const codes = new Set(validateParticleDocument([malformed]).map(item => item.code));
+  for (const code of [
+    'E_PARTICLE_LIFETIME_RANGE', 'E_PARTICLE_SPEED_RANGE', 'E_PARTICLE_CURVE_ID_DUPLICATE',
+    'E_PARTICLE_CURVE_PROPERTY_DUPLICATE', 'E_PARTICLE_CURVE_KEY_ID_DUPLICATE',
+    'E_PARTICLE_CURVE_KEY_TIME_DUPLICATE', 'E_PARTICLE_CURVE_KEY_ORDER'
+  ]) assert(codes.has(code), `${code} was not reported`);
+
+  const numericStrings = JSON.parse(JSON.stringify(asset));
+  numericStrings.duration = '1';
+  numericStrings.curves[0].keys[0].time = '0';
+  assert.strictEqual(validateParticleDocument([numericStrings]).some(item => item.severity === 'error'), false);
+  assert(validateParticleDocument([numericStrings], { strict: true }).some(item => item.code === 'E_PARTICLE_DURATION'));
+
+  const canonicalWithoutId = { ...asset };
+  delete canonicalWithoutId.id;
+  assert(validateParticleDocument([canonicalWithoutId]).some(item => item.code === 'E_PARTICLE_ASSET_ID'));
+
+  const legacy = { name: 'Legacy', amount: 12, rate: 4, lifetime: 1, futureLegacy: true };
+  assert(validateParticleDocument({ particles: [legacy] }).some(item => item.code === 'W_PARTICLE_ASSET_LEGACY'));
+  assert.throws(() => assertParticleDocument({ particles: [legacy] }, { strict: true }), error => error instanceof ComponentSchemaError && error.code === 'E_PARTICLE_ASSET_LEGACY');
+
+  const standalone = { format: 'AH2D.Particle', version: 1, ...asset };
+  assert.deepStrictEqual(validateParticleDocument(standalone), []);
+  const missingStandaloneFormat = { ...standalone };
+  delete missingStandaloneFormat.format;
+  assert(validateParticleDocument(missingStandaloneFormat).some(item => (
+    item.code === 'E_PARTICLE_DOCUMENT_FORMAT' && item.pointer === '/format'
+  )), 'a bare Particle Asset must not be mistaken for an empty Project');
+  const wrongStandaloneFormat = { ...standalone, format: 'AH2D.Particles' };
+  assert(validateParticleDocument(wrongStandaloneFormat).some(item => (
+    item.code === 'E_PARTICLE_DOCUMENT_FORMAT' && item.pointer === '/format'
+  )), 'a Particle-like standalone dialect typo must be rejected');
+  const malformedStandaloneEnvelope = { ...standalone, format: 'Other.Particle', version: 2 };
+  const malformedStandaloneDiagnostics = validateParticleDocument(malformedStandaloneEnvelope);
+  assert(malformedStandaloneDiagnostics.some(item => item.code === 'E_PARTICLE_DOCUMENT_FORMAT'));
+  assert(malformedStandaloneDiagnostics.some(item => item.code === 'E_PARTICLE_DOCUMENT_VERSION'));
+  const wrongStandaloneVersion = { ...standalone, version: 999 };
+  assert(validateParticleDocument(wrongStandaloneVersion).some(item => item.code === 'E_PARTICLE_DOCUMENT_VERSION' && item.pointer === '/version'));
+  const missingStandaloneVersion = { ...standalone };
+  delete missingStandaloneVersion.version;
+  assert(validateParticleDocument(missingStandaloneVersion).some(item => item.code === 'E_PARTICLE_DOCUMENT_VERSION'));
+  assert.strictEqual(validateParticleDocument({ ...standalone, version: '1' }).some(item => item.code === 'E_PARTICLE_DOCUMENT_VERSION'), false);
+  assert(validateParticleDocument({ ...standalone, version: '1' }, { strict: true }).some(item => item.code === 'E_PARTICLE_DOCUMENT_VERSION'));
+  assert.deepStrictEqual(validateParticleDocument({
+    format: 'AH2D', version: 4, currentSceneId: 'main', scenes: [{ id: 'main', objects: [] }],
+    duration: 2, particles: []
+  }), [], 'Universal Projects must not be classified as standalone Particle Assets');
+  assert.deepStrictEqual(validateParticleDocument({ version: 3, entities: [{ id: 'runtime', components: { ParticleEmitter: { assetId: 'sparks' } } }] }), []);
 });
 
 test('normalizes, validates, and samples canonical Animation Clips without losing extensions', () => {
