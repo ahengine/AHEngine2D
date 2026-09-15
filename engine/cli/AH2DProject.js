@@ -4,8 +4,9 @@ const crypto = require('crypto');
 const {
   DATA_MODEL_ID, DATA_MODEL_VERSION, COMPONENT_SCHEMA_VERSION, PROFILE_NAMES,
   ComponentSchemaError, EntityCodec, createDefaultComponentRegistry, applyJsonPointerOperation, applyPrefabOverrideOperation, validatePrefabDocument,
-  validateAnimationDocument, validateSkeletonDocument, validateParticleDocument, parseJsonPointer, prefabOverridePathAllowed, jsonPointerLookup,
-  PREFAB_ASSET_SCHEMA, ANIMATION_CLIP_SCHEMA, PARTICLE_ASSET_SCHEMA
+  validateAnimationDocument, validateSkeletonDocument, validateParticleDocument, validateShaderGraphDocument, parseJsonPointer, prefabOverridePathAllowed, jsonPointerLookup,
+  PREFAB_ASSET_SCHEMA, ANIMATION_CLIP_SCHEMA, PARTICLE_ASSET_SCHEMA, SHADER_GRAPH_SCHEMA, POST_PROCESS_EFFECT_SCHEMA, POST_PROCESS_SCHEMA,
+  SHADER_NODE_TYPES, SHADER_VALUE_TYPES, SHADER_NODE_DEFINITIONS
 } = require('../AH2DDataModel.js');
 
 const PROTOCOL = 'ah2d.cli/v1';
@@ -143,7 +144,7 @@ function createProject(options = {}) {
     scene: clone(objects),
     postProcess: createDefaultPostProcess(),
     assets: [], folders: ['Environment', 'Props', 'Characters', 'FX', 'UI', 'Prefabs', 'Animations'],
-    prefabs: [], animations: [], particles: []
+    prefabs: [], animations: [], particles: [], shaderGraphs: []
   };
 }
 
@@ -182,6 +183,7 @@ function migrateDocument(input, options = {}) {
   if (document.prefabs == null && document.prefab == null) document.prefabs = [];
   document.animations = Array.isArray(document.animations) ? document.animations : [];
   document.particles = Array.isArray(document.particles) ? document.particles : [];
+  if (document.shaderGraphs == null) { document.shaderGraphs = []; migrated = true; }
   if (!isObject(document.postProcess)) { document.postProcess = createDefaultPostProcess(); migrated = true; }
   document.format = 'AH2D';
   document.version = PROJECT_VERSION;
@@ -327,30 +329,11 @@ function validateDocument(document, options = {}) {
   const gravity = document.engine?.gravity;
   if (gravity && (!finite(gravity.x) || !finite(gravity.y))) diagnostics.push(diagnostic('error', 'E_GRAVITY', 'Gravity x and y must be finite', '/engine/gravity'));
   if (document.engine?.pixelsPerMeter != null && (!finite(document.engine.pixelsPerMeter) || Number(document.engine.pixelsPerMeter) <= 0)) diagnostics.push(diagnostic('error', 'E_PIXELS_PER_METER', 'pixelsPerMeter must be greater than zero', '/engine/pixelsPerMeter'));
-  if (document.postProcess != null) {
-    if (!isObject(document.postProcess)) diagnostics.push(diagnostic('error', 'E_POST_PROCESS_TYPE', 'postProcess must be an object', '/postProcess'));
-    else {
-      if (document.postProcess.enabled != null && typeof document.postProcess.enabled !== 'boolean') diagnostics.push(diagnostic('error', 'E_POST_PROCESS_ENABLED', 'postProcess.enabled must be boolean', '/postProcess/enabled'));
-      if (!Array.isArray(document.postProcess.effects)) diagnostics.push(diagnostic('error', 'E_POST_PROCESS_EFFECTS', 'postProcess.effects must be an array', '/postProcess/effects'));
-      else {
-        const effectIds = new Set();
-        document.postProcess.effects.forEach((effect, index) => {
-          const pointer = `/postProcess/effects/${index}`;
-          if (!isObject(effect)) { diagnostics.push(diagnostic('error', 'E_POST_PROCESS_EFFECT_TYPE', 'Post Process effect must be an object', pointer)); return; }
-          if (typeof effect.id !== 'string' || !effect.id.trim()) diagnostics.push(diagnostic('error', 'E_POST_PROCESS_EFFECT_ID', 'Post Process effect id must be a non-empty string', `${pointer}/id`));
-          else if (effectIds.has(effect.id)) diagnostics.push(diagnostic('error', 'E_POST_PROCESS_DUPLICATE_ID', `Duplicate Post Process effect id: ${effect.id}`, `${pointer}/id`));
-          else effectIds.add(effect.id);
-          if (typeof effect.type !== 'string' || !effect.type.trim()) diagnostics.push(diagnostic('error', 'E_POST_PROCESS_EFFECT_KIND', 'Post Process effect type must be a non-empty string', `${pointer}/type`));
-          if (effect.enabled != null && typeof effect.enabled !== 'boolean') diagnostics.push(diagnostic('error', 'E_POST_PROCESS_EFFECT_ENABLED', 'Effect enabled must be boolean', `${pointer}/enabled`));
-          for (const [key, value] of Object.entries(effect)) if (!['id', 'type', 'name', 'enabled'].includes(key) && typeof value === 'number' && !Number.isFinite(value)) diagnostics.push(diagnostic('error', 'E_POST_PROCESS_NUMBER', `${key} must be finite`, `${pointer}/${escapePointer(key)}`));
-        });
-      }
-    }
-  }
   validatePrefabContract(document, diagnostics, options);
   diagnostics.push(...validateAnimationDocument(document, { strict: Boolean(options.strict), entityCodec }));
   diagnostics.push(...validateSkeletonDocument(document, { strict: Boolean(options.strict), entityCodec, validateComponents: false }));
   diagnostics.push(...validateParticleDocument(document, { strict: Boolean(options.strict), entityCodec }));
+  diagnostics.push(...validateShaderGraphDocument(document, { strict: Boolean(options.strict) }));
   for (const key of ['assets', 'folders', 'prefab', 'prefabs', 'animations']) if (document[key] != null && !Array.isArray(document[key])) diagnostics.push(diagnostic('error', 'E_RESOURCE_ARRAY', `${key} must be an array`, `/${key}`));
   return diagnostics;
 }
@@ -1720,7 +1703,7 @@ function applyOperations(input, operations, options = {}) {
 
 function resourceField(type, document) {
   const key = String(type || '').toLowerCase();
-  const fields = { asset: 'assets', assets: 'assets', folder: 'folders', folders: 'folders', prefab: Array.isArray(document.prefabs) ? 'prefabs' : 'prefab', prefabs: Array.isArray(document.prefabs) ? 'prefabs' : 'prefab', animation: 'animations', animations: 'animations', particle: 'particles', particles: 'particles' };
+  const fields = { asset: 'assets', assets: 'assets', folder: 'folders', folders: 'folders', prefab: Array.isArray(document.prefabs) ? 'prefabs' : 'prefab', prefabs: Array.isArray(document.prefabs) ? 'prefabs' : 'prefab', animation: 'animations', animations: 'animations', particle: 'particles', particles: 'particles', shader: 'shaderGraphs', shaders: 'shaderGraphs', shadergraph: 'shaderGraphs', shadergraphs: 'shaderGraphs' };
   const field = fields[key];if (!field) throw new DomainError('E_RESOURCE_TYPE', `Unknown resource type: ${type}`, { exitCode: EXIT.USAGE });if (!Array.isArray(document[field])) document[field] = [];return field;
 }
 
@@ -1831,7 +1814,8 @@ function documentHash(value) {
 module.exports = {
   PROTOCOL, PROJECT_VERSION, RUNTIMES, PHYSICS_BACKENDS, PHYSICS_IMPLEMENTATIONS, BODY_TYPES, COLLIDER_SHAPES, EXIT, DomainError,
   DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES: PROFILE_NAMES, componentRegistry, entityCodec,
-  PREFAB_ASSET_SCHEMA, ANIMATION_CLIP_SCHEMA, PARTICLE_ASSET_SCHEMA,
+  PREFAB_ASSET_SCHEMA, ANIMATION_CLIP_SCHEMA, PARTICLE_ASSET_SCHEMA, SHADER_GRAPH_SCHEMA, POST_PROCESS_EFFECT_SCHEMA, POST_PROCESS_SCHEMA,
+  SHADER_NODE_TYPES, SHADER_VALUE_TYPES, SHADER_NODE_DEFINITIONS,
   clone, generateId, detectDialect, createProject, createDefaultPostProcess, migrateDocument, syncActiveMirror,
   validateDocument, assertValid, resolveScene, resolveEntity, entityName,
   applyOperations, applyJsonPatch, mergePatch, setPath, getPointer,

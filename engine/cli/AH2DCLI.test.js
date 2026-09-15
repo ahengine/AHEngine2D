@@ -142,6 +142,12 @@ try {
   assert.deepStrictEqual(capabilities.enums.particleCurveInterpolation, ['linear', 'step', 'cubic']);
   assert.deepStrictEqual(capabilities.enums.particleShape, ['point', 'circle', 'box']);
   assert.deepStrictEqual(capabilities.enums.particleBlend, ['normal', 'additive']);
+  assert.deepStrictEqual(capabilities.enums.shaderNodeType, [
+    'sceneTexture', 'output', 'tint', 'grayscale', 'brightnessContrast',
+    'saturation', 'invert', 'vignette', 'pixelate', 'chromaticAberration', 'mix'
+  ]);
+  assert.deepStrictEqual(capabilities.enums.shaderValueType, ['color']);
+  assert.deepStrictEqual(capabilities.enums.shaderDomain, ['postProcess']);
   assert.deepStrictEqual(capabilities.enums.bendDirection, [-1, 1]);
   assert.strictEqual(capabilities.animations.schema, 'animationClip');
   assert.strictEqual(capabilities.animations.stableReference, 'clipId');
@@ -151,6 +157,13 @@ try {
   assert.deepStrictEqual(capabilities.particles.runtimeOnly, [
     'ParticleEmitter.particles', 'ParticleEmitter.emissionAccumulator', 'ParticleEmitter.completed', 'ParticleEmitter.rngState'
   ]);
+  assert.strictEqual(capabilities.shaderGraphs.storage, 'shaderGraphs');
+  assert.strictEqual(capabilities.shaderGraphs.schema, 'shaderGraph');
+  assert.strictEqual(capabilities.shaderGraphs.postProcessEffect.stableReference, 'graphId');
+  assert.strictEqual(capabilities.shaderGraphs.postProcessEffect.schema, 'postProcessEffect');
+  assert.strictEqual(capabilities.shaderGraphs.postProcessEffect.stackSchema, 'postProcess');
+  assert.deepStrictEqual(capabilities.shaderGraphs.resourceAliases, ['shader', 'shaders', 'shaderGraph', 'shaderGraphs']);
+  assert.strictEqual(capabilities.shaderGraphs.definitions.mix.inputs.a, 'color');
   assert.deepStrictEqual(capabilities.skeletons.components, ['Skeleton', 'Bone', 'IK', 'Skin']);
   assert.strictEqual(capabilities.skeletons.referenceScope, 'same Scene or Prefab Asset');
   assert.deepStrictEqual(capabilities.skeletons.runtimeOnly, ['Skeleton.pose', 'Skeleton.boneMatrices', 'Skin.deformedVertices']);
@@ -160,7 +173,7 @@ try {
 
 
   const schemaIndex = success(['schema', 'list']).data;
-  assert.deepStrictEqual(schemaIndex.schemas, ['project', 'prefabAsset', 'animationClip', 'particleAsset', 'operation', 'batch']);
+  assert.deepStrictEqual(schemaIndex.schemas, ['project', 'prefabAsset', 'animationClip', 'particleAsset', 'shaderGraph', 'postProcessEffect', 'postProcess', 'operation', 'batch']);
   assert.ok(schemaIndex.components.includes('Collider'));
   assert.ok(schemaIndex.components.includes('Skeleton'));
   assert.ok(schemaIndex.components.includes('Bone'));
@@ -186,6 +199,9 @@ try {
   assert.strictEqual(projectSchema.properties.prefabs.items.$ref, '#/$defs/prefabAsset');
   assert.strictEqual(projectSchema.properties.animations.items.$ref, '#/$defs/animationClip');
   assert.strictEqual(projectSchema.properties.particles.items.$ref, '#/$defs/particleAsset');
+  assert.strictEqual(projectSchema.properties.shaderGraphs.items.$ref, '#/$defs/shaderGraph');
+  assert.strictEqual(projectSchema.properties.postProcess.$ref, '#/$defs/postProcess');
+  assert.deepStrictEqual(projectSchema.$defs.postProcess.required, ['effects']);
   const prefabAssetSchema = success(['schema', 'show', '--name', 'prefabAsset']).data.schema;
   assert.deepStrictEqual(prefabAssetSchema.required, ['id', 'rootEntityId', 'entities']);
   const animationClipSchema = success(['schema', 'show', '--name', 'animationClip']).data.schema;
@@ -193,6 +209,17 @@ try {
   const particleAssetSchema = success(['schema', 'show', '--name', 'particleAsset']).data.schema;
   assert.deepStrictEqual(particleAssetSchema.required, ['id', 'name', 'duration', 'loop', 'maxParticles', 'emission', 'lifetime', 'velocity', 'shape', 'appearance', 'curves']);
   assert.deepStrictEqual(particleAssetSchema.properties.curves.items.properties.property.enum, ['emission', 'scale', 'speed', 'opacity', 'hue']);
+  const shaderGraphSchema = success(['schema', 'show', '--name', 'shaderGraph']).data.schema;
+  assert.deepStrictEqual(shaderGraphSchema.required, ['id', 'name', 'version', 'domain', 'nodes', 'links', 'outputNodeId']);
+  assert.strictEqual(shaderGraphSchema.properties.domain.const, 'postProcess');
+  const postProcessEffectSchema = success(['schema', 'show', '--name', 'postProcessEffect']).data.schema;
+  assert.deepStrictEqual(postProcessEffectSchema.required, ['id', 'type']);
+  assert.strictEqual(postProcessEffectSchema.properties.graphId.pattern, '\\S');
+  assert.strictEqual(postProcessEffectSchema.properties.parameters.type, 'object');
+  assert.strictEqual(postProcessEffectSchema.additionalProperties, true);
+  const postProcessSchema = success(['schema', 'show', '--name', 'postProcess']).data.schema;
+  assert.deepStrictEqual(postProcessSchema.required, ['effects']);
+  assert.strictEqual(postProcessSchema.properties.effects.items.properties.id.pattern, '\\S');
   const particleEmitterSchema = success(['schema', 'show', '--component', 'ParticleEmitter']).data.component;
   assert.strictEqual(particleEmitterSchema.schemas.authoring.properties.assetId.type, 'string');
   assert.strictEqual(particleEmitterSchema.schemas.authoring.properties.speed.minimum, 0);
@@ -213,6 +240,7 @@ try {
   assert.strictEqual(project.engine.physicsImplementation, 'planck');
   assert.ok(project.postProcess.effects.some(effect => effect.type === 'bloom'));
   assert.ok(project.postProcess.effects.some(effect => effect.type === 'crt'));
+  assert.deepStrictEqual(project.shaderGraphs, []);
   const clip = {
     id: 'idle', name: 'Idle', fps: 12, frameCount: 2, loop: true, futureClip: { keep: true },
     tracks: [{ id: 'sprite', type: 'sprite', keyframes: [{ id: 'sprite-0', frame: 0, value: { frame: 0, futureValue: true } }] }]
@@ -284,6 +312,72 @@ try {
   assert.ok(rejectedDelete.payload.diagnostics.some(item => item.code === 'E_PARTICLE_ASSET_REFERENCE' && item.pointer === '/scenes/0/objects/0/components/ParticleEmitter/assetId'));
   assert.ok(rejectedDelete.payload.diagnostics.some(item => item.code === 'E_PARTICLE_ASSET_REFERENCE' && item.pointer === '/prefabs/0/entities/0/components/ParticleEmitter/assetId'));
   assert.strictEqual(fs.readFileSync(referencedParticleFile, 'utf8'), beforeRejectedDelete, 'referenced Particle deletion must roll back');
+
+  const shaderGraph = {
+    id: 'cinematic-grade', name: 'Cinematic Grade', version: 1, domain: 'postProcess', outputNodeId: 'output',
+    nodes: [
+      { id: 'scene', type: 'sceneTexture', position: { x: 80, y: 120 }, parameters: {}, futureNode: { keep: true } },
+      { id: 'tint', type: 'tint', position: { x: 300, y: 120 }, parameters: { color: '#aaccff', amount: 0.6, futureUniform: 2 } },
+      { id: 'output', type: 'output', position: { x: 520, y: 120 }, parameters: {} }
+    ],
+    links: [
+      { id: 'scene-tint', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'tint', port: 'color' }, futureLink: true },
+      { id: 'tint-output', from: { nodeId: 'tint', port: 'color' }, to: { nodeId: 'output', port: 'color' } }
+    ],
+    futureGraph: { keep: true }
+  };
+  const shaderDryRun = success(['resource', 'put', '--file', projectFile, 'shader', '--value', JSON.stringify(shaderGraph), '--dry-run', '--include-document']).data.document;
+  assert.deepStrictEqual(shaderDryRun.shaderGraphs[0], shaderGraph, 'generic Shader Graph resource commands must preserve extensions exactly');
+  assert.strictEqual(JSON.parse(fs.readFileSync(projectFile, 'utf8')).shaderGraphs.length, 0, 'Shader Graph dry-run must not mutate the Project');
+  success(['resource', 'put', '--file', projectFile, 'shaderGraph', '--value', JSON.stringify(shaderGraph), '--write']);
+  assert.deepStrictEqual(success(['resource', 'get', '--file', projectFile, 'shaders', 'cinematic-grade']).data.value, shaderGraph);
+  assert.strictEqual(success(['resource', 'list', '--file', projectFile, 'shaderGraphs']).data.items.length, 1);
+  assert.strictEqual(success(['inspect', '--file', projectFile]).data.resources.shaderGraphs, 1);
+
+  const beforeRejectedShader = fs.readFileSync(projectFile, 'utf8');
+  const invalidShader = JSON.parse(JSON.stringify(shaderGraph));
+  invalidShader.id = 'invalid-shader';
+  invalidShader.links.push({ id: 'duplicate-input', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'output', port: 'color' } });
+  const invalidShaderResult = failure(['resource', 'put', '--file', projectFile, 'shader', '--value', JSON.stringify(invalidShader), '--write'], 'E_PROJECT_INVALID');
+  assert.ok(invalidShaderResult.payload.diagnostics.some(item => item.code === 'E_SHADER_LINK_TARGET_DUPLICATE'));
+  assert.strictEqual(fs.readFileSync(projectFile, 'utf8'), beforeRejectedShader, 'rejected Shader Graph mutation must be failure-atomic');
+
+  project = JSON.parse(fs.readFileSync(projectFile, 'utf8'));
+  project.postProcess.effects.push({ id: 'cinematic-graph', type: 'shaderGraph', name: 'Cinematic Graph', enabled: true, graphId: 'cinematic-grade', overrides: { tint: { amount: 0.75 } }, futureEffect: true });
+  fs.writeFileSync(projectFile, JSON.stringify(project));
+  assert.deepStrictEqual(success(['validate', '--file', projectFile]).diagnostics, []);
+  const beforeReferencedShaderDelete = fs.readFileSync(projectFile, 'utf8');
+  const rejectedShaderDelete = failure(['resource', 'delete', '--file', projectFile, 'shader', 'cinematic-grade', '--write'], 'E_PROJECT_INVALID');
+  assert.ok(rejectedShaderDelete.payload.diagnostics.some(item => item.code === 'E_SHADER_EFFECT_GRAPH_REFERENCE' && item.pointer === '/postProcess/effects/6/graphId'));
+  assert.strictEqual(fs.readFileSync(projectFile, 'utf8'), beforeReferencedShaderDelete, 'referenced Shader Graph deletion must roll back');
+
+  const malformedPostProcessProject = createProject();
+  malformedPostProcessProject.postProcess = { enabled: 'yes', effects: [
+    { id: 'duplicate', type: 'bloom', enabled: 'yes', intensity: Number.NaN },
+    { id: ' duplicate ', type: 'vignette' },
+    { type: 'pixelate' },
+    { id: 'missing-type', type: ' ' }
+  ] };
+  const malformedPostProcessDiagnostics = validateDocument(malformedPostProcessProject);
+  assert.strictEqual(
+    malformedPostProcessDiagnostics.filter(item => item.pointer === '/postProcess/effects/1/id').length,
+    1,
+    'CLI validation must not duplicate shared Post Process identity diagnostics'
+  );
+  assert(malformedPostProcessDiagnostics.some(item => item.code === 'E_POST_PROCESS_EFFECT_ID_DUPLICATE'));
+  assert.strictEqual(
+    malformedPostProcessDiagnostics.filter(item => item.pointer === '/postProcess/effects/2/id').length,
+    1,
+    'missing Effect IDs must have one canonical diagnostic'
+  );
+  assert.strictEqual(
+    malformedPostProcessDiagnostics.filter(item => item.pointer === '/postProcess/effects/3/type').length,
+    1,
+    'missing Effect types must have one canonical diagnostic'
+  );
+  assert(malformedPostProcessDiagnostics.some(item => item.code === 'E_POST_PROCESS_ENABLED' && item.pointer === '/postProcess/enabled'));
+  assert(malformedPostProcessDiagnostics.some(item => item.code === 'E_POST_PROCESS_EFFECT_ENABLED' && item.pointer === '/postProcess/effects/0/enabled'));
+  assert(malformedPostProcessDiagnostics.some(item => item.code === 'E_POST_PROCESS_NUMBER' && item.pointer === '/postProcess/effects/0/intensity'));
 
   const invalidAnimationFile = path.join(tempRoot, 'invalid-animation.ah2d.json');
   const invalidAnimationProject = createProject();
@@ -1192,11 +1286,12 @@ try {
   success(['format', '--file', projectFile, '--check']);
 
   const legacyFile = path.join(tempRoot, 'legacy.json'), migratedFile = path.join(tempRoot, 'migrated.json');
-  fs.writeFileSync(legacyFile, JSON.stringify({ format: 'AH2D', version: 3, engine: '0.2.0', unknownPluginData: { keep: true }, entities: [{ id: 'ecs-player', components: { Name: { value: 'ECS Player' }, Transform: { x: 1, y: 2 }, Rigidbody: { type: 'dynamic', mass: 1, futureTuning: { keep: true } }, FutureGameplay: { nested: { keep: true } } } }] }));
+  fs.writeFileSync(legacyFile, JSON.stringify({ format: 'AH2D', version: 3, engine: '0.2.0', unknownPluginData: { keep: true }, shaderGraphs: [shaderGraph], entities: [{ id: 'ecs-player', components: { Name: { value: 'ECS Player' }, Transform: { x: 1, y: 2 }, Rigidbody: { type: 'dynamic', mass: 1, futureTuning: { keep: true } }, FutureGameplay: { nested: { keep: true } } } }] }));
   success(['migrate', '--file', legacyFile, '--out', migratedFile]);
   let migrated = JSON.parse(fs.readFileSync(migratedFile, 'utf8'));
   assert.strictEqual(migrated.version, 4);
   assert.strictEqual(migrated.unknownPluginData.keep, true, 'unknown fields must survive migration');
+  assert.deepStrictEqual(migrated.shaderGraphs[0], shaderGraph, 'migration must preserve Shader Graphs and unknown nested fields');
   assert.strictEqual(migrated.scenes[0].objects[0].components.Rigidbody.mass, 1);
   success(['component', 'patch', '--file', migratedFile, '--scene', 'main', 'ecs-player', 'Rigidbody', '{"mass":3}', '--write']);
   migrated = JSON.parse(fs.readFileSync(migratedFile, 'utf8'));

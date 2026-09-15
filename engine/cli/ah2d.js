@@ -5,7 +5,9 @@ const fs = require('fs');
 const path = require('path');
 const {
   PROTOCOL, PROJECT_VERSION, PHYSICS_BACKENDS, PHYSICS_IMPLEMENTATIONS, EXIT, DomainError, clone, detectDialect, createProject,
-  DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES, PREFAB_ASSET_SCHEMA, ANIMATION_CLIP_SCHEMA, PARTICLE_ASSET_SCHEMA, componentRegistry,
+  DATA_MODEL_DESCRIPTOR, COMPONENT_SCHEMA_PROFILES, PREFAB_ASSET_SCHEMA, ANIMATION_CLIP_SCHEMA, PARTICLE_ASSET_SCHEMA, SHADER_GRAPH_SCHEMA,
+  POST_PROCESS_EFFECT_SCHEMA, POST_PROCESS_SCHEMA,
+  SHADER_NODE_TYPES, SHADER_VALUE_TYPES, SHADER_NODE_DEFINITIONS, componentRegistry,
   migrateDocument, syncActiveMirror, validateDocument, assertValid, resolveScene,
   resolveEntity, entityName, applyOperations, applyJsonPatch, mergePatch, getPointer,
   listComponents, listEntities, getComponent, putComponent, resourceField, documentHash,
@@ -267,7 +269,7 @@ function inspectProject(context) {
       runtime: document.engine?.runtime || document.engine?.renderer || null,
       physics: { ...configuredPhysics(document), gravity: document.engine?.gravity || null, pixelsPerMeter: document.engine?.pixelsPerMeter || null },
       scenes: scenes.map(scene => ({ id: scene.id, name: scene.name, objectCount: scene.objects?.length || 0 })),
-      resources: { assets: document.assets?.length || 0, folders: document.folders?.length || 0, prefabs: Array.isArray(document.prefabs) ? document.prefabs.length : (document.prefab?.length || 0), animations: document.animations?.length || 0, particles: document.particles?.length || 0 }
+      resources: { assets: document.assets?.length || 0, folders: document.folders?.length || 0, prefabs: Array.isArray(document.prefabs) ? document.prefabs.length : (document.prefab?.length || 0), animations: document.animations?.length || 0, particles: document.particles?.length || 0, shaderGraphs: document.shaderGraphs?.length || 0 }
     }
   };
 }
@@ -336,6 +338,7 @@ function capabilities() {
       colliderShape: ['rectangle', 'box', 'circle'], animationTrackType: ['sprite', 'position', 'rotation', 'event', 'hitbox', 'bone', 'ik'],
       particleCurveProperty: ['emission', 'scale', 'speed', 'opacity', 'hue'],
       particleCurveInterpolation: ['linear', 'step', 'cubic'], particleShape: ['point', 'circle', 'box'], particleBlend: ['normal', 'additive'],
+      shaderNodeType: [...SHADER_NODE_TYPES], shaderValueType: [...SHADER_VALUE_TYPES], shaderDomain: ['postProcess'],
       bendDirection: [-1, 1]
     },
     options: {
@@ -382,6 +385,13 @@ function capabilities() {
       runtimeOnly: ['ParticleEmitter.particles', 'ParticleEmitter.emissionAccumulator', 'ParticleEmitter.completed', 'ParticleEmitter.rngState'],
       mutation: 'resource put|delete or project patch/apply'
     },
+    shaderGraphs: {
+      storage: 'shaderGraphs', schema: 'shaderGraph', version: 1, domain: 'postProcess',
+      nodeTypes: [...SHADER_NODE_TYPES], valueTypes: [...SHADER_VALUE_TYPES], definitions: clone(SHADER_NODE_DEFINITIONS),
+      postProcessEffect: { type: 'shaderGraph', stableReference: 'graphId', schema: 'postProcessEffect', stackSchema: 'postProcess' },
+      resourceAliases: ['shader', 'shaders', 'shaderGraph', 'shaderGraphs'],
+      mutation: 'resource put|delete or project patch/apply'
+    },
     skeletons: {
       components: ['Skeleton', 'Bone', 'IK', 'Skin'],
       referenceScope: 'same Scene or Prefab Asset',
@@ -404,10 +414,13 @@ function componentSchemaTypes() {
 }
 
 const schemas = {
-  project: { $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'AH2D Project', type: 'object', required: ['format', 'version', 'currentSceneId', 'scenes'], properties: { format: { const: 'AH2D' }, version: { type: 'integer', maximum: PROJECT_VERSION }, dataModel: { type: 'object', required: ['id', 'version', 'componentSchemaVersion'], properties: { id: { const: DATA_MODEL_DESCRIPTOR.id }, version: { const: DATA_MODEL_DESCRIPTOR.version }, componentSchemaVersion: { const: DATA_MODEL_DESCRIPTOR.componentSchemaVersion } }, additionalProperties: true }, currentSceneId: { type: 'string' }, scenes: { type: 'array', minItems: 1, items: { $ref: '#/$defs/scene' } }, prefabs: { type: 'array', items: { $ref: '#/$defs/prefabAsset' } }, animations: { type: 'array', items: { $ref: '#/$defs/animationClip' } }, particles: { type: 'array', items: { $ref: '#/$defs/particleAsset' } } }, $defs: { scene: { type: 'object', required: ['id', 'name', 'objects'], properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string' }, objects: { type: 'array', items: { $ref: '#/$defs/entity' } } }, additionalProperties: true }, entity: { type: 'object', required: ['id'], properties: { id: { type: 'string', minLength: 1 }, parentId: { type: ['string', 'null'], minLength: 1, description: 'Stable ID of the parent Entity in the same Scene; Transform is local to this parent.' }, x: { type: 'number', description: 'Local X position.' }, y: { type: 'number', description: 'Local Y position.' }, rot: { type: 'number', description: 'Local rotation in degrees.' }, rotation: { type: 'number', description: 'Local rotation in degrees.' }, sx: { type: 'number', description: 'Local X scale.' }, sy: { type: 'number', description: 'Local Y scale.' }, scaleX: { type: 'number', description: 'Local X scale.' }, scaleY: { type: 'number', description: 'Local Y scale.' }, components: { type: 'object' } }, additionalProperties: true }, prefabAsset: clone(PREFAB_ASSET_SCHEMA), animationClip: clone(ANIMATION_CLIP_SCHEMA), particleAsset: clone(PARTICLE_ASSET_SCHEMA) } },
+  project: { $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'AH2D Project', type: 'object', required: ['format', 'version', 'currentSceneId', 'scenes'], properties: { format: { const: 'AH2D' }, version: { type: 'integer', maximum: PROJECT_VERSION }, dataModel: { type: 'object', required: ['id', 'version', 'componentSchemaVersion'], properties: { id: { const: DATA_MODEL_DESCRIPTOR.id }, version: { const: DATA_MODEL_DESCRIPTOR.version }, componentSchemaVersion: { const: DATA_MODEL_DESCRIPTOR.componentSchemaVersion } }, additionalProperties: true }, currentSceneId: { type: 'string' }, scenes: { type: 'array', minItems: 1, items: { $ref: '#/$defs/scene' } }, prefabs: { type: 'array', items: { $ref: '#/$defs/prefabAsset' } }, animations: { type: 'array', items: { $ref: '#/$defs/animationClip' } }, particles: { type: 'array', items: { $ref: '#/$defs/particleAsset' } }, shaderGraphs: { type: 'array', items: { $ref: '#/$defs/shaderGraph' } }, postProcess: { $ref: '#/$defs/postProcess' } }, $defs: { scene: { type: 'object', required: ['id', 'name', 'objects'], properties: { id: { type: 'string', minLength: 1 }, name: { type: 'string' }, objects: { type: 'array', items: { $ref: '#/$defs/entity' } } }, additionalProperties: true }, entity: { type: 'object', required: ['id'], properties: { id: { type: 'string', minLength: 1 }, parentId: { type: ['string', 'null'], minLength: 1, description: 'Stable ID of the parent Entity in the same Scene; Transform is local to this parent.' }, x: { type: 'number', description: 'Local X position.' }, y: { type: 'number', description: 'Local Y position.' }, rot: { type: 'number', description: 'Local rotation in degrees.' }, rotation: { type: 'number', description: 'Local rotation in degrees.' }, sx: { type: 'number', description: 'Local X scale.' }, sy: { type: 'number', description: 'Local Y scale.' }, scaleX: { type: 'number', description: 'Local X scale.' }, scaleY: { type: 'number', description: 'Local Y scale.' }, components: { type: 'object' } }, additionalProperties: true }, prefabAsset: clone(PREFAB_ASSET_SCHEMA), animationClip: clone(ANIMATION_CLIP_SCHEMA), particleAsset: clone(PARTICLE_ASSET_SCHEMA), shaderGraph: clone(SHADER_GRAPH_SCHEMA), postProcessEffect: clone(POST_PROCESS_EFFECT_SCHEMA), postProcess: clone(POST_PROCESS_SCHEMA) } },
   prefabAsset: clone(PREFAB_ASSET_SCHEMA),
   animationClip: clone(ANIMATION_CLIP_SCHEMA),
   particleAsset: clone(PARTICLE_ASSET_SCHEMA),
+  shaderGraph: clone(SHADER_GRAPH_SCHEMA),
+  postProcessEffect: clone(POST_PROCESS_EFFECT_SCHEMA),
+  postProcess: clone(POST_PROCESS_SCHEMA),
   operation: { type: 'object', required: ['op'], properties: { op: { type: 'string', pattern: '^(scene|entity|component|resource|runtime|physics|project|prefab)\\.' } }, additionalProperties: true },
   batch: { type: 'array', minItems: 1, items: { $ref: '#/$defs/operation' }, $defs: { operation: { type: 'object', required: ['op'], properties: { op: { type: 'string' } } } } }
 };

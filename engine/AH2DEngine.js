@@ -2456,9 +2456,519 @@
 
   const createDefaultPostProcess = () => ({ enabled: true, effects: clone(DEFAULT_POST_PROCESS_EFFECTS) });
 
-  class PostProcessSystem {
+  const SHADER_GRAPH_VERSION = 1;
+  const SHADER_GRAPH_DOMAIN = 'postProcess';
+  const SHADER_NODE_DEFINITIONS = Object.freeze({
+    sceneTexture: Object.freeze({ inputs: [], outputs: ['color'], parameters: Object.freeze({}) }),
+    output: Object.freeze({ inputs: ['color'], outputs: [], parameters: Object.freeze({}) }),
+    tint: Object.freeze({ inputs: ['color'], outputs: ['color'], parameters: Object.freeze({ color: '#ffffff', amount: 1 }) }),
+    grayscale: Object.freeze({ inputs: ['color'], outputs: ['color'], parameters: Object.freeze({ amount: 1 }) }),
+    brightnessContrast: Object.freeze({ inputs: ['color'], outputs: ['color'], parameters: Object.freeze({ brightness: 0, contrast: 1 }) }),
+    saturation: Object.freeze({ inputs: ['color'], outputs: ['color'], parameters: Object.freeze({ amount: 1 }) }),
+    invert: Object.freeze({ inputs: ['color'], outputs: ['color'], parameters: Object.freeze({ amount: 1 }) }),
+    vignette: Object.freeze({ inputs: ['color'], outputs: ['color'], parameters: Object.freeze({ intensity: 0.35, softness: 0.5, radius: 0.75 }) }),
+    pixelate: Object.freeze({ inputs: ['color'], outputs: ['color'], parameters: Object.freeze({ size: 4 }) }),
+    chromaticAberration: Object.freeze({ inputs: ['color'], outputs: ['color'], parameters: Object.freeze({ amount: 2 }) }),
+    mix: Object.freeze({ inputs: ['a', 'b'], outputs: ['color'], parameters: Object.freeze({ factor: 0.5 }) })
+  });
+
+  const shaderDiagnostic = (code, message, details = {}) => ({ severity: 'error', code, message, ...details });
+  class ShaderGraphCompileError extends Error {
+    constructor(message, diagnostics = []) {
+      super(message);
+      this.name = 'ShaderGraphCompileError';
+      this.code = diagnostics[0]?.code || 'E_SHADER_GRAPH_COMPILE';
+      this.diagnostics = clone(diagnostics);
+    }
+  }
+
+  const shaderSafeName = value => String(value || 'node').replace(/[^a-zA-Z0-9_]/g, '_').replace(/^[0-9]/, '_$&');
+  const shaderColor = (value, fallback = [1, 1, 1, 1]) => {
+    if (Array.isArray(value)) {
+      const values = [0, 1, 2, 3].map(index => Number(value[index]));
+      return values.map((part, index) => Number.isFinite(part) ? clamp(part, 0, 1) : fallback[index]);
+    }
+    if (value && typeof value === 'object') {
+      return shaderColor([value.r, value.g, value.b, value.a == null ? 1 : value.a], fallback);
+    }
+    if (Number.isFinite(Number(value))) {
+      const numeric = Math.max(0, Math.min(0xffffff, Number(value) >>> 0));
+      return [((numeric >> 16) & 255) / 255, ((numeric >> 8) & 255) / 255, (numeric & 255) / 255, 1];
+    }
+    const source = String(value == null ? '' : value).trim();
+    const short = source.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])([0-9a-f])?$/i);
+    if (short) return [1, 2, 3, 4].map((index, offset) => offset === 3 && !short[index] ? 1 : parseInt(short[index] + short[index], 16) / 255);
+    const full = source.match(/^#([0-9a-f]{6})([0-9a-f]{2})?$/i);
+    if (full) {
+      const numeric = parseInt(full[1], 16);
+      return [((numeric >> 16) & 255) / 255, ((numeric >> 8) & 255) / 255, (numeric & 255) / 255, full[2] ? parseInt(full[2], 16) / 255 : 1];
+    }
+    return fallback.slice();
+  };
+  const shaderSmoothstep = (edge0, edge1, value) => {
+    const span = edge1 - edge0;
+    if (Math.abs(span) < 1e-12) return value < edge0 ? 0 : 1;
+    const amount = clamp((value - edge0) / span, 0, 1);
+    return amount * amount * (3 - 2 * amount);
+  };
+  const colorAdjustHueMatrix = degrees => {
+    const angle = finite(degrees, 0) * Math.PI / 180;
+    const cosine = Math.cos(angle), sine = Math.sin(angle);
+    const rows = [
+      [0.213 + cosine * 0.787 - sine * 0.213, 0.715 - cosine * 0.715 - sine * 0.715, 0.072 - cosine * 0.072 + sine * 0.928],
+      [0.213 - cosine * 0.213 + sine * 0.143, 0.715 + cosine * 0.285 + sine * 0.140, 0.072 - cosine * 0.072 - sine * 0.283],
+      [0.213 - cosine * 0.213 - sine * 0.787, 0.715 - cosine * 0.715 + sine * 0.715, 0.072 + cosine * 0.928 + sine * 0.072]
+    ];
+    // WebGL uploads matrices column-major, while the hue formula above is
+    // conventionally written as rows. Transpose the serialization explicitly.
+    return [rows[0][0], rows[1][0], rows[2][0], rows[0][1], rows[1][1], rows[2][1], rows[0][2], rows[1][2], rows[2][2]];
+  };
+
+  class ShaderGraphSystem {
     constructor(engine) {
       this.engine = engine;
+      this.graphs = [];
+      this.index = new Map();
+      this.diagnosticIndex = new Map();
+      this.compileSignatures = new Map();
+    }
+    load(source, options = {}) {
+      const input = Array.isArray(source) ? source : (Array.isArray(source?.shaderGraphs) ? source.shaderGraphs : []);
+      let graphs = input;
+      if (typeof DataModel.normalizeShaderGraphs === 'function') {
+        const normalized = DataModel.normalizeShaderGraphs(input);
+        graphs = Array.isArray(normalized) ? normalized : (Array.isArray(normalized?.shaderGraphs) ? normalized.shaderGraphs : input);
+      }
+      this.graphs = clone(graphs).filter(graph => graph && typeof graph === 'object');
+      this.index.clear();
+      this.diagnosticIndex.clear();
+      this.compileSignatures.clear();
+      this.graphs.forEach(graph => {
+        const id = String(graph.id || '').trim();
+        if (id && !this.index.has(id)) this.index.set(id, graph);
+      });
+      for (const graph of this.graphs) {
+        const result = this._compile(graph, {});
+        this.diagnosticIndex.set(String(graph.id || ''), clone(result.diagnostics));
+      }
+      if (options.emit !== false) this.engine?.events.emit('shadergraph:change', { shaderGraphs: this, engine: this.engine });
+      return this;
+    }
+    list() { return clone(this.graphs); }
+    get(id) { const graph = this.index.get(String(id || '')); return graph ? clone(graph) : null; }
+    toJSON() { return clone(this.graphs); }
+    _resolve(reference) {
+      if (reference && typeof reference === 'object') return reference;
+      return this.index.get(String(reference || '')) || null;
+    }
+    _override(parameters, nodeId, key) {
+      if (!parameters || typeof parameters !== 'object') return undefined;
+      if (parameters[nodeId] && typeof parameters[nodeId] === 'object' && Object.prototype.hasOwnProperty.call(parameters[nodeId], key)) {
+        return parameters[nodeId][key];
+      }
+      const path = `${nodeId}.${key}`;
+      return Object.prototype.hasOwnProperty.call(parameters, path) ? parameters[path] : undefined;
+    }
+    _nodeParameters(node, overrides = {}) {
+      const defaults = SHADER_NODE_DEFINITIONS[node.type]?.parameters || {};
+      const output = { ...defaults, ...(node.parameters && typeof node.parameters === 'object' ? clone(node.parameters) : {}) };
+      for (const key of Object.keys(output)) {
+        const value = this._override(overrides, node.id, key);
+        if (value !== undefined) output[key] = clone(value);
+      }
+      return output;
+    }
+    _analyse(graph) {
+      const diagnostics = [];
+      const graphId = String(graph?.id || '');
+      if (!graph || typeof graph !== 'object') {
+        diagnostics.push(shaderDiagnostic('E_SHADER_GRAPH_TYPE', 'Shader Graph must be an object', { graphId }));
+        return { graph: null, graphId, nodes: [], byId: new Map(), incoming: new Map(), order: [], output: null, diagnostics };
+      }
+      if (!graphId.trim()) diagnostics.push(shaderDiagnostic('E_SHADER_GRAPH_ID', 'Shader Graph id must be a non-empty string', { graphId }));
+      if (Number(graph.version) !== SHADER_GRAPH_VERSION) diagnostics.push(shaderDiagnostic('E_SHADER_GRAPH_VERSION', `Shader Graph version must be ${SHADER_GRAPH_VERSION}`, { graphId }));
+      if (String(graph.domain || '') !== SHADER_GRAPH_DOMAIN) diagnostics.push(shaderDiagnostic('E_SHADER_GRAPH_DOMAIN', `Shader Graph domain must be ${SHADER_GRAPH_DOMAIN}`, { graphId }));
+      const nodes = Array.isArray(graph.nodes) ? graph.nodes.filter(node => node && typeof node === 'object') : [];
+      const byId = new Map();
+      const outputNodes = [];
+      for (const node of nodes) {
+        const id = String(node.id || '').trim();
+        if (!id) { diagnostics.push(shaderDiagnostic('E_SHADER_NODE_ID', 'Shader node id must be a non-empty string', { graphId })); continue; }
+        if (byId.has(id)) { diagnostics.push(shaderDiagnostic('E_SHADER_NODE_DUPLICATE', `Duplicate Shader node id: ${id}`, { graphId, nodeId: id })); continue; }
+        byId.set(id, node);
+        if (!SHADER_NODE_DEFINITIONS[node.type]) diagnostics.push(shaderDiagnostic('E_SHADER_NODE_TYPE', `Unsupported Shader node type: ${node.type || '(missing)'}`, { graphId, nodeId: id }));
+        else {
+          const parameters = node.parameters;
+          if (!isPlainObject(parameters)) diagnostics.push(shaderDiagnostic('E_SHADER_NODE_PARAMETERS', `Shader node parameters must be an object: ${id}`, { graphId, nodeId: id }));
+          else {
+            const canonicalParameters = DataModel.SHADER_NODE_DEFINITIONS?.[node.type]?.parameters || {};
+            for (const [key, descriptor] of Object.entries(canonicalParameters)) {
+              if (!Object.prototype.hasOwnProperty.call(parameters, key)) continue;
+              const value = parameters[key];
+              if (descriptor.type === 'number' && (!Number.isFinite(value) || typeof value !== 'number')) {
+                diagnostics.push(shaderDiagnostic('E_SHADER_PARAMETER_TYPE', `${node.type}.${key} must be a finite number`, { graphId, nodeId: id, parameter: key }));
+              } else if (descriptor.type === 'string' && (typeof value !== 'string' || !value.trim())) {
+                diagnostics.push(shaderDiagnostic('E_SHADER_PARAMETER_TYPE', `${node.type}.${key} must be a non-empty string`, { graphId, nodeId: id, parameter: key }));
+              } else if (descriptor.type === 'string' && descriptor.pattern && !(new RegExp(descriptor.pattern)).test(value)) {
+                diagnostics.push(shaderDiagnostic('E_SHADER_PARAMETER_VALUE', `${node.type}.${key} must match ${descriptor.pattern}`, { graphId, nodeId: id, parameter: key, pattern: descriptor.pattern }));
+              } else if (descriptor.type === 'number' && descriptor.minimum != null && value < descriptor.minimum) {
+                diagnostics.push(shaderDiagnostic('E_SHADER_PARAMETER_RANGE', `${node.type}.${key} must be at least ${descriptor.minimum}`, { graphId, nodeId: id, parameter: key, minimum: descriptor.minimum }));
+              } else if (descriptor.type === 'number' && descriptor.maximum != null && value > descriptor.maximum) {
+                diagnostics.push(shaderDiagnostic('E_SHADER_PARAMETER_RANGE', `${node.type}.${key} must be at most ${descriptor.maximum}`, { graphId, nodeId: id, parameter: key, maximum: descriptor.maximum }));
+              }
+            }
+          }
+        }
+        if (node.type === 'output') outputNodes.push(id);
+      }
+      if (outputNodes.length !== 1) diagnostics.push(shaderDiagnostic('E_SHADER_OUTPUT_COUNT', 'Shader Graph must contain exactly one output node', { graphId, count: outputNodes.length }));
+      const incoming = new Map([...byId.keys()].map(id => [id, new Map()]));
+      const outgoing = new Map([...byId.keys()].map(id => [id, new Set()]));
+      const linkIds = new Set();
+      for (const link of Array.isArray(graph.links) ? graph.links : []) {
+        if (!link || typeof link !== 'object') continue;
+        const linkId = String(link.id || '');
+        if (!linkId.trim()) diagnostics.push(shaderDiagnostic('E_SHADER_LINK_ID', 'Shader link id must be a non-empty string', { graphId }));
+        else if (linkIds.has(linkId)) diagnostics.push(shaderDiagnostic('E_SHADER_LINK_ID_DUPLICATE', `Duplicate Shader link id: ${linkId}`, { graphId, linkId }));
+        else linkIds.add(linkId);
+        const fromId = String(link.from?.nodeId || ''), toId = String(link.to?.nodeId || '');
+        const fromNode = byId.get(fromId), toNode = byId.get(toId);
+        if (!fromNode || !toNode) {
+          diagnostics.push(shaderDiagnostic('E_SHADER_LINK_DANGLING', `Shader link ${linkId || '(unnamed)'} references a missing node`, { graphId, linkId, fromNodeId: fromId, toNodeId: toId }));
+          continue;
+        }
+        const fromPort = String(link.from?.port || ''), toPort = String(link.to?.port || '');
+        const fromDefinition = SHADER_NODE_DEFINITIONS[fromNode.type], toDefinition = SHADER_NODE_DEFINITIONS[toNode.type];
+        if (!fromDefinition?.outputs.includes(fromPort)) {
+          diagnostics.push(shaderDiagnostic('E_SHADER_LINK_FROM_PORT', `Node ${fromId} has no output port ${fromPort || '(missing)'}`, { graphId, linkId, nodeId: fromId, port: fromPort }));
+          continue;
+        }
+        if (!toDefinition?.inputs.includes(toPort)) {
+          diagnostics.push(shaderDiagnostic('E_SHADER_LINK_TO_PORT', `Node ${toId} has no input port ${toPort || '(missing)'}`, { graphId, linkId, nodeId: toId, port: toPort }));
+          continue;
+        }
+        if (incoming.get(toId).has(toPort)) {
+          diagnostics.push(shaderDiagnostic('E_SHADER_LINK_INPUT_OCCUPIED', `Input ${toId}.${toPort} has more than one link`, { graphId, linkId, nodeId: toId, port: toPort }));
+          continue;
+        }
+        incoming.get(toId).set(toPort, { link, fromId, fromPort });
+        if (!outgoing.get(fromId).has(toId)) {
+          outgoing.get(fromId).add(toId);
+        }
+      }
+      const outputId = String(graph.outputNodeId || '');
+      const output = byId.get(outputId) || null;
+      if (!output) diagnostics.push(shaderDiagnostic('E_SHADER_OUTPUT_MISSING', `Shader Graph outputNodeId does not resolve: ${outputId || '(missing)'}`, { graphId, nodeId: outputId }));
+      else if (output.type !== 'output') diagnostics.push(shaderDiagnostic('E_SHADER_OUTPUT_TYPE', 'outputNodeId must reference an output node', { graphId, nodeId: outputId }));
+
+      // Authoring graphs may contain disconnected work-in-progress nodes. Only the
+      // nodes that contribute to the declared Output belong to the executable plan.
+      // Link identity/endpoints/ports remain validated globally above so malformed
+      // serialized data cannot hide outside the active chain.
+      const reachable = new Set();
+      const pending = output ? [outputId] : [];
+      while (pending.length) {
+        const nodeId = pending.pop();
+        if (reachable.has(nodeId)) continue;
+        reachable.add(nodeId);
+        const sources = [...(incoming.get(nodeId)?.values() || [])]
+          .map(connection => connection.fromId)
+          .sort()
+          .reverse();
+        for (const sourceId of sources) if (!reachable.has(sourceId)) pending.push(sourceId);
+      }
+      for (const nodeId of reachable) {
+        const node = byId.get(nodeId);
+        const definition = SHADER_NODE_DEFINITIONS[node.type];
+        if (!definition) continue;
+        for (const port of definition.inputs) {
+          if (!incoming.get(nodeId)?.has(port)) diagnostics.push(shaderDiagnostic('E_SHADER_INPUT_REQUIRED', `Required input is not connected: ${nodeId}.${port}`, { graphId, nodeId, port }));
+        }
+      }
+      const reachableIndegree = new Map([...reachable].map(id => [id, 0]));
+      for (const fromId of reachable) {
+        for (const toId of outgoing.get(fromId) || []) {
+          if (reachable.has(toId)) reachableIndegree.set(toId, reachableIndegree.get(toId) + 1);
+        }
+      }
+      const ready = [...reachable].filter(id => reachableIndegree.get(id) === 0).sort();
+      const order = [];
+      while (ready.length) {
+        const id = ready.shift();
+        order.push(id);
+        for (const next of [...outgoing.get(id)].sort()) {
+          if (!reachable.has(next)) continue;
+          reachableIndegree.set(next, reachableIndegree.get(next) - 1);
+          if (reachableIndegree.get(next) === 0) { ready.push(next); ready.sort(); }
+        }
+      }
+      if (order.length !== reachable.size) diagnostics.push(shaderDiagnostic('E_SHADER_GRAPH_CYCLE', 'Shader Graph output chain must be acyclic', { graphId }));
+      return { graph, graphId, nodes, byId, incoming, order, output, reachable, diagnostics };
+    }
+    _compile(graph, options = {}) {
+      const plan = this._analyse(graph);
+      const diagnostics = plan.diagnostics.slice();
+      const parameterOverrides = options.parameters && typeof options.parameters === 'object' ? options.parameters : {};
+      for (const nodeId of plan.order) {
+        const node = plan.byId.get(nodeId);
+        const canonicalParameters = DataModel.SHADER_NODE_DEFINITIONS?.[node.type]?.parameters || {};
+        for (const [key, descriptor] of Object.entries(canonicalParameters)) {
+          const value = this._override(parameterOverrides, node.id, key);
+          if (value === undefined) continue;
+          if (descriptor.type === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) {
+            diagnostics.push(shaderDiagnostic('E_SHADER_PARAMETER_OVERRIDE_TYPE', `${node.type}.${key} override must be a finite number`, { graphId: plan.graphId, nodeId: node.id, parameter: key }));
+          } else if (descriptor.type === 'string' && (typeof value !== 'string' || !value.trim())) {
+            diagnostics.push(shaderDiagnostic('E_SHADER_PARAMETER_OVERRIDE_TYPE', `${node.type}.${key} override must be a non-empty string`, { graphId: plan.graphId, nodeId: node.id, parameter: key }));
+          } else if (descriptor.type === 'string' && descriptor.pattern && !(new RegExp(descriptor.pattern)).test(value)) {
+            diagnostics.push(shaderDiagnostic('E_SHADER_PARAMETER_OVERRIDE_VALUE', `${node.type}.${key} override must match ${descriptor.pattern}`, { graphId: plan.graphId, nodeId: node.id, parameter: key, pattern: descriptor.pattern }));
+          } else if (descriptor.type === 'number' && descriptor.minimum != null && value < descriptor.minimum) {
+            diagnostics.push(shaderDiagnostic('E_SHADER_PARAMETER_OVERRIDE_RANGE', `${node.type}.${key} override must be at least ${descriptor.minimum}`, { graphId: plan.graphId, nodeId: node.id, parameter: key, minimum: descriptor.minimum }));
+          } else if (descriptor.type === 'number' && descriptor.maximum != null && value > descriptor.maximum) {
+            diagnostics.push(shaderDiagnostic('E_SHADER_PARAMETER_OVERRIDE_RANGE', `${node.type}.${key} override must be at most ${descriptor.maximum}`, { graphId: plan.graphId, nodeId: node.id, parameter: key, maximum: descriptor.maximum }));
+          }
+        }
+      }
+      if (diagnostics.some(item => item.severity === 'error')) {
+        return { valid: false, graphId: plan.graphId, diagnostics, order: plan.order.slice(), fragmentSource: '', vertexSource: SHADER_FILTER_VERTEX, shaderKey: '', uniforms: {} };
+      }
+      const samplers = new Map();
+      const uniforms = {};
+      const functions = [];
+      const uniform = (node, index, key, kind = 'float') => {
+        const name = `u_${index}_${shaderSafeName(node.id)}_${shaderSafeName(key)}`;
+        const parameters = this._nodeParameters(node, parameterOverrides);
+        const color = kind === 'vec4';
+        uniforms[name] = {
+          value: color ? shaderColor(parameters[key]) : finite(parameters[key], SHADER_NODE_DEFINITIONS[node.type]?.parameters?.[key] ?? 0),
+          type: color ? 'vec4<f32>' : 'f32',
+          glslType: color ? 'vec4' : 'float',
+          nodeId: node.id,
+          parameter: key
+        };
+        return name;
+      };
+      const input = (nodeId, port = 'color', uv = 'uv') => {
+        const source = plan.incoming.get(nodeId)?.get(port);
+        const sampler = source && samplers.get(source.fromId);
+        return sampler ? `${sampler}(${uv})` : `texture(uTexture, clamp(${uv}, uInputClamp.xy, uInputClamp.zw))`;
+      };
+      plan.order.forEach((id, index) => {
+        const node = plan.byId.get(id), name = `sample_${index}_${shaderSafeName(id)}`;
+        samplers.set(id, name);
+        if (node.type === 'sceneTexture') functions.push(`vec4 ${name}(vec2 uv) {\n  vec4 color = texture(uTexture, clamp(uv, uInputClamp.xy, uInputClamp.zw));\n  if (color.a > 0.000001) color.rgb /= color.a;\n  else color.rgb = vec3(0.0);\n  return color;\n}`);
+        else if (node.type === 'output') functions.push(`vec4 ${name}(vec2 uv) {\n  vec4 color = ${input(id)};\n  return vec4(color.rgb * color.a, color.a);\n}`);
+        else if (node.type === 'tint') {
+          const color = uniform(node, index, 'color', 'vec4'), amount = uniform(node, index, 'amount');
+          functions.push(`vec4 ${name}(vec2 uv) {\n  vec4 color = ${input(id)};\n  return vec4(mix(color.rgb, color.rgb * ${color}.rgb, clamp(${amount}, 0.0, 1.0)), color.a * mix(1.0, ${color}.a, clamp(${amount}, 0.0, 1.0)));\n}`);
+        } else if (node.type === 'grayscale') {
+          const amount = uniform(node, index, 'amount');
+          functions.push(`vec4 ${name}(vec2 uv) {\n  vec4 color = ${input(id)};\n  float luma = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));\n  return vec4(mix(color.rgb, vec3(luma), clamp(${amount}, 0.0, 1.0)), color.a);\n}`);
+        } else if (node.type === 'brightnessContrast') {
+          const brightness = uniform(node, index, 'brightness'), contrast = uniform(node, index, 'contrast');
+          functions.push(`vec4 ${name}(vec2 uv) {\n  vec4 color = ${input(id)};\n  return vec4(clamp((color.rgb - 0.5) * ${contrast} + 0.5 + ${brightness}, 0.0, 1.0), color.a);\n}`);
+        } else if (node.type === 'saturation') {
+          const amount = uniform(node, index, 'amount');
+          functions.push(`vec4 ${name}(vec2 uv) {\n  vec4 color = ${input(id)};\n  float luma = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));\n  return vec4(clamp(vec3(luma) + (color.rgb - vec3(luma)) * ${amount}, 0.0, 1.0), color.a);\n}`);
+        } else if (node.type === 'invert') {
+          const amount = uniform(node, index, 'amount');
+          functions.push(`vec4 ${name}(vec2 uv) {\n  vec4 color = ${input(id)};\n  return vec4(mix(color.rgb, vec3(1.0) - color.rgb, clamp(${amount}, 0.0, 1.0)), color.a);\n}`);
+        } else if (node.type === 'vignette') {
+          const intensity = uniform(node, index, 'intensity'), softness = uniform(node, index, 'softness'), radius = uniform(node, index, 'radius');
+          functions.push(`vec4 ${name}(vec2 uv) {\n  vec4 color = ${input(id)};\n  float distanceFromCenter = length(uv - vec2(0.5)) * 1.41421356;\n  float mask = 1.0 - smoothstep(clamp(${radius} - ${softness}, 0.0, 1.0), max(${radius}, 0.0001), distanceFromCenter);\n  return vec4(color.rgb * mix(1.0, mask, clamp(${intensity}, 0.0, 1.0)), color.a);\n}`);
+        } else if (node.type === 'pixelate') {
+          const size = uniform(node, index, 'size');
+          functions.push(`vec4 ${name}(vec2 uv) {\n  vec2 pixelSize = max(vec2(${size}), vec2(1.0));\n  vec2 sampleUv = (floor(uv * uInputSize.xy / pixelSize) + 0.5) * pixelSize * uInputSize.zw;\n  return ${input(id, 'color', 'clamp(sampleUv, uInputClamp.xy, uInputClamp.zw)')};\n}`);
+        } else if (node.type === 'chromaticAberration') {
+          const amount = uniform(node, index, 'amount');
+          functions.push(`vec4 ${name}(vec2 uv) {\n  vec2 offset = vec2(${amount}, 0.0) * uInputSize.zw;\n  vec4 base = ${input(id)};\n  vec4 redSample = ${input(id, 'color', 'clamp(uv + offset, uInputClamp.xy, uInputClamp.zw)')};\n  vec4 blueSample = ${input(id, 'color', 'clamp(uv - offset, uInputClamp.xy, uInputClamp.zw)')};\n  return vec4(redSample.r, base.g, blueSample.b, base.a);\n}`);
+        } else if (node.type === 'mix') {
+          const factor = uniform(node, index, 'factor');
+          functions.push(`vec4 ${name}(vec2 uv) {\n  return mix(${input(id, 'a')}, ${input(id, 'b')}, clamp(${factor}, 0.0, 1.0));\n}`);
+        }
+      });
+      const uniformDeclarations = Object.entries(uniforms).map(([name, metadata]) => `uniform ${metadata.glslType} ${name};`);
+      const outputSampler = samplers.get(String(graph.outputNodeId));
+      const fragmentSource = [
+        'in vec2 vTextureCoord;', 'out vec4 finalColor;', 'uniform sampler2D uTexture;', 'uniform vec4 uInputSize;', 'uniform vec4 uInputClamp;',
+        ...uniformDeclarations, ...functions, `void main(void) {\n  finalColor = ${outputSampler}(vTextureCoord);\n}`
+      ].join('\n');
+      const structural = {
+        version: Number(graph.version), domain: graph.domain, outputNodeId: graph.outputNodeId,
+        nodes: [...plan.reachable].map(id => plan.byId.get(id)).map(node => ({ id: node.id, type: node.type })).sort((a, b) => String(a.id).localeCompare(String(b.id))),
+        links: (Array.isArray(graph.links) ? graph.links : [])
+          .filter(link => plan.reachable.has(String(link?.from?.nodeId || '')) && plan.reachable.has(String(link?.to?.nodeId || '')))
+          .map(link => ({ from: link?.from, to: link?.to })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+      };
+      return {
+        valid: true, graphId: plan.graphId, name: String(graph.name || plan.graphId), version: SHADER_GRAPH_VERSION,
+        domain: SHADER_GRAPH_DOMAIN, diagnostics, order: plan.order.slice(), fragmentSource, vertexSource: SHADER_FILTER_VERTEX,
+        shaderKey: JSON.stringify(structural), uniforms
+      };
+    }
+    compile(reference, options = {}) {
+      const graph = this._resolve(reference);
+      const result = graph ? this._compile(graph, options) : {
+        valid: false, graphId: String(reference || ''), diagnostics: [shaderDiagnostic('E_SHADER_GRAPH_MISSING', `Unknown Shader Graph: ${reference || '(missing)'}`)],
+        order: [], fragmentSource: '', vertexSource: SHADER_FILTER_VERTEX, shaderKey: '', uniforms: {}
+      };
+      this.diagnosticIndex.set(result.graphId, clone(result.diagnostics));
+      const compileSignature = JSON.stringify({ key: result.shaderKey, valid: result.valid, diagnostics: result.diagnostics, uniforms: result.uniforms });
+      if (options.emit !== false && this.compileSignatures.get(result.graphId) !== compileSignature) {
+        this.compileSignatures.set(result.graphId, compileSignature);
+        this.engine?.events.emit(result.valid ? 'shadergraph:compile' : 'shadergraph:error', { graphId: result.graphId, result, shaderGraphs: this, engine: this.engine });
+      }
+      if (!result.valid && options.throwOnError) throw new ShaderGraphCompileError(`Shader Graph could not compile: ${result.graphId}`, result.diagnostics);
+      return result;
+    }
+    getDiagnostics(reference) {
+      const graphId = typeof reference === 'object' ? String(reference?.id || '') : String(reference || '');
+      if (!this.diagnosticIndex.has(graphId)) this.compile(reference, { emit: false });
+      return clone(this.diagnosticIndex.get(graphId) || []);
+    }
+    setNodeParameters(graphId, nodeId, values = {}, options = {}) {
+      const graph = this.index.get(String(graphId || ''));
+      const node = graph?.nodes?.find(item => item?.id === nodeId);
+      if (!node || !values || typeof values !== 'object') return null;
+      const previous = clone(node.parameters);
+      node.parameters = options.replace === true ? clone(values) : { ...(node.parameters && typeof node.parameters === 'object' ? node.parameters : {}), ...clone(values) };
+      this.compileSignatures.delete(String(graphId));
+      const result = this.compile(graphId, { emit: false });
+      if (!result.valid && options.validate !== false) {
+        node.parameters = previous;
+        this.diagnosticIndex.set(String(graphId), clone(this._compile(graph, {}).diagnostics));
+        throw new ShaderGraphCompileError(`Shader node parameters are invalid: ${graphId}.${nodeId}`, result.diagnostics);
+      }
+      this.engine?.events.emit('shadergraph:change', { graphId, nodeId, node: clone(node), result, shaderGraphs: this, engine: this.engine });
+      return clone(node);
+    }
+    configure(graphId, nodeId, values, options) { return this.setNodeParameters(graphId, nodeId, values, options); }
+    evaluate(reference, input = {}, options = {}) {
+      const graph = this._resolve(reference);
+      const result = this.compile(reference, { ...options, emit: false });
+      const initialColor = shaderColor(Array.isArray(input) ? input : input.color, [0, 0, 0, 1]);
+      const initialUv = Array.isArray(input?.uv) ? [finite(input.uv[0], 0.5), finite(input.uv[1], 0.5)] : [0.5, 0.5];
+      if (!graph || !result.valid) return { valid: false, graphId: result.graphId, color: initialColor, uv: initialUv, diagnostics: clone(result.diagnostics) };
+      const plan = this._analyse(graph), evaluators = new Map();
+      const resolution = Array.isArray(input?.resolution) ? [Math.max(1, finite(input.resolution[0], 1)), Math.max(1, finite(input.resolution[1], 1))] : [1, 1];
+      const normalizedUv = uv => [clamp(finite(uv?.[0], 0.5), 0, 1), clamp(finite(uv?.[1], 0.5), 0, 1)];
+      const sample = uv => shaderColor(typeof input?.sample === 'function' ? input.sample(normalizedUv(uv)) : initialColor, initialColor);
+      const linked = (nodeId, port, uv) => {
+        const source = plan.incoming.get(nodeId)?.get(port);
+        const evaluator = source ? evaluators.get(source.fromId) : null;
+        const sampleUv = normalizedUv(uv);
+        const value = evaluator ? evaluator(sampleUv) : { color: sample(sampleUv), uv: sampleUv };
+        return { color: value.color.slice(), uv: value.uv.slice() };
+      };
+      const rgbMap = (color, fn) => [...fn(color.slice(0, 3)).map(value => clamp(value, 0, 1)), color[3]];
+      for (const id of plan.order) {
+        const node = plan.byId.get(id), parameters = this._nodeParameters(node, options.parameters || {});
+        evaluators.set(id, requestedUv => {
+          const uv = normalizedUv(requestedUv);
+          let value = ['sceneTexture', 'pixelate', 'mix'].includes(node.type) ? null : linked(id, 'color', uv);
+          if (node.type === 'sceneTexture') value = { color: sample(uv), uv };
+          else if (node.type === 'tint') {
+            const color = shaderColor(parameters.color), amount = clamp(finite(parameters.amount, 1), 0, 1), source = value.color;
+            value.color = [0, 1, 2].map(index => source[index] * (1 - amount + color[index] * amount)).concat(source[3] * (1 - amount + color[3] * amount));
+          } else if (node.type === 'grayscale') {
+            const amount = clamp(finite(parameters.amount, 1), 0, 1), source = value.color, luminance = source[0] * 0.2126 + source[1] * 0.7152 + source[2] * 0.0722;
+            value.color = [0, 1, 2].map(index => source[index] * (1 - amount) + luminance * amount).concat(source[3]);
+          } else if (node.type === 'brightnessContrast') {
+            const brightness = finite(parameters.brightness, 0), contrast = finite(parameters.contrast, 1);
+            value.color = rgbMap(value.color, rgb => rgb.map(channel => (channel - 0.5) * contrast + 0.5 + brightness));
+          } else if (node.type === 'saturation') {
+            const amount = Math.max(0, finite(parameters.amount, 1)), source = value.color, luminance = source[0] * 0.2126 + source[1] * 0.7152 + source[2] * 0.0722;
+            value.color = rgbMap(source, rgb => rgb.map(channel => luminance + (channel - luminance) * amount));
+          } else if (node.type === 'invert') {
+            const amount = clamp(finite(parameters.amount, 1), 0, 1);
+            value.color = rgbMap(value.color, rgb => rgb.map(channel => channel * (1 - amount) + (1 - channel) * amount));
+          } else if (node.type === 'vignette') {
+            const intensity = clamp(finite(parameters.intensity, 0.35), 0, 1), softness = clamp(finite(parameters.softness, 0.5), 0, 1), radius = clamp(finite(parameters.radius, 0.75), 0, 1);
+            const distance = Math.hypot(uv[0] - 0.5, uv[1] - 0.5) * Math.SQRT2;
+            const mask = 1 - shaderSmoothstep(Math.max(0, radius - softness), Math.max(0.0001, radius), distance);
+            value.color = rgbMap(value.color, rgb => rgb.map(channel => channel * (1 - intensity + mask * intensity)));
+          } else if (node.type === 'pixelate') {
+            const size = Math.max(1, finite(parameters.size, 4));
+            const sampleUv = [0, 1].map(index => clamp((Math.floor(uv[index] * resolution[index] / size) + 0.5) * size / resolution[index], 0, 1));
+            value = linked(id, 'color', sampleUv);
+          } else if (node.type === 'chromaticAberration') {
+            const amount = finite(parameters.amount, 2), offset = amount / resolution[0];
+            const red = linked(id, 'color', [uv[0] + offset, uv[1]]);
+            const blue = linked(id, 'color', [uv[0] - offset, uv[1]]);
+            value.color = [red.color[0], value.color[1], blue.color[2], value.color[3]];
+          } else if (node.type === 'mix') {
+            const a = linked(id, 'a', uv), b = linked(id, 'b', uv), factor = clamp(finite(parameters.factor, 0.5), 0, 1);
+            value = { color: a.color.map((channel, index) => channel * (1 - factor) + b.color[index] * factor), uv: a.uv.map((part, index) => part * (1 - factor) + b.uv[index] * factor) };
+          }
+          return value;
+        });
+      }
+      const output = evaluators.get(String(graph.outputNodeId))?.(initialUv) || { color: initialColor, uv: initialUv };
+      return { valid: true, graphId: result.graphId, color: output.color.slice(), uv: output.uv.slice(), diagnostics: [] };
+    }
+  }
+
+  const SHADER_FILTER_VERTEX = `in vec2 aPosition;
+out vec2 vTextureCoord;
+uniform vec4 uInputSize;
+uniform vec4 uOutputFrame;
+uniform vec4 uOutputTexture;
+vec4 filterVertexPosition(void) {
+  vec2 position = aPosition * uOutputFrame.zw + uOutputFrame.xy;
+  position.x = position.x * (2.0 / uOutputTexture.x) - 1.0;
+  position.y = position.y * (2.0 * uOutputTexture.z / uOutputTexture.y) - uOutputTexture.z;
+  return vec4(position, 0.0, 1.0);
+}
+vec2 filterTextureCoord(void) { return aPosition * (uOutputFrame.zw * uInputSize.zw); }
+void main(void) { gl_Position = filterVertexPosition(); vTextureCoord = filterTextureCoord(); }`;
+
+  const compileBuiltinPostProcess = effect => {
+    const type = String(effect?.type || '');
+    const source = key => effect?.parameters?.[key] ?? effect?.[key];
+    const uniformDefinitions = {};
+    const parameter = (key, fallback) => {
+      const name = `u_${shaderSafeName(key)}`;
+      uniformDefinitions[name] = { value: finite(source(key), fallback), type: 'f32', glslType: 'float', parameter: key };
+      return name;
+    };
+    const matrixParameter = (key, value) => {
+      const name = `u_${shaderSafeName(key)}`;
+      uniformDefinitions[name] = { value: value.slice(), type: 'mat3x3<f32>', glslType: 'mat3', parameter: key };
+      return name;
+    };
+    let body = '';
+    if (type === 'bloom') {
+      const intensity = parameter('intensity', 0.22), radius = parameter('radius', 8), threshold = parameter('threshold', 0.72);
+      // Blur and compositing stay in PMA. Bloom expands coverage with its glow,
+      // guaranteeing that a following straight-RGB pass can safely unpremultiply.
+      body = `vec2 d=vec2(${radius})*uInputSize.zw;vec4 c=texture(uTexture,vTextureCoord);vec4 b=(texture(uTexture,clamp(vTextureCoord+vec2(d.x,0.0),uInputClamp.xy,uInputClamp.zw))+texture(uTexture,clamp(vTextureCoord-vec2(d.x,0.0),uInputClamp.xy,uInputClamp.zw))+texture(uTexture,clamp(vTextureCoord+vec2(0.0,d.y),uInputClamp.xy,uInputClamp.zw))+texture(uTexture,clamp(vTextureCoord-vec2(0.0,d.y),uInputClamp.xy,uInputClamp.zw)))*0.25;vec3 bs=b.a>0.000001?b.rgb/b.a:vec3(0.0);float m=max(dot(bs,vec3(0.2126,0.7152,0.0722))-${threshold},0.0);float strength=clamp(m*max(${intensity},0.0),0.0,1.0);vec4 glow=b*strength;float outAlpha=c.a+glow.a*(1.0-c.a);vec3 outRgb=min(c.rgb+glow.rgb,vec3(outAlpha));finalColor=vec4(outRgb,outAlpha);`;
+    } else if (type === 'vignette') {
+      const intensity = parameter('intensity', 0.24), softness = parameter('softness', 0.68);
+      body = `vec4 c=texture(uTexture,vTextureCoord);float d=length(vTextureCoord-vec2(0.5))*1.41421356;float m=1.0-smoothstep(max(0.0,1.0-${softness}),1.0,d);finalColor=vec4(c.rgb*mix(1.0,m,clamp(${intensity},0.0,1.0)),c.a);`;
+    } else if (type === 'colorAdjust') {
+      const brightness = parameter('brightness', 1), contrast = parameter('contrast', 1), saturation = parameter('saturation', 1);
+      const hueMatrix = matrixParameter('hue', colorAdjustHueMatrix(source('hue')));
+      body = `vec4 c=texture(uTexture,vTextureCoord);vec3 rgb=c.a>0.000001?c.rgb/c.a:vec3(0.0);rgb=(rgb-0.5)*${contrast}+0.5;rgb*=max(${brightness},0.0);float l=dot(rgb,vec3(0.2126,0.7152,0.0722));rgb=vec3(l)+(rgb-vec3(l))*${saturation};rgb=clamp(${hueMatrix}*rgb,0.0,1.0);finalColor=vec4(rgb*c.a,c.a);`;
+    } else if (type === 'chromaticAberration') {
+      const amount = parameter('amount', 3), intensity = parameter('intensity', 0.32);
+      body = `vec2 d=vec2(${amount},0.0)*uInputSize.zw;vec4 c=texture(uTexture,vTextureCoord);vec4 rs=texture(uTexture,clamp(vTextureCoord+d,uInputClamp.xy,uInputClamp.zw));vec4 bs=texture(uTexture,clamp(vTextureCoord-d,uInputClamp.xy,uInputClamp.zw));vec3 rgb=c.a>0.000001?c.rgb/c.a:vec3(0.0);float r=rs.a>0.000001?rs.r/rs.a:0.0;float b=bs.a>0.000001?bs.b/bs.a:0.0;vec3 split=vec3(r,rgb.g,b);rgb=clamp(mix(rgb,split,clamp(${intensity},0.0,1.0)),0.0,1.0);finalColor=vec4(rgb*c.a,c.a);`;
+    } else if (type === 'pixelate') {
+      const size = parameter('size', 4);
+      body = `vec2 s=max(vec2(${size}),vec2(1.0));vec2 uv=(floor(vTextureCoord*uInputSize.xy/s)+0.5)*s*uInputSize.zw;finalColor=texture(uTexture,clamp(uv,uInputClamp.xy,uInputClamp.zw));`;
+    } else if (type === 'crt') {
+      const scanlines = parameter('scanlines', 0.18), noise = parameter('noise', 0.04), curvature = parameter('curvature', 0.12);
+      body = `vec2 p=vTextureCoord*2.0-1.0;p*=1.0+dot(p,p)*${curvature};vec2 uv=p*0.5+0.5;vec4 c=texture(uTexture,clamp(uv,uInputClamp.xy,uInputClamp.zw));vec3 rgb=c.a>0.000001?c.rgb/c.a:vec3(0.0);float line=sin(vTextureCoord.y*uInputSize.y*3.14159265)*${scanlines};float grain=fract(sin(dot(vTextureCoord*uInputSize.xy,vec2(12.9898,78.233)))*43758.5453)-0.5;rgb=clamp(rgb*(1.0-line)+vec3(grain*${noise}),0.0,1.0);float inside=step(0.0,uv.x)*step(uv.x,1.0)*step(0.0,uv.y)*step(uv.y,1.0);finalColor=vec4(rgb*c.a,c.a)*inside;`;
+    } else {
+      return { valid: false, kind: 'builtin', type, shaderKey: '', vertexSource: SHADER_FILTER_VERTEX, fragmentSource: '', uniforms: {}, diagnostics: [shaderDiagnostic('E_POST_PROCESS_UNSUPPORTED', `PixiJS Post Process does not support effect type: ${type || '(missing)'}`, { effectId: effect?.id, type })] };
+    }
+    const declarations = Object.entries(uniformDefinitions).map(([name, metadata]) => `uniform ${metadata.glslType} ${name};`).join('\n');
+    const fragmentSource = `in vec2 vTextureCoord;\nout vec4 finalColor;\nuniform sampler2D uTexture;\nuniform vec4 uInputSize;\nuniform vec4 uInputClamp;\n${declarations}\nvoid main(void){${body}}`;
+    return { valid: true, kind: 'builtin', type, shaderKey: `builtin:${type}`, vertexSource: SHADER_FILTER_VERTEX, fragmentSource, uniforms: uniformDefinitions, diagnostics: [] };
+  };
+
+  class PostProcessSystem {
+    constructor(engine, shaders = null) {
+      this.engine = engine;
+      this.shaders = shaders;
       this.enabled = true;
       this.effects = [];
       this.load();
@@ -2467,27 +2977,52 @@
       const config = source && typeof source === 'object' ? source : createDefaultPostProcess();
       this.enabled = config.enabled !== false;
       const effects = Array.isArray(config.effects) ? config.effects : DEFAULT_POST_PROCESS_EFFECTS;
-      this.effects = clone(effects).filter(effect => effect && typeof effect === 'object').map((effect, index) => ({
-        ...effect,
-        id: String(effect.id || effect.type || `effect-${index + 1}`),
-        type: String(effect.type || effect.id || 'custom'),
-        name: String(effect.name || effect.type || effect.id || `Effect ${index + 1}`),
-        enabled: effect.enabled !== false
-      }));
+      this.effects = clone(effects).filter(effect => effect && typeof effect === 'object').map((effect, index) => {
+        const normalized = {
+          ...effect,
+          id: String(effect.id || effect.type || `effect-${index + 1}`),
+          type: String(effect.type || effect.id || 'custom'),
+          name: String(effect.name || effect.type || effect.id || `Effect ${index + 1}`),
+          enabled: effect.enabled !== false
+        };
+        if (normalized.type === 'shaderGraph' && typeof normalized.graphId === 'string') normalized.graphId = normalized.graphId.trim();
+        return normalized;
+      });
       if (options.emit !== false) this.engine?.events.emit('postprocess:change', { postProcess: this, engine: this.engine });
       return this;
     }
-    get(idOrType) { return this.effects.find(effect => effect.id === idOrType || effect.type === idOrType) || null; }
+    get(idOrType) {
+      return this.effects.find(effect => effect.id === idOrType)
+        || this.effects.find(effect => effect.type === idOrType)
+        || null;
+    }
     configure(idOrType, values = {}) {
       const effect = this.get(idOrType);
       if (!effect || !values || typeof values !== 'object') return null;
       Object.assign(effect, clone(values));
+      if (effect.type === 'shaderGraph' && typeof effect.graphId === 'string') effect.graphId = effect.graphId.trim();
       this.engine?.events.emit('postprocess:change', { effect, postProcess: this, engine: this.engine });
       return effect;
     }
     reset() { return this.load(createDefaultPostProcess()); }
     toJSON() { return { enabled: this.enabled, effects: clone(this.effects) }; }
     get active() { return this.enabled ? this.effects.filter(effect => effect.enabled !== false) : []; }
+    resolve(effectOrId) {
+      const effect = typeof effectOrId === 'string' ? this.get(effectOrId) : effectOrId;
+      if (!effect) return null;
+      if (effect.type === 'shaderGraph') {
+        const shaders = this.shaders || this.engine?.shaders || this.engine?.shaderGraphs;
+        const graphId = String(effect.graphId || '').trim();
+        const compiled = shaders?.compile(graphId, { parameters: effect.parameters || {}, emit: false }) || {
+          valid: false, diagnostics: [shaderDiagnostic('E_SHADER_SYSTEM_MISSING', 'Shader Graph system is unavailable', { graphId })]
+        };
+        return { ...clone(effect), kind: 'shaderGraph', graphId, compiled, valid: compiled.valid === true, diagnostics: clone(compiled.diagnostics || []) };
+      }
+      const compiled = compileBuiltinPostProcess(effect);
+      return { ...clone(effect), kind: 'builtin', compiled, valid: compiled.valid === true, diagnostics: clone(compiled.diagnostics || []) };
+    }
+    get resolvedActive() { return this.active.map(effect => this.resolve(effect)).filter(Boolean); }
+    get compiledActive() { return this.resolvedActive; }
   }
 
   class TilemapSystem {
@@ -3924,7 +4459,10 @@
       this.particleObjects = new Map();
       this.nodes = new Map();
       this.textureLoads = new Map();
+      this.postProcessFilters = new Map();
+      this._postProcessFailures = new Map();
       this.app = null;
+      this.postProcessRoot = null;
       this.world = null;
       this.ready = Promise.resolve(this);
       this.error = null;
@@ -3990,11 +4528,16 @@
       this.app.stop?.();
       this.app.ticker?.stop?.();
       stage.sortableChildren = true;
+      this.postProcessRoot = new this.PIXI.Container();
+      this.postProcessRoot.label = this.postProcessRoot.label || 'AH2D Post Process Viewport';
+      this.postProcessRoot.name = this.postProcessRoot.name || 'AH2D Post Process Viewport';
+      this.postProcessRoot.sortableChildren = true;
+      stage.addChild(this.postProcessRoot);
       this.world = new this.PIXI.Container();
       this.world.label = this.world.label || 'AH2D World';
       this.world.name = this.world.name || 'AH2D World';
       this.world.sortableChildren = true;
-      stage.addChild(this.world);
+      this.postProcessRoot.addChild(this.world);
       this._appendCanvas();
       this._mounted = true;
       this.error = null;
@@ -4649,6 +5192,16 @@
     _syncViewport() {
       this._resizeRenderer();
       const size = this._rendererSize();
+      if (this.postProcessRoot) {
+        // Filters belong to an identity viewport root, never to the
+        // camera-transformed world. This keeps filter coordinates and bounds
+        // stable while the Camera moves, zooms, or the renderer resizes.
+        this._applyMatrix(this.postProcessRoot, IDENTITY_MATRIX);
+        let area = this.postProcessRoot.filterArea;
+        if (!area || typeof area !== 'object') area = this.PIXI?.Rectangle ? new this.PIXI.Rectangle() : {};
+        area.x = 0; area.y = 0; area.width = Math.max(0, size.width); area.height = Math.max(0, size.height);
+        this.postProcessRoot.filterArea = area;
+      }
       const cameraId = this._activeCamera();
       const camera = cameraId ? this.engine.ecs.get(cameraId, 'Camera') : null;
       const configured = this.options.viewport || {};
@@ -4693,6 +5246,138 @@
         else if (renderer) renderer.backgroundColor = color;
       }
     }
+    _postProcessError(effect, error, code = 'E_PIXI_POST_PROCESS') {
+      const effectId = String(effect?.id || effect?.graphId || effect?.type || 'post-process');
+      const signature = `${code}:${effectId}:${error?.message || error}`;
+      if (this._postProcessFailures.get(effectId) === signature) return;
+      this._postProcessFailures.set(effectId, signature);
+      const payload = { runtime: this, effect: clone(effect), error, code, fallback: 'effect-skipped', engine: this.engine };
+      try { this.engine?.events.emit('runtime:postProcessError', payload); } catch (_) { /* Rendering remains available without this Effect. */ }
+      try { this.engine?.events.emit('runtime:postProcessFallback', payload); } catch (_) { /* Rendering remains available without this Effect. */ }
+    }
+    _destroyPostProcessRecord(key) {
+      const record = this.postProcessFilters.get(key);
+      if (!record) return;
+      try { record.filter?.destroy?.(); } catch (_) { /* Best-effort across Pixi versions. */ }
+      this.postProcessFilters.delete(key);
+    }
+    _clearPostProcessFilters() {
+      for (const key of [...this.postProcessFilters.keys()]) this._destroyPostProcessRecord(key);
+      if (this.postProcessRoot) this.postProcessRoot.filters = [];
+    }
+    _createPostProcessFilter(effect, compiled) {
+      const Filter = this.PIXI?.Filter;
+      if (!Filter) throw new Error('PIXI.Filter is unavailable');
+      const uniformEntries = Object.fromEntries(Object.entries(compiled.uniforms || {}).map(([name, metadata]) => [name, {
+        value: Array.isArray(metadata.value) ? new Float32Array(metadata.value) : metadata.value,
+        type: metadata.type || 'f32'
+      }]));
+      const resources = { ah2dUniforms: uniformEntries };
+      const name = `AH2D ${effect.type === 'shaderGraph' ? effect.graphId : effect.type} ${effect.id}`;
+      const padding = effect.type === 'bloom'
+        ? Math.max(0, finite(effect.parameters?.radius ?? effect.radius, 0))
+        : 0;
+      let filter = null;
+      if (typeof Filter.from === 'function') {
+        filter = Filter.from({
+          gl: { vertex: compiled.vertexSource, fragment: compiled.fragmentSource, name },
+          resources,
+          padding
+        });
+      } else if (typeof Filter === 'function' && this.PIXI?.GlProgram?.from) {
+        filter = new Filter({
+          glProgram: this.PIXI.GlProgram.from({ vertex: compiled.vertexSource, fragment: compiled.fragmentSource, name }),
+          resources,
+          padding
+        });
+      } else if (typeof Filter === 'function') {
+        // Pixi v7-compatible hosts use the legacy constructor. Pixi v8 follows
+        // one of the branches above and never needs generated JavaScript.
+        filter = new Filter(compiled.vertexSource, compiled.fragmentSource,
+          Object.fromEntries(Object.entries(compiled.uniforms || {}).map(([key, metadata]) => [key, clone(metadata.value)])));
+      }
+      if (!filter) throw new Error('PIXI.Filter could not create a Post Process filter');
+      filter.label = filter.label || name;
+      filter.name = filter.name || name;
+      filter.enabled = true;
+      return filter;
+    }
+    _syncPostProcessUniforms(record, compiled) {
+      const group = record.filter?.resources?.ah2dUniforms;
+      const uniforms = group?.uniforms || group || record.filter?.uniforms || null;
+      if (!uniforms) return;
+      for (const [name, metadata] of Object.entries(compiled.uniforms || {})) {
+        const next = metadata.value;
+        const current = uniforms[name];
+        if (Array.isArray(next)) {
+          if (ArrayBuffer.isView(current) && typeof current.set === 'function') current.set(next);
+          else if (current && typeof current === 'object' && Object.prototype.hasOwnProperty.call(current, 'value')) {
+            if (ArrayBuffer.isView(current.value) && typeof current.value.set === 'function') current.value.set(next);
+            else current.value = new Float32Array(next);
+          } else uniforms[name] = new Float32Array(next);
+        } else if (current && typeof current === 'object' && Object.prototype.hasOwnProperty.call(current, 'value')) current.value = next;
+        else uniforms[name] = next;
+      }
+      group?.update?.();
+    }
+    _syncPostProcess() {
+      if (!this.postProcessRoot || !this.engine?.postProcess) return;
+      const descriptors = this.engine.postProcess.resolvedActive;
+      const rendererType = this.app?.renderer?.type;
+      const rendererName = String(rendererType ?? this.app?.renderer?.constructor?.name ?? '').toLowerCase();
+      const unsupportedRenderer = rendererType === 2 || rendererType === 4 || rendererName.includes('webgpu') || rendererName.includes('canvas');
+      if (unsupportedRenderer) {
+        const activeFailureIds = new Set();
+        for (const effect of descriptors) {
+          activeFailureIds.add(String(effect.id || effect.graphId || effect.type || 'effect'));
+          this._postProcessError(effect, new Error('AH2D generated Post Process filters currently require a PixiJS WebGL renderer'), 'E_PIXI_FILTER_RENDERER_UNSUPPORTED');
+        }
+        this._clearPostProcessFilters();
+        for (const effectId of [...this._postProcessFailures.keys()]) if (!activeFailureIds.has(effectId)) this._postProcessFailures.delete(effectId);
+        return;
+      }
+      const live = new Set();
+      const activeFailureIds = new Set();
+      const filters = [];
+      const duplicateCounts = new Map();
+      descriptors.forEach(effect => {
+        const stableId = String(effect.id || effect.graphId || effect.type || 'effect');
+        activeFailureIds.add(stableId);
+        const duplicate = duplicateCounts.get(stableId) || 0;
+        duplicateCounts.set(stableId, duplicate + 1);
+        const key = duplicate === 0 ? stableId : `${stableId}#${duplicate}`;
+        const compiled = effect.compiled;
+        if (!effect.valid || !compiled?.fragmentSource) {
+          const diagnostic = effect.diagnostics?.[0] || { code: 'E_SHADER_GRAPH_COMPILE', message: 'Post Process effect did not compile' };
+          this._postProcessError(effect, new ShaderGraphCompileError(diagnostic.message, effect.diagnostics || [diagnostic]), diagnostic.code);
+          return;
+        }
+        live.add(key);
+        let record = this.postProcessFilters.get(key);
+        if (record && record.shaderKey !== compiled.shaderKey) {
+          this._destroyPostProcessRecord(key);
+          record = null;
+        }
+        if (!record) {
+          try {
+            record = { filter: this._createPostProcessFilter(effect, compiled), shaderKey: compiled.shaderKey };
+            this.postProcessFilters.set(key, record);
+          } catch (error) {
+            this._postProcessError(effect, error, 'E_PIXI_FILTER_UNAVAILABLE');
+            return;
+          }
+        }
+        this._postProcessFailures.delete(String(effect.id || effect.graphId || effect.type || 'post-process'));
+        record.filter.padding = effect.type === 'bloom'
+          ? Math.max(0, finite(effect.parameters?.radius ?? effect.radius, 0))
+          : 0;
+        this._syncPostProcessUniforms(record, compiled);
+        filters.push(record.filter);
+      });
+      for (const key of [...this.postProcessFilters.keys()]) if (!live.has(key)) this._destroyPostProcessRecord(key);
+      for (const effectId of [...this._postProcessFailures.keys()]) if (!activeFailureIds.has(effectId)) this._postProcessFailures.delete(effectId);
+      this.postProcessRoot.filters = filters;
+    }
     _syncScene() {
       if (!this._mounted || !this.engine || !this.world) return false;
       this.engine.transform.update();
@@ -4706,6 +5391,7 @@
         this._syncParticles(id, record);
       }
       this._syncViewport();
+      this._syncPostProcess();
       return true;
     }
     _renderApplication() {
@@ -4742,20 +5428,28 @@
     }
     _disposeApplication() {
       this._mounted = false;
+      this._clearPostProcessFilters();
       for (const id of [...this.nodes.keys()]) this._removeNode(id);
       if (this.world) {
         this.world.parent?.removeChild?.(this.world);
         this.world.destroy?.({ children: true, texture: false, textureSource: false, baseTexture: false });
       }
+      if (this.postProcessRoot) {
+        this.postProcessRoot.parent?.removeChild?.(this.postProcessRoot);
+        this.postProcessRoot.destroy?.({ children: true, texture: false, textureSource: false, baseTexture: false });
+      }
       const app = this.app;
       const appendedCanvas = this._appendedCanvas;
       this.world = null;
+      this.postProcessRoot = null;
       this.app = null;
       this._appendedCanvas = null;
       this.objects.clear();
       this.particleObjects.clear();
       this.nodes.clear();
       this.textureLoads.clear();
+      this.postProcessFilters.clear();
+      this._postProcessFailures.clear();
       this._assetDocument = null;
       this._assetIndex = null;
       if (app && this._ownsApplication) this._destroyPixiApplication(app);
@@ -5862,7 +6556,9 @@
         fixedStep: options.particleStep
       });
       this.skeleton = new SkeletonSystem(this);
-      this.postProcess = new PostProcessSystem(this);
+      this.shaders = new ShaderGraphSystem(this);
+      this.shaderGraphs = this.shaders;
+      this.postProcess = new PostProcessSystem(this, this.shaders);
       this.tilemap = new TilemapSystem(this);
       this.prefabs = new PrefabSystem(this);
       const physicsOptions = { ...(options.physicsOptions || {}) };
@@ -6039,6 +6735,9 @@
       if (typeof DataModel.assertParticleDocument === 'function') {
         DataModel.assertParticleDocument(source, { entityCodec: this.entityCodec });
       }
+      if (typeof DataModel.assertShaderGraphDocument === 'function') {
+        DataModel.assertShaderGraphDocument(source);
+      }
       if (typeof DataModel.assertSkeletonDocument === 'function') {
         DataModel.assertSkeletonDocument(source, { entityCodec: this.entityCodec });
       }
@@ -6056,7 +6755,10 @@
         nextDocument.currentSceneId = activeScene.id;
         if (nextDocument.meta && typeof nextDocument.meta === 'object') nextDocument.meta.currentSceneId = activeScene.id;
       }
-      const stagedPostProcess = new PostProcessSystem(null);
+      const stagedShaders = new ShaderGraphSystem(null);
+      stagedShaders.load(source, { emit: false });
+      const nextShaderGraphs = stagedShaders.toJSON();
+      const stagedPostProcess = new PostProcessSystem(null, stagedShaders);
       stagedPostProcess.load(source.postProcess);
       const nextPostProcess = stagedPostProcess.toJSON();
       const stagedEvents = new EventBus();
@@ -6140,12 +6842,14 @@
       this.activeSceneId = activeScene?.id || null;
       this.animation.load(nextDocument);
       this.particles.load(nextDocument).initialize();
+      this.shaders.load(nextShaderGraphs, { emit: false });
       this.postProcess.load(nextPostProcess, { emit: false });
       const transformedEntities = this.transform.update(false, { emit: false });
       const emitCommitted = (type, payload) => {
         try { this.events.emit(type, payload); } catch (error) { retainFirstError(error); }
       };
       for (const [type, payload] of physicsEvents) emitCommitted(type, payload);
+      emitCommitted('shadergraph:change', { shaderGraphs: this.shaders, engine: this });
       emitCommitted('postprocess:change', { postProcess: this.postProcess, engine: this });
       this.skeleton.suspend();
       try {
@@ -6178,6 +6882,7 @@
           version: DataModel.DATA_MODEL_VERSION,
           componentSchemaVersion: DataModel.COMPONENT_SCHEMA_VERSION
         },
+        shaderGraphs: this.shaders.toJSON(),
         postProcess: this.postProcess.toJSON(),
         entities: [...this.ecs.entities].map(id => ({
           id,
@@ -6212,8 +6917,11 @@
     }
     captureSnapshot() {
       this.transform.update();
+      const authoringDocument = clone(this.document || this.export());
+      authoringDocument.shaderGraphs = this.shaders.toJSON();
+      authoringDocument.postProcess = this.postProcess.toJSON();
       return {
-        document: clone(this.document || this.export()),
+        document: authoringDocument,
         runtime: clone(this.export()),
         physics: clone(this.physics.snapshot()),
         physicsAdapter: this.physics.name,
@@ -6236,6 +6944,8 @@
         this.activeSceneId = snapshot.activeSceneId || authoringDocument.currentSceneId || null;
         this.animation.load(authoringDocument);
         this.particles.load(authoringDocument);
+        this.shaders.load(authoringDocument, { emit: false });
+        this.postProcess.load(authoringDocument.postProcess, { emit: false });
       }
       this.animation.time = finite(snapshot.animationTime, 0);
       this.camera.active = snapshot.activeCamera || null;
@@ -6332,16 +7042,18 @@
       const postProcess = editorState?.postProcess;
       const animations = Array.isArray(editorState?.animations) ? editorState.animations : undefined;
       const particles = Array.isArray(editorState?.particles) ? editorState.particles : undefined;
+      const shaderGraphs = Array.isArray(editorState?.shaderGraphs) ? editorState.shaderGraphs : undefined;
       const assets = Array.isArray(editorState?.assets) ? editorState.assets : undefined;
       const engine = isPlainObject(editorState?.engine) ? editorState.engine : undefined;
-      const signature = JSON.stringify({ scene, postProcess, animations, particles, assets, engine });
+      const signature = JSON.stringify({ scene, postProcess, animations, particles, shaderGraphs, assets, engine });
       if (signature === this.lastSignature) return false;
       this.lastSignature = signature;
       this.engine.load({
         scene,
-        postProcess,
+        ...(postProcess !== undefined ? { postProcess } : {}),
         ...(animations ? { animations } : {}),
         ...(particles ? { particles } : {}),
+        ...(shaderGraphs ? { shaderGraphs } : {}),
         ...(assets ? { assets } : {}),
         ...(engine ? { engine } : {})
       });
@@ -6362,7 +7074,9 @@
     normalizeParticleAsset: DataModel.normalizeParticleAsset,
     normalizeParticleAssets: DataModel.normalizeParticleAssets,
     sampleParticleCurve: DataModel.sampleParticleCurve,
-    LightingSystem, ShadowSystem, AnimationSystem, ParticleSystem, SkeletonSystem, PostProcessSystem, TilemapSystem,
+    LightingSystem, ShadowSystem, AnimationSystem, ParticleSystem, SkeletonSystem, ShaderGraphSystem, PostProcessSystem, TilemapSystem,
+    ShaderGraphCompileError, SHADER_GRAPH_VERSION, SHADER_GRAPH_DOMAIN,
+    SHADER_NODE_DEFINITIONS: DataModel.SHADER_NODE_DEFINITIONS || SHADER_NODE_DEFINITIONS,
     DEFAULT_POST_PROCESS_EFFECTS, createDefaultPostProcess, PrefabSystem,
     BODY_TYPES, COLLIDER_SHAPES, PhysicsAdapter, Box2DPhysicsAdapter,
     RuntimeAdapter, PixiRuntimeAdapter, PhaserRuntimeAdapter, CustomRuntimeAdapter,

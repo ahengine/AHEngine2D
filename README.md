@@ -1,6 +1,6 @@
 # AH2D Editor & Engine
 
-AH2D یک Editor دوبعدی local-first مبتنی بر Next.js و یک هستهٔ Runtime مستقل از Framework است. پروژه مستقیماً از پوشهٔ انتخاب‌شده روی سیستم کاربر باز می‌شود و همان‌جا ذخیره می‌ماند. صحنه، hierarchy، componentها، فیزیک، prefab، animation، particle و Post Process در قالب JSON نگه‌داری می‌شوند و همان داده می‌تواند توسط Canvas سفارشی، PixiJS، PhaserJS یا یک Runtime اختصاصی مصرف شود.
+AH2D یک Editor دوبعدی local-first مبتنی بر Next.js و یک هستهٔ Runtime مستقل از Framework است. پروژه مستقیماً از پوشهٔ انتخاب‌شده روی سیستم کاربر باز می‌شود و همان‌جا ذخیره می‌ماند. صحنه، hierarchy، componentها، فیزیک، prefab، animation، particle، Shader Graph و Post Process در قالب JSON نگه‌داری می‌شوند و همان داده می‌تواند توسط Canvas سفارشی، PixiJS، PhaserJS یا یک Runtime اختصاصی مصرف شود.
 
 نسخهٔ فعلی Engine و CLI برابر `0.3.0` و نسخهٔ Universal Project برابر `4` است.
 
@@ -16,7 +16,7 @@ AH2D Editor (Next.js)
     ├── Scene Graph + ECS
     ├── Transform / Camera / Lighting / Shadow
     ├── Animation / Particle / Skeleton / IK / Skinning
-    ├── Post Process / Tilemap
+    ├── Shader Graph / Post Process / Tilemap
     ├── Native Box2D-compatible Physics (Planck) + explicit built-in fallback
     ├── PixiJS / PhaserJS / Custom adapters
     └── Agent-friendly CLI
@@ -38,6 +38,7 @@ AH2D Editor (Next.js)
 - `docs/ANIMATIONS.md`: قرارداد Clip/Track/Keyframe، Timeline، binding و Runtime Animation.
 - `docs/SKELETONS.md`: قرارداد Skeleton/Bone/IK/Skin، Bind Pose، Timeline، Prefab و Rendererها.
 - `docs/PARTICLES.md`: قرارداد Particle Asset/Emitter، Curveها، شبیه‌سازی و rendererها.
+- `docs/SHADERS.md`: قرارداد Node-Based Shader Graph، Post Process stack، کامپایلر و rendererها.
 - `docs/DEPLOYMENT.md`: اجرای Production و محدودیت storage محلی.
 - `docs/PHYSICS.md`: قرارداد کامل Box2D، واحدها، fixtureها، contactها، Play Mode و API بومی.
 - `Agent.md`: راهنمای توسعهٔ بازی توسط Agent.
@@ -136,8 +137,8 @@ Editor تعبیه‌شده عمومی است، اما در iframe با origin ا
 
 | خروجی | نسخه | محتوا | کاربرد |
 | --- | ---: | --- | --- |
-| Editor Universal JSON | 4 | تمام Sceneها، assets، Prefab Asset/Instance/Override، animationها، particleها، Post Process و تنظیمات Engine | منبع اصلی پروژه، Save/Load و ادامهٔ ویرایش |
-| `Engine.export()` یا `ah2d ecs export` | 3 | فقط Entity/Componentهای Scene فعال در Runtime | Debug، تست یا انتقال snapshot فعال |
+| Editor Universal JSON | 4 | تمام Sceneها، assets، Prefab Asset/Instance/Override، animationها، particleها، Shader Graphها، Post Process و تنظیمات Engine | منبع اصلی پروژه، Save/Load و ادامهٔ ویرایش |
+| `Engine.export()` یا `ah2d ecs export` | 3 | Entity/Componentهای Scene فعال و تنظیمات Runtime لازم مانند Post Process/Shader Graph؛ نه کل سند authoring | Debug، تست یا انتقال snapshot فعال |
 | Animation asset | 1 | Clip کامل شامل FPS، frame count، Trackها، Keyframeها، easing، sprite/event/hitbox و Bone/IK | Import/اشتراک Asset و مصرف توسط AnimationSystem/SkeletonSystem |
 | Particle asset | 1 | emission، lifetime، velocity، shape، appearance و Curveهای keyframe‌دار | مصرف توسط ParticleSystem و renderer بازی |
 
@@ -226,6 +227,7 @@ Registry پیش‌فرض این componentها را می‌شناسد: `Name`، `
     }
   ],
   "scene": [],
+  "shaderGraphs": [],
   "postProcess": {
     "enabled": true,
     "effects": [
@@ -248,27 +250,32 @@ Registry پیش‌فرض این componentها را می‌شناسد: `Name`، `
 
 `scenes` نمایش اصلی Multi-Scene است. کلید `scene` فقط آینهٔ سازگاری از `objects` صحنهٔ فعال است. CLI بعد از هر تغییر این آینه را هماهنگ می‌کند.
 
-### Post Process قابل‌ویرایش هر پروژه
+### Shader Graph و Post Process قابل‌ویرایش هر پروژه
 
-هر پروژه یک stack مستقل در `postProcess` دارد. پروژهٔ تازه شش effect پیش‌فرض `Bloom`، `Vignette`، `Color Adjust`، `Chromatic Aberration`، `Pixelate` و `CRT` دریافت می‌کند؛ فعال‌بودن و مقدارهای هر effect در همان Universal JSON ذخیره می‌شود. دکمهٔ Post Process بالای Scene، master toggle، sliderها و `Reset Defaults` را در اختیار کاربر قرار می‌دهد و Preview در لحظه به‌روز می‌شود.
+هر پروژه یک کتابخانهٔ مستقل `shaderGraphs[]` و یک stack مستقل در `postProcess` دارد. پروژهٔ تازه شش effect پیش‌فرض `Bloom`، `Vignette`، `Color Adjust`، `Chromatic Aberration`، `Pixelate` و `CRT` دریافت می‌کند؛ Workspace بخش **Shaders** نیز ساخت، اتصال، Multi-select، Pan/Zoom/Fit، Preview زنده، و افزودن گراف به stack را انجام می‌دهد. Effect نوع `shaderGraph` فقط با `graphId` به گراف وصل می‌شود، بنابراین ادیت گراف همهٔ Instanceهای آن Effect را به‌روز می‌کند.
 
 API Runtime:
 
 ```js
-engine.postProcess.load(project.postProcess);
+engine.load(project);
+const compiled = engine.shaders.compile('cinematic-grade');
 engine.postProcess.configure('bloom', { enabled: true, intensity: 0.5 });
 engine.postProcess.configure('colorAdjust', { saturation: 1.2, hue: 12 });
 
 console.log(engine.postProcess.get('vignette'));
 console.log(engine.postProcess.active);
+console.log(engine.postProcess.resolvedActive);
 project.postProcess = engine.postProcess.toJSON();
+project.shaderGraphs = engine.shaders.toJSON();
 
 engine.events.on('postprocess:change', ({ postProcess }) => {
-  renderer.applyPostProcess(postProcess.active);
+  renderer.applyPostProcess(postProcess.resolvedActive);
 });
 ```
 
-`engine.postProcess.reset()` stack اولیه را برمی‌گرداند. Editor فیلترهای Canvas خود را اعمال می‌کند؛ در Runtimeهای PixiJS، PhaserJS و Custom، host باید effectهای موجود در `engine.postProcess.active` را به filter/shader همان renderer نگاشت کند.
+`engine.postProcess.reset()` stack اولیه را برمی‌گرداند. Editor یک CPU Preview مستقل از Framework دارد و PixiJS adapter روی renderer وب‌جی‌ال، Effectهای built-in و Shader Graph کامپایل‌شده را به Filterهای native و reusable تبدیل می‌کند؛ WebGPU/Canvas فعلاً Effect را با fallback ایزوله رد می‌کنند و Scene را در حال اجرا نگه می‌دارند. PhaserJS و Custom باید descriptorهای `engine.postProcess.resolvedActive` را به shader/filter خودشان نگاشت کنند.
+
+قرارداد Graph/Node/Link، Nodeهای داخلی، API کامپایلر، PixiJS integration و workflow امن CLI در [`docs/SHADERS.md`](./docs/SHADERS.md) مستند شده است.
 
 CLI هنگام `init` همین defaultها را اضافه می‌کند، `migrate` پروژهٔ فاقد `postProcess` را تکمیل می‌کند و `validate` ساختار effectها را بررسی می‌کند. برای ویرایش امن می‌توان از JSON Patch استفاده کرد:
 
@@ -1011,7 +1018,7 @@ class GameScene extends Phaser.Scene {
 }
 ```
 
-PixiJS adapter اکنون Display Tree، Sprite/Graphics/Mesh، Transform، visibility، Camera، Skin deformation، Particleهای texture/graphics، asset loading پایه و برش native مقدار `Renderable.sourceRect` را مستقیماً از ECS ایجاد و Render می‌کند. مقدار `Renderable.frame` به‌تنهایی ابعاد و مختصات برش را تعیین نمی‌کند و به metadata مربوط به Asset یا host نیاز دارد. PhaserJS همچنان یک adapter انتخاب/سازگاری است و ساخت Game Objectها، همگام‌سازی ECS و `Skin.deformedVertices`، `ParticleEmitter.particles` و Camera/renderer mapping آن باید توسط پروژهٔ بازی انجام شود؛ مثال `createPhaserObjectsFromECS` بالا host-owned است. Light/Shadow و Post Process filters نیز در PhaserJS/Custom به نگاشت اختصاصی host نیاز دارند.
+PixiJS adapter اکنون Display Tree، Sprite/Graphics/Mesh، Transform، visibility، Camera، Skin deformation، Particleهای texture/graphics، asset loading پایه، برش native مقدار `Renderable.sourceRect` و—روی WebGL—Filterهای Post Process/Shader Graph را مستقیماً ایجاد و Render می‌کند. مقدار `Renderable.frame` به‌تنهایی ابعاد و مختصات برش را تعیین نمی‌کند و به metadata مربوط به Asset یا host نیاز دارد. PhaserJS همچنان یک adapter انتخاب/سازگاری است و ساخت Game Objectها، همگام‌سازی ECS و `Skin.deformedVertices`، `ParticleEmitter.particles` و Camera/renderer mapping آن باید توسط پروژهٔ بازی انجام شود؛ مثال `createPhaserObjectsFromECS` بالا host-owned است. Light/Shadow و Post Process در PhaserJS/Custom به نگاشت اختصاصی host نیاز دارند.
 
 ### اجرای Headless در Node.js
 
@@ -1115,6 +1122,15 @@ engine.postProcess.configure(idOrType, values)
 engine.postProcess.reset()
 engine.postProcess.toJSON()
 engine.postProcess.active
+engine.postProcess.resolvedActive
+engine.shaders.load(projectOrGraphs)
+engine.shaders.list()
+engine.shaders.get(graphId)
+engine.shaders.compile(idOrGraph)
+engine.shaders.evaluate(idOrGraph, input)
+engine.shaders.setNodeParameters(graphId, nodeId, values)
+engine.shaders.getDiagnostics(idOrGraph)
+engine.shaders.toJSON()
 
 engine.events.on(type, callback) // تابع unsubscribe برمی‌گرداند
 engine.events.emit(type, payload)
@@ -1128,7 +1144,7 @@ engine.events.emit(type, payload)
 
 - نام پروژه در خروجی مستقیم Editor فعلاً `Demo Project` است؛ CLI می‌تواند `meta.name` را بدون از دست رفتن داده تغییر دهد.
 - Loader فعلی Editor فیلدهای ناشناختهٔ سند، Scene، `meta`، `engine`، Asset و Entity را هنگام Load/Save حفظ می‌کند؛ بخش‌هایی که Editor واقعاً مدل می‌کند با state فعال به‌روزرسانی می‌شوند. برای mutation اتمیک و قابل‌شرط‌گذاری با hash همچنان از CLI استفاده کنید.
-- Project Load تمام `animations[]` و `particles[]` را به state ادیتور برمی‌گرداند. Particle Editor روی Asset انتخاب‌شده کار می‌کند، Assetها با ID پایدار merge می‌شوند و Curve/Keyframeها در Save بعدی حفظ می‌شوند.
+- Project Load تمام `animations[]`، `particles[]` و `shaderGraphs[]` را به state ادیتور برمی‌گرداند. Particle Editor روی Asset انتخاب‌شده و Shader Editor روی Graph انتخاب‌شده کار می‌کند؛ Asset/Graphها با ID پایدار merge می‌شوند و Curve/Node/Linkها در Save بعدی حفظ می‌شوند.
 - Skeleton/Bone/IK/Skin در همان Entity/Componentهای Scene یا Prefab ذخیره می‌شوند؛ Timeline Trackهای Bone و IK را نگه می‌دارد و داده‌های pose/deformation مشتق‌شده وارد Authoring نمی‌شوند.
 - standalone animation/particle JSON ورودی مستقیم Project Load نیستند.
 - layout پنل‌ها، selection، undo history، grid/snap، commentهای محلی داخل canvas و وضعیت دوربین Prefab در Universal JSON ذخیره نمی‌شوند. Commentهای مشارکتی Studio جداگانه در Project API ذخیره می‌شوند.

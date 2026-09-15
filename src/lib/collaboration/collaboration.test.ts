@@ -176,6 +176,7 @@ async function main(): Promise<void> {
     assert.deepEqual(defaultDocument.prefabs, []);
     assert.deepEqual(defaultDocument.animations, []);
     assert.deepEqual(defaultDocument.particles, []);
+    assert.deepEqual(defaultDocument.shaderGraphs, []);
     assert.equal((defaultDocument.meta as { name?: string }).name, "Default Contract");
     assert.equal((defaultDocument.engine as { runtime?: string }).runtime, "custom");
     assert.equal(defaultDocument.currentSceneId, "main");
@@ -428,6 +429,8 @@ async function main(): Promise<void> {
     assert.match(frameSource, /AH2D_EDITOR_COMMAND/);
     assert.match(frameSource, /merged\.animations\s*=\s*mergeAnimations\(baseProject\.animations, editorDocument\.animations\)/);
     assert.match(frameSource, /merged\.particles\s*=\s*mergeParticles\(baseProject\.particles, editorDocument\.particles\)/);
+    assert.match(frameSource, /merged\.shaderGraphs\s*=\s*mergeShaderGraphs\(baseProject\.shaderGraphs, editorDocument\.shaderGraphs\)/);
+    assert.match(frameSource, /merged\.postProcess\s*=\s*mergePostProcess\(baseProject\.postProcess, editorDocument\.postProcess\)/);
     assert.doesNotMatch(frameSource, /!Array\.isArray\(baseProject\.animations\)/);
 
     const bridgeSource = frameSource.match(
@@ -449,6 +452,10 @@ async function main(): Promise<void> {
       loadProject(project: Record<string, unknown>) {
         const sourceClip = (project.animations as Array<Record<string, unknown>>)[0];
         const sourceParticle = (project.particles as Array<Record<string, unknown>>)[0];
+        const sourceShaderGraph = (project.shaderGraphs as Array<Record<string, unknown>>)[0];
+        const sourceShaderNodes = sourceShaderGraph.nodes as Array<Record<string, unknown>>;
+        const sourceShaderLinks = sourceShaderGraph.links as Array<Record<string, unknown>>;
+        const sourcePostEffect = ((project.postProcess as Record<string, unknown>).effects as Array<Record<string, unknown>>)[0];
         editorSnapshot = {
           ...structuredClone(project),
           animations: [
@@ -506,6 +513,54 @@ async function main(): Promise<void> {
               curves: [],
             },
           ],
+          shaderGraphs: [
+            {
+              id: sourceShaderGraph.id,
+              name: sourceShaderGraph.name,
+              version: sourceShaderGraph.version,
+              domain: sourceShaderGraph.domain,
+              outputNodeId: sourceShaderGraph.outputNodeId,
+              nodes: sourceShaderNodes.map((node) => ({
+                id: node.id,
+                type: node.type,
+                position: structuredClone(node.position),
+                parameters: {
+                  ...structuredClone(node.parameters as Record<string, unknown>),
+                  ...(node.id === "grade" ? { amount: 0.8 } : {}),
+                },
+              })),
+              links: sourceShaderLinks.map((link) => ({
+                id: link.id,
+                from: structuredClone(link.from),
+                to: structuredClone(link.to),
+              })),
+            },
+            {
+              id: "new-graph",
+              name: "New Graph",
+              version: 1,
+              domain: "postProcess",
+              nodes: [
+                { id: "new-scene", type: "sceneTexture", position: { x: 0, y: 0 }, parameters: {} },
+                { id: "new-output", type: "output", position: { x: 300, y: 0 }, parameters: {} },
+              ],
+              links: [{ id: "new-link", from: { nodeId: "new-scene", port: "color" }, to: { nodeId: "new-output", port: "color" } }],
+              outputNodeId: "new-output",
+            },
+          ],
+          postProcess: {
+            enabled: true,
+            effects: [
+              {
+                id: sourcePostEffect.id,
+                type: sourcePostEffect.type,
+                graphId: sourcePostEffect.graphId,
+                enabled: false,
+                parameters: { grade: { amount: 0.75 } },
+              },
+              { id: "new-effect", type: "vignette", enabled: true, intensity: 0.2 },
+            ],
+          },
         };
         return true;
       },
@@ -597,6 +652,59 @@ async function main(): Promise<void> {
           curves: [],
         },
       ],
+      shaderGraphs: [
+        {
+          id: "cinematic-grade",
+          name: "Cinematic Grade",
+          version: 1,
+          domain: "postProcess",
+          outputNodeId: "output",
+          futureGraphExtension: { compiler: "keep-me" },
+          nodes: [
+            { id: "scene", type: "sceneTexture", position: { x: 0, y: 0 }, parameters: {} },
+            {
+              id: "grade",
+              type: "saturation",
+              position: { x: 180, y: 0 },
+              parameters: { amount: 1.1, futureParameter: "keep-parameter" },
+              futureNodeExtension: { inspector: "keep-node" },
+            },
+            { id: "output", type: "output", position: { x: 360, y: 0 }, parameters: {} },
+          ],
+          links: [
+            {
+              id: "scene-grade",
+              from: { nodeId: "scene", port: "color", futureEndpoint: "keep-endpoint" },
+              to: { nodeId: "grade", port: "color" },
+              futureLinkExtension: "keep-link",
+            },
+            { id: "grade-output", from: { nodeId: "grade", port: "color" }, to: { nodeId: "output", port: "color" } },
+          ],
+        },
+        {
+          id: "delete-graph",
+          name: "Deleted in Editor",
+          version: 1,
+          domain: "postProcess",
+          nodes: [],
+          links: [],
+          outputNodeId: "",
+        },
+      ],
+      postProcess: {
+        enabled: true,
+        effects: [
+          {
+            id: "graph-grade",
+            type: "shaderGraph",
+            graphId: "cinematic-grade",
+            enabled: true,
+            parameters: { grade: { amount: 0.5, futureUniform: "keep-uniform" } },
+            futureEffectExtension: { renderer: "keep-effect" },
+          },
+          { id: "delete-effect", type: "pixelate", enabled: false, size: 4 },
+        ],
+      },
     };
     const messageListener = bridgeListeners.get("message")?.[0];
     assert(messageListener, "the bridge must subscribe to parent messages");
@@ -666,6 +774,39 @@ async function main(): Promise<void> {
     );
     assert.equal(savedParticles[1].id, "new-particle");
     assert.equal(savedParticles.some((asset) => asset.id === "delete-particle"), false);
+    const savedShaderGraphs = (saveMessage.document as {
+      shaderGraphs: Array<Record<string, unknown>>;
+    }).shaderGraphs;
+    assert.equal(savedShaderGraphs.length, 2, "the authored Shader Graph library owns additions and deletions");
+    assert.equal(savedShaderGraphs[0].id, "cinematic-grade");
+    assert.deepEqual(savedShaderGraphs[0].futureGraphExtension, { compiler: "keep-me" });
+    const savedShaderNodes = savedShaderGraphs[0].nodes as Array<Record<string, unknown>>;
+    const savedGradeNode = savedShaderNodes.find((node) => node.id === "grade");
+    assert(savedGradeNode);
+    assert.equal((savedGradeNode.parameters as Record<string, unknown>).amount, 0.8);
+    assert.equal((savedGradeNode.parameters as Record<string, unknown>).futureParameter, "keep-parameter");
+    assert.deepEqual(savedGradeNode.futureNodeExtension, { inspector: "keep-node" });
+    const savedShaderLinks = savedShaderGraphs[0].links as Array<Record<string, unknown>>;
+    assert.equal(savedShaderLinks[0].futureLinkExtension, "keep-link");
+    assert.equal((savedShaderLinks[0].from as Record<string, unknown>).futureEndpoint, "keep-endpoint");
+    assert.equal(savedShaderGraphs.some((graph) => graph.id === "delete-graph"), false);
+    assert.equal(savedShaderGraphs[1].id, "new-graph");
+    const savedPostProcess = (saveMessage.document as {
+      postProcess: { effects: Array<Record<string, unknown>> };
+    }).postProcess;
+    assert.equal(savedPostProcess.effects.length, 2, "the authored Post Process stack owns additions and deletions");
+    assert.equal(savedPostProcess.effects[0].enabled, false);
+    assert.deepEqual(savedPostProcess.effects[0].futureEffectExtension, { renderer: "keep-effect" });
+    assert.equal(
+      ((savedPostProcess.effects[0].parameters as Record<string, unknown>).grade as Record<string, unknown>).futureUniform,
+      "keep-uniform",
+    );
+    assert.equal(
+      ((savedPostProcess.effects[0].parameters as Record<string, unknown>).grade as Record<string, unknown>).amount,
+      0.75,
+    );
+    assert.equal(savedPostProcess.effects.some((effect) => effect.id === "delete-effect"), false);
+    assert.equal(savedPostProcess.effects[1].id, "new-effect");
     assert.equal(saveMessage.targetOrigin, "http://localhost");
 
     const routeProjectResponse = await createProjectRoute(new Request("http://localhost/api/projects", {

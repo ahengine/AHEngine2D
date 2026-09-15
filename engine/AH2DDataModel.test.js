@@ -45,7 +45,18 @@ const {
   normalizeParticleAssets,
   sampleParticleCurve,
   validateParticleDocument,
-  assertParticleDocument
+  assertParticleDocument,
+  SHADER_NODE_TYPES,
+  SHADER_NODE_DEFINITIONS,
+  SHADER_HEX_COLOR_PATTERN,
+  SHADER_GRAPH_DEFAULTS,
+  SHADER_GRAPH_SCHEMA,
+  POST_PROCESS_EFFECT_SCHEMA,
+  POST_PROCESS_SCHEMA,
+  normalizeShaderGraph,
+  normalizeShaderGraphs,
+  validateShaderGraphDocument,
+  assertShaderGraphDocument
 } = DataModel;
 
 const tests = [];
@@ -63,6 +74,9 @@ test('exports stable constants, schemas, and a browser global', () => {
   assert.strictEqual(JSON_SCHEMAS.components, COMPONENT_SCHEMAS);
   assert.strictEqual(JSON_SCHEMAS.prefabAsset, PREFAB_ASSET_SCHEMA);
   assert.strictEqual(JSON_SCHEMAS.particleAsset, PARTICLE_ASSET_SCHEMA);
+  assert.strictEqual(JSON_SCHEMAS.shaderGraph, SHADER_GRAPH_SCHEMA);
+  assert.strictEqual(JSON_SCHEMAS.postProcessEffect, POST_PROCESS_EFFECT_SCHEMA);
+  assert.strictEqual(JSON_SCHEMAS.postProcess, POST_PROCESS_SCHEMA);
   assert.deepStrictEqual(PREFAB_OVERRIDE_OPERATIONS, ['add', 'replace', 'remove']);
 
   const source = fs.readFileSync(path.join(__dirname, 'AH2DDataModel.js'), 'utf8');
@@ -73,6 +87,8 @@ test('exports stable constants, schemas, and a browser global', () => {
   assert.strictEqual(typeof browser.AH2DDataModel.validatePrefabDocument, 'function');
   assert.strictEqual(typeof browser.AH2DDataModel.validateSkeletonDocument, 'function');
   assert.strictEqual(typeof browser.AH2DDataModel.sampleParticleCurve, 'function');
+  assert.strictEqual(typeof browser.AH2DDataModel.normalizeShaderGraph, 'function');
+  assert.strictEqual(typeof browser.AH2DDataModel.validateShaderGraphDocument, 'function');
 });
 
 test('applies canonical Prefab override pointers safely and protects instance identity', () => {
@@ -1017,6 +1033,249 @@ test('validates Particle Asset ranges, unique curves, sorted keys, and Scene/Pre
     duration: 2, particles: []
   }), [], 'Universal Projects must not be classified as standalone Particle Assets');
   assert.deepStrictEqual(validateParticleDocument({ version: 3, entities: [{ id: 'runtime', components: { ParticleEmitter: { assetId: 'sparks' } } }] }), []);
+});
+
+test('normalizes canonical Shader Graphs with stable IDs, defaults, and unknown extensions intact', () => {
+  assert.deepStrictEqual(SHADER_NODE_TYPES, [
+    'sceneTexture', 'output', 'tint', 'grayscale', 'brightnessContrast',
+    'saturation', 'invert', 'vignette', 'pixelate', 'chromaticAberration', 'mix'
+  ]);
+  assert.deepStrictEqual(SHADER_GRAPH_SCHEMA.required, [
+    'id', 'name', 'version', 'domain', 'nodes', 'links', 'outputNodeId'
+  ]);
+  assert.strictEqual(SHADER_NODE_DEFINITIONS.mix.inputs.a, 'color');
+  assert.strictEqual(SHADER_NODE_DEFINITIONS.mix.inputs.b, 'color');
+  assert.strictEqual(SHADER_NODE_DEFINITIONS.chromaticAberration.parameters.amount.default, 2);
+  assert.strictEqual(SHADER_NODE_DEFINITIONS.tint.parameters.color.pattern, SHADER_HEX_COLOR_PATTERN);
+  assert.strictEqual(SHADER_GRAPH_DEFAULTS.domain, 'postProcess');
+  assert.deepStrictEqual(POST_PROCESS_EFFECT_SCHEMA.required, ['id', 'type']);
+  assert.strictEqual(POST_PROCESS_EFFECT_SCHEMA.properties.graphId.pattern, '\\S');
+  assert.strictEqual(POST_PROCESS_EFFECT_SCHEMA.properties.parameters.type, 'object');
+  assert.strictEqual(POST_PROCESS_EFFECT_SCHEMA.additionalProperties, true);
+  assert.deepStrictEqual(POST_PROCESS_SCHEMA.required, ['effects']);
+  assert.strictEqual(POST_PROCESS_SCHEMA.properties.effects.items, POST_PROCESS_EFFECT_SCHEMA);
+  assert.strictEqual(POST_PROCESS_SCHEMA.additionalProperties, true);
+
+  const source = {
+    name: 'Dream Grade', futureGraph: { keep: true },
+    nodes: [
+      { id: 'scene', type: 'SCENETEXTURE', position: { x: '10.5', y: '-20', futureAxis: 3 }, parameters: {}, futureNode: 'keep' },
+      { type: 'brightnesscontrast', position: { x: 210, y: 20 }, parameters: { brightness: 0.2, futureUniform: 7 } },
+      { id: 'result', type: 'OUTPUT', position: { x: 420, y: 20 }, parameters: {} }
+    ],
+    links: [
+      { id: 'source-grade', from: { nodeId: 'scene', port: 'color', futureEndpoint: true }, to: { nodeId: 'brightnesscontrast', port: 'color' }, futureLink: 1 },
+      { from: { nodeId: 'brightnesscontrast', port: 'color' }, to: { nodeId: 'result', port: 'color' } }
+    ],
+    outputNodeId: 'result'
+  };
+  const before = JSON.stringify(source);
+  const normalized = normalizeShaderGraph(source);
+  assert.strictEqual(JSON.stringify(source), before, 'Shader Graph normalization must not mutate input');
+  assert.strictEqual(normalized.id, 'dream-grade');
+  assert.strictEqual(normalized.version, 1);
+  assert.strictEqual(normalized.domain, 'postProcess');
+  assert.strictEqual(normalized.nodes[0].type, 'sceneTexture');
+  assert.strictEqual(normalized.nodes[1].type, 'brightnessContrast');
+  assert.strictEqual(normalized.nodes[1].parameters.contrast, 1);
+  assert.strictEqual(normalized.nodes[1].parameters.futureUniform, 7);
+  assert.strictEqual(normalized.nodes[0].futureNode, 'keep');
+  assert.strictEqual(normalized.nodes[0].position.x, 10.5, 'compatible numeric-string X coordinates must normalize to numbers');
+  assert.strictEqual(normalized.nodes[0].position.y, -20, 'compatible numeric-string Y coordinates must normalize to numbers');
+  assert.strictEqual(normalized.nodes[0].position.futureAxis, 3);
+  assert.strictEqual(normalized.links[0].futureLink, 1);
+  assert.strictEqual(normalized.links[0].from.futureEndpoint, true);
+  assert(normalized.nodes[1].id);
+  assert(normalized.links[1].id);
+  assert.deepStrictEqual(validateShaderGraphDocument([normalized]), []);
+
+  const defaults = normalizeShaderGraph({ name: 'Default Graph' });
+  assert.deepStrictEqual(defaults.nodes.map(node => node.type), ['sceneTexture', 'output']);
+  assert.deepStrictEqual(validateShaderGraphDocument(defaults, { strict: true }), []);
+  const collisionSafe = normalizeShaderGraphs([
+    { name: 'Grade' },
+    { name: 'Grade' },
+    { ...normalizeShaderGraph({ name: 'Explicit' }), id: 'grade' }
+  ]);
+  assert.deepStrictEqual(collisionSafe.map(graph => graph.id), ['grade-2', 'grade-3', 'grade']);
+});
+
+test('validates Shader Graph topology, ports, parameters, cycles, and Post Process references', () => {
+  const graph = normalizeShaderGraph({ name: 'Valid Grade' });
+  const project = {
+    shaderGraphs: [{ ...graph, futureGraph: { keep: true } }],
+    postProcess: { enabled: true, effects: [
+      { id: 'grade', type: 'shaderGraph', graphId: graph.id, enabled: true, overrides: { future: true } }
+    ] }
+  };
+  const before = JSON.stringify(project);
+  assert.deepStrictEqual(validateShaderGraphDocument(project, { strict: true }), []);
+  assert.deepStrictEqual(assertShaderGraphDocument(project, { strict: true }), []);
+  assert.strictEqual(JSON.stringify(project), before, 'Shader Graph validation must be non-mutating');
+  const inProgress = JSON.parse(JSON.stringify(graph));
+  inProgress.nodes.push({ id: 'unconnected-tint', type: 'tint', position: { x: 300, y: 300 }, parameters: {} });
+  assert.deepStrictEqual(validateShaderGraphDocument([inProgress], { strict: true }), [], 'disconnected authoring nodes outside the Output-reachable graph may be saved');
+
+  const unknown = JSON.parse(JSON.stringify(graph));
+  unknown.nodes.push({ id: 'future', type: 'futureShaderNode', position: { x: 0, y: 0 }, parameters: { extension: true }, extension: 'keep' });
+  const compatibleUnknown = validateShaderGraphDocument([unknown]);
+  assert(compatibleUnknown.some(item => item.code === 'W_SHADER_NODE_UNKNOWN' && item.severity === 'warning'));
+  assert.strictEqual(compatibleUnknown.some(item => item.severity === 'error'), false);
+  assert(validateShaderGraphDocument([unknown], { strict: true }).some(item => item.code === 'E_SHADER_NODE_UNKNOWN'));
+  const unknownInActiveChain = normalizeShaderGraph({
+    id: 'future-chain', name: 'Future Chain', nodes: [
+      { id: 'scene', type: 'sceneTexture', position: { x: 0, y: 0 }, parameters: {} },
+      { id: 'future', type: 'futureShaderNode', position: { x: 100, y: 0 }, parameters: {} },
+      { id: 'output', type: 'output', position: { x: 200, y: 0 }, parameters: {} }
+    ], links: [
+      { id: 'scene-future', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'future', port: 'input' } },
+      { id: 'future-output', from: { nodeId: 'future', port: 'result' }, to: { nodeId: 'output', port: 'color' } }
+    ], outputNodeId: 'output'
+  });
+  const compatibleFutureChain = validateShaderGraphDocument([unknownInActiveChain]);
+  assert(compatibleFutureChain.some(item => item.code === 'W_SHADER_NODE_UNKNOWN'));
+  assert.strictEqual(compatibleFutureChain.some(item => item.severity === 'error'), false, 'future nodes and ports must remain compatible outside strict validation');
+  assert(validateShaderGraphDocument([unknownInActiveChain], { strict: true }).some(item => item.code === 'E_SHADER_NODE_UNKNOWN'));
+
+  assert(validateShaderGraphDocument({
+    id: 'malformed', name: 'Malformed', version: 1, domain: 'postProcess', nodes: {}, links: [], outputNodeId: 'output'
+  }).some(item => item.code === 'E_SHADER_NODES'), 'a malformed standalone graph must not be mistaken for an empty Project');
+
+  const duplicateTarget = JSON.parse(JSON.stringify(graph));
+  duplicateTarget.links.push({ id: 'another-output-link', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'output', port: 'color' } });
+  assert(validateShaderGraphDocument([duplicateTarget]).some(item => item.code === 'E_SHADER_LINK_TARGET_DUPLICATE'));
+
+  const badPort = JSON.parse(JSON.stringify(graph));
+  badPort.links[0].from.port = 'missing';
+  assert(validateShaderGraphDocument([badPort]).some(item => item.code === 'E_SHADER_LINK_OUTPUT_PORT'));
+
+  const dangling = JSON.parse(JSON.stringify(graph));
+  dangling.links[0].from.nodeId = 'missing';
+  const danglingDiagnostics = validateShaderGraphDocument([dangling]);
+  assert(danglingDiagnostics.some(item => item.code === 'E_SHADER_LINK_NODE_REFERENCE'));
+  assert(danglingDiagnostics.some(item => item.code === 'E_SHADER_INPUT_REQUIRED'));
+
+  const invalidOutput = JSON.parse(JSON.stringify(graph));
+  invalidOutput.outputNodeId = 'scene';
+  assert(validateShaderGraphDocument([invalidOutput]).some(item => item.code === 'E_SHADER_OUTPUT_KIND'));
+  invalidOutput.nodes.push({ id: 'output-2', type: 'output', position: { x: 0, y: 0 }, parameters: {} });
+  assert(validateShaderGraphDocument([invalidOutput]).some(item => item.code === 'E_SHADER_OUTPUT_COUNT'));
+
+  const cycle = {
+    id: 'cycle', name: 'Cycle', version: 1, domain: 'postProcess', outputNodeId: 'output',
+    nodes: [
+      { id: 'scene', type: 'sceneTexture', position: { x: 0, y: 0 }, parameters: {} },
+      { id: 'a', type: 'tint', position: { x: 100, y: 0 }, parameters: {} },
+      { id: 'b', type: 'tint', position: { x: 200, y: 0 }, parameters: {} },
+      { id: 'output', type: 'output', position: { x: 300, y: 0 }, parameters: {} }
+    ],
+    links: [
+      { id: 'a-b', from: { nodeId: 'a', port: 'color' }, to: { nodeId: 'b', port: 'color' } },
+      { id: 'b-a', from: { nodeId: 'b', port: 'color' }, to: { nodeId: 'a', port: 'color' } },
+      { id: 'scene-output', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'output', port: 'color' } }
+    ]
+  };
+  assert.strictEqual(
+    validateShaderGraphDocument([cycle]).some(item => item.code === 'E_SHADER_GRAPH_CYCLE'),
+    false,
+    'disconnected work-in-progress cycles outside the Output chain may be saved'
+  );
+  const reachableCycle = JSON.parse(JSON.stringify(cycle));
+  reachableCycle.links[2] = { id: 'b-output', from: { nodeId: 'b', port: 'color' }, to: { nodeId: 'output', port: 'color' } };
+  assert(validateShaderGraphDocument([reachableCycle]).some(item => item.code === 'E_SHADER_GRAPH_CYCLE'));
+
+  const parameter = normalizeShaderGraph({ name: 'Bad Parameter' });
+  parameter.nodes.splice(1, 0, { id: 'pixel', type: 'pixelate', position: { x: 200, y: 0 }, parameters: { size: 0 } });
+  parameter.links = [
+    { id: 'scene-pixel', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'pixel', port: 'color' } },
+    { id: 'pixel-output', from: { nodeId: 'pixel', port: 'color' }, to: { nodeId: 'output', port: 'color' } }
+  ];
+  assert(validateShaderGraphDocument([parameter]).some(item => item.code === 'E_SHADER_PARAMETER_RANGE'));
+
+  for (const [index, color] of ['#abc', '#AbC7', '#aabbcc', '#AABBCC80'].entries()) {
+    const validTint = JSON.parse(JSON.stringify(graph));
+    validTint.nodes.push({ id: `valid-tint-${index}`, type: 'tint', position: { x: 0, y: 0 }, parameters: { color } });
+    assert.strictEqual(
+      validateShaderGraphDocument([validTint], { strict: true }).some(item => item.pointer.endsWith(`/parameters/color`) && item.severity === 'error'),
+      false,
+      `${color} must be accepted by the tint contract`
+    );
+  }
+  for (const [index, color] of ['red', '#12', '#12345', '#ggg', '#123456789'].entries()) {
+    const invalidTint = JSON.parse(JSON.stringify(graph));
+    invalidTint.nodes.push({ id: `invalid-tint-${index}`, type: 'tint', position: { x: 0, y: 0 }, parameters: { color } });
+    assert(validateShaderGraphDocument([invalidTint]).some(item => (
+      item.code === 'E_SHADER_PARAMETER_VALUE' && item.pointer.endsWith('/nodes/2/parameters/color')
+    )), `${color} must be rejected by the tint contract`);
+  }
+
+  const duplicateGraph = { shaderGraphs: [graph, { ...graph }] };
+  assert(validateShaderGraphDocument(duplicateGraph).some(item => item.code === 'E_SHADER_GRAPH_ID_DUPLICATE'));
+  const missingGraph = { shaderGraphs: [graph], postProcess: { effects: [{ id: 'missing', type: 'shaderGraph', graphId: 'not-there' }] } };
+  assert(validateShaderGraphDocument(missingGraph).some(item => item.code === 'E_SHADER_EFFECT_GRAPH_REFERENCE'));
+  const missingGraphId = { shaderGraphs: [graph], postProcess: { effects: [{ id: 'missing', type: 'shaderGraph' }] } };
+  assert(validateShaderGraphDocument(missingGraphId).some(item => item.code === 'E_SHADER_EFFECT_GRAPH_ID'));
+
+  const postProcessType = validateShaderGraphDocument({ shaderGraphs: [graph], postProcess: [] });
+  assert(postProcessType.some(item => item.code === 'E_POST_PROCESS_TYPE' && item.pointer === '/postProcess'));
+  const effectsType = validateShaderGraphDocument({ shaderGraphs: [graph], postProcess: { effects: {} } });
+  assert(effectsType.some(item => item.code === 'E_POST_PROCESS_EFFECTS_TYPE' && item.pointer === '/postProcess/effects'));
+  const missingEffects = validateShaderGraphDocument({ shaderGraphs: [graph], postProcess: { enabled: true } });
+  assert(missingEffects.some(item => item.code === 'E_POST_PROCESS_EFFECTS_TYPE' && item.pointer === '/postProcess/effects'));
+  const invalidEffects = validateShaderGraphDocument({ shaderGraphs: [graph], postProcess: { effects: [
+    null,
+    { type: 'vignette' },
+    { id: 'missing-type', type: ' ' },
+    { id: 'duplicate-effect', type: 'bloom' },
+    { id: ' duplicate-effect ', type: 'futureEffect', extension: { keep: true } }
+  ] } });
+  assert(invalidEffects.some(item => item.code === 'E_POST_PROCESS_EFFECT_OBJECT' && item.pointer === '/postProcess/effects/0'));
+  assert(invalidEffects.some(item => item.code === 'E_POST_PROCESS_EFFECT_ID' && item.pointer === '/postProcess/effects/1/id'));
+  assert(invalidEffects.some(item => item.code === 'E_POST_PROCESS_EFFECT_TYPE' && item.pointer === '/postProcess/effects/2/type'));
+  const duplicateEffect = invalidEffects.find(item => item.code === 'E_POST_PROCESS_EFFECT_ID_DUPLICATE');
+  assert.strictEqual(duplicateEffect.pointer, '/postProcess/effects/4/id');
+  assert.strictEqual(duplicateEffect.details.firstPointer, '/postProcess/effects/3/id');
+  const invalidEffectShape = validateShaderGraphDocument({ shaderGraphs: [graph], postProcess: {
+    enabled: null,
+    effects: [{ id: 'shape', type: 'vignette', name: 42, enabled: 'yes', graphId: ' ', parameters: [] }]
+  } });
+  for (const [code, pointer] of [
+    ['E_POST_PROCESS_ENABLED', '/postProcess/enabled'],
+    ['E_POST_PROCESS_EFFECT_NAME', '/postProcess/effects/0/name'],
+    ['E_POST_PROCESS_EFFECT_ENABLED', '/postProcess/effects/0/enabled'],
+    ['E_POST_PROCESS_EFFECT_GRAPH_ID', '/postProcess/effects/0/graphId'],
+    ['E_POST_PROCESS_EFFECT_PARAMETERS', '/postProcess/effects/0/parameters']
+  ]) assert(invalidEffectShape.some(item => item.code === code && item.pointer === pointer), `${code} must point to ${pointer}`);
+
+  const unsafePostProcess = {
+    shaderGraphs: [graph],
+    postProcess: { enabled: true, effects: [{
+      id: 'unsafe', type: 'futureEffect', parameters: { amount: Number.NaN },
+      functionExtension: () => {}, objectExtension: new Date(0)
+    }] }
+  };
+  const unsafeDiagnostics = validateShaderGraphDocument(unsafePostProcess);
+  assert(unsafeDiagnostics.some(item => item.code === 'E_POST_PROCESS_NUMBER' && item.pointer === '/postProcess/effects/0/parameters/amount'));
+  assert(unsafeDiagnostics.some(item => item.code === 'E_POST_PROCESS_JSON_TYPE' && item.pointer === '/postProcess/effects/0/functionExtension'));
+  assert(unsafeDiagnostics.some(item => item.code === 'E_POST_PROCESS_JSON_OBJECT' && item.pointer === '/postProcess/effects/0/objectExtension'));
+  const circularEffectExtension = {};
+  circularEffectExtension.self = circularEffectExtension;
+  assert(validateShaderGraphDocument({
+    shaderGraphs: [graph],
+    postProcess: { effects: [{ id: 'circular', type: 'futureEffect', extension: circularEffectExtension }] }
+  }).some(item => item.code === 'E_POST_PROCESS_JSON_CIRCULAR' && item.pointer === '/postProcess/effects/0/extension/self'));
+  assert.throws(
+    () => assertShaderGraphDocument({ shaderGraphs: [graph], postProcess: { effects: [
+      { id: 'same', type: 'vignette' }, { id: 'same', type: 'bloom' }
+    ] } }),
+    error => error instanceof ComponentSchemaError && error.code === 'E_POST_PROCESS_EFFECT_ID_DUPLICATE' && error.pointer === '/postProcess/effects/1/id'
+  );
+
+  const circular = normalizeShaderGraph({ name: 'Circular Extension' });
+  circular.nodes[0].future = {};
+  circular.nodes[0].future.self = circular.nodes[0].future;
+  assert(validateShaderGraphDocument([circular]).some(item => item.code === 'E_SHADER_JSON_CIRCULAR'));
+  assert.throws(() => assertShaderGraphDocument([badPort]), error => error instanceof ComponentSchemaError && error.code === 'E_SHADER_LINK_OUTPUT_PORT');
 });
 
 test('normalizes, validates, and samples canonical Animation Clips without losing extensions', () => {

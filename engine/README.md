@@ -8,10 +8,10 @@ AH2D keeps editor data independent from a specific renderer. The editor can prev
 
 - Scene Graph with cycle-safe nested parent/child relationships
 - Entity Component System (ECS)
-- Transform, Camera, Lighting, Shadow, Animation, deterministic Particle, Skeleton/FK/IK/Skinning, and Tilemap systems
+- Transform, Camera, Lighting, Shadow, Animation, deterministic Particle, Skeleton/FK/IK/Skinning, Shader Graph/Post Process, and Tilemap systems
 - Native Box2D-compatible backend through Planck with pixel/metre conversion
 - Deterministic built-in 2D physics backend available by explicit selection
-- Runtime adapters for PixiJS, PhaserJS, and custom hosts
+- Runtime adapters for PixiJS, PhaserJS, and custom hosts, with native PixiJS Post Process filters
 - Editor bridge for `AH2DEdtior.html`
 - Multi-Scene project loading and runtime Scene switching
 - Reusable Prefab Assets with expanded Scene Instances, path-based Overrides, Apply/Revert, and lossless Unpack
@@ -25,7 +25,7 @@ npm run ah2d -- inspect --file game.ah2d.json --pretty
 npm run ah2d -- validate --file game.ah2d.json --engine
 ```
 
-See [`CLI.md`](./CLI.md) for Scene, Entity, component, resource, Prefab, runtime, physics, simulation, JSON Patch, and atomic batch workflows. Prefab lifecycle is documented in [`../docs/PREFABS.md`](../docs/PREFABS.md), skeletal authoring/runtime in [`../docs/SKELETONS.md`](../docs/SKELETONS.md), and Particle Assets/Curves in [`../docs/PARTICLES.md`](../docs/PARTICLES.md).
+See [`CLI.md`](./CLI.md) for Scene, Entity, component, resource, Prefab, runtime, physics, simulation, JSON Patch, and atomic batch workflows. Prefab lifecycle is documented in [`../docs/PREFABS.md`](../docs/PREFABS.md), skeletal authoring/runtime in [`../docs/SKELETONS.md`](../docs/SKELETONS.md), Particle Assets/Curves in [`../docs/PARTICLES.md`](../docs/PARTICLES.md), and Shader Graph/Post Process in [`../docs/SHADERS.md`](../docs/SHADERS.md).
 
 ## Unified ECS and Component Schema contract
 
@@ -123,6 +123,21 @@ const project = {
 engine.load(project);       // Loads currentSceneId.
 engine.loadScene('boss');   // Switches without runtime-specific data.
 ```
+
+## Shader Graph and Post Process
+
+Top-level `shaderGraphs[]` stores framework-neutral post-process graphs; `postProcess.effects[]` can reference one with `{ type: 'shaderGraph', graphId }`. The graph compiler validates typed ports, links, the selected Output, and cycles before producing an executable descriptor.
+
+```js
+engine.load(project);
+engine.shaders.compile('cinematic-grade');
+engine.shaders.setNodeParameters('cinematic-grade', 'grade', { amount: 1.2 });
+
+engine.postProcess.configure('cinematic-grade-effect', { enabled: true });
+console.log(engine.postProcess.resolvedActive);
+```
+
+`engine.shaderGraphs` aliases `engine.shaders`. PixiJS WebGL creates and synchronizes reusable native Filters for supported built-in and compiled graph effects; its WebGPU/Canvas renderers currently skip those effects without stopping the Scene. PhaserJS and custom hosts map `resolvedActive` themselves. See [`../docs/SHADERS.md`](../docs/SHADERS.md) for the complete data contract, nodes, Editor workflow, and CLI examples.
 
 ## Prefab lifecycle
 

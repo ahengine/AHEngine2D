@@ -1081,9 +1081,377 @@ const testPostProcessProjectContract = () => {
   engine.postProcess.configure('grade', { saturation: 0.8 });
   assert.strictEqual(engine.postProcess.active.length, 1);
   assert.strictEqual(engine.export().postProcess.effects[0].saturation, 0.8, 'ECS snapshots must expose renderer Post Process data');
+  for (const effect of defaults.effects) {
+    const resolved = engine.postProcess.resolve({ ...effect, enabled: true });
+    assert.strictEqual(resolved.valid, true, `built-in ${effect.type} must compile to a Runtime descriptor`);
+    assert.strictEqual(resolved.compiled.kind, 'builtin');
+    assert.ok(resolved.compiled.fragmentSource.includes('void main(void)'), `built-in ${effect.type} must provide GLSL`);
+    assert.ok(resolved.compiled.fragmentSource.includes('uniform vec4 uInputClamp'), `built-in ${effect.type} must respect Pixi's active input frame`);
+    assert.ok(resolved.compiled.shaderKey, `built-in ${effect.type} must expose a stable filter key`);
+    if (effect.type === 'bloom') {
+      assert.ok(resolved.compiled.fragmentSource.includes('vec4 glow=b*strength'), 'Bloom glow must retain premultiplied alpha coverage');
+      assert.ok(resolved.compiled.fragmentSource.includes('float outAlpha='), 'Bloom must produce alpha for every emitted glow contribution');
+      assert.ok(resolved.compiled.fragmentSource.includes('vec3 outRgb=min('), 'Bloom RGB must remain bounded by its premultiplied alpha');
+      assert.ok(resolved.compiled.fragmentSource.includes('finalColor=vec4(outRgb,outAlpha)'), 'Bloom must publish its expanded PMA coverage');
+      assert.ok(!resolved.compiled.fragmentSource.includes('vec4(c.rgb+b*'), 'Bloom must not emit non-zero RGB with the original alpha');
+    }
+    if (['colorAdjust', 'chromaticAberration', 'crt'].includes(effect.type)) {
+      assert.ok(resolved.compiled.fragmentSource.includes('c.a>0.000001?c.rgb/c.a:vec3(0.0)'), `${effect.type} must transform straight RGB after safely unpremultiplying Pixi input`);
+      assert.ok(resolved.compiled.fragmentSource.includes('rgb*c.a'), `${effect.type} must return premultiplied RGB to Pixi`);
+    }
+  }
+  const huePass = engine.postProcess.resolve({
+    id: 'hue-direction', type: 'colorAdjust', enabled: true,
+    brightness: 1, contrast: 1, saturation: 1, hue: 120
+  });
+  const [hueUniformName, hueUniform] = Object.entries(huePass.compiled.uniforms)
+    .find(([, metadata]) => metadata.parameter === 'hue');
+  assert.strictEqual(hueUniform.type, 'mat3x3<f32>');
+  assert.ok(huePass.compiled.fragmentSource.includes(`${hueUniformName}*rgb`));
+  const hueMatrix = hueUniform.value;
+  const rotatedRed = [
+    hueMatrix[0], hueMatrix[1], hueMatrix[2]
+  ].map(channel => Math.max(0, Math.min(1, channel)));
+  near(rotatedRed[0], 0);
+  near(rotatedRed[1], 0.44334163274117466, 1e-12, 'positive 120 degree Hue rotates red toward green');
+  near(rotatedRed[2], 0);
+  const unsupported = engine.postProcess.resolve({ id: 'future-pass', type: 'futurePass', enabled: true, extension: { keep: true } });
+  assert.strictEqual(unsupported.valid, false);
+  assert.strictEqual(unsupported.extension.keep, true, 'unsupported Post Process effects must remain lossless in resolved descriptors');
+  assert.ok(unsupported.diagnostics.some(item => item.code === 'E_POST_PROCESS_UNSUPPORTED'));
+  engine.postProcess.load({ enabled: true, effects: [
+    { id: 'type-owner', type: 'shared-selector', enabled: true },
+    { id: 'shared-selector', type: 'pixelate', enabled: true, size: 4 }
+  ] }, { emit: false });
+  assert.strictEqual(engine.postProcess.get('shared-selector').id, 'shared-selector', 'Post Process lookup must prefer an exact stable ID over an earlier type fallback');
   const secondDefaults = AH2D.createDefaultPostProcess();
   secondDefaults.effects[0].intensity = 99;
   assert.notStrictEqual(AH2D.createDefaultPostProcess().effects[0].intensity, 99, 'default stacks must not share mutable state');
+};
+
+const shaderGraphFixture = (id = 'grade-graph', amount = 1) => ({
+  id,
+  name: 'Grade Graph',
+  version: 1,
+  domain: 'postProcess',
+  extension: { owner: 'game', keep: true },
+  nodes: [
+    { id: 'output', type: 'output', position: { x: 500, y: 100 }, parameters: {}, extension: 'output-kept' },
+    { id: 'gray', type: 'grayscale', position: { x: 280, y: 100 }, parameters: { amount }, customParameter: 7 },
+    { id: 'scene', type: 'sceneTexture', position: { x: 60, y: 100 }, parameters: {} }
+  ],
+  links: [
+    { id: 'gray-output', from: { nodeId: 'gray', port: 'color' }, to: { nodeId: 'output', port: 'color' } },
+    { id: 'scene-gray', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'gray', port: 'color' } }
+  ],
+  outputNodeId: 'output'
+});
+
+const testShaderGraphCompilationEvaluationAndSnapshots = () => {
+  const graph = shaderGraphFixture();
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  const compileEvents = [];
+  engine.events.on('shadergraph:compile', event => compileEvents.push(event));
+  engine.load({
+    format: 'AH2D', version: 4, shaderGraphs: [graph], scene: [],
+    postProcess: { enabled: true, effects: [{
+      id: 'custom-grade', type: 'shaderGraph', graphId: `  ${graph.id}  `, enabled: true,
+      parameters: { gray: { amount: 0.5 }, 'gray.extra': 99 }, customEffectField: 'kept'
+    }] }
+  });
+  assert.strictEqual(engine.shaders, engine.shaderGraphs, 'both public Shader Graph names must resolve to one system');
+  assert.strictEqual(engine.shaders.list()[0].extension.keep, true, 'unknown Graph fields must survive Runtime load');
+  assert.strictEqual(engine.shaders.get(graph.id).nodes[0].extension, 'output-kept', 'unknown node fields must survive Runtime load');
+
+  const compiled = engine.shaders.compile(graph.id);
+  assert.strictEqual(compiled.valid, true);
+  assert.deepStrictEqual(compiled.order, ['scene', 'gray', 'output'], 'topological output must be deterministic rather than authoring-array order');
+  assert.ok(compiled.fragmentSource.includes('uniform sampler2D uTexture'));
+  assert.ok(compiled.fragmentSource.includes('uniform vec4 uInputClamp'));
+  assert.ok(compiled.fragmentSource.includes('uInputClamp.xy'), 'Shader Graph texture reads must stay inside Pixi pooled input textures');
+  assert.ok(compiled.fragmentSource.includes('0.2126'));
+  assert.ok(compiled.fragmentSource.includes('if (color.a > 0.000001) color.rgb /= color.a;'), 'sceneTexture must safely convert Pixi premultiplied samples to straight Graph RGBA');
+  assert.ok(compiled.fragmentSource.includes('return vec4(color.rgb * color.a, color.a);'), 'Output must convert straight Graph RGBA back to Pixi premultiplied RGBA');
+  assert.strictEqual((compiled.fragmentSource.match(/color\.rgb \* color\.a/g) || []).length, 1, 'a Graph output path must premultiply exactly once');
+  assert.strictEqual(compiled.diagnostics.length, 0);
+  assert.strictEqual(compileEvents.length, 1, 'the same compiled state must emit only once');
+  engine.shaders.compile(graph.id);
+  assert.strictEqual(compileEvents.length, 1);
+
+  const reordered = shaderGraphFixture();
+  reordered.nodes.reverse();
+  reordered.links.reverse();
+  const reorderedCompile = engine.shaders.compile(reordered, { emit: false });
+  assert.strictEqual(reorderedCompile.fragmentSource, compiled.fragmentSource, 'authored array order must not change equivalent Shader output');
+  assert.strictEqual(reorderedCompile.shaderKey, compiled.shaderKey);
+
+  const withDraftNode = shaderGraphFixture('grade-with-draft');
+  withDraftNode.nodes.push({
+    id: 'draft-tint', type: 'tint', position: { x: 120, y: 260 },
+    parameters: { color: '#ff00ff', amount: 0.25 }, editorState: { selected: true }
+  });
+  const draftCompile = engine.shaders.compile(withDraftNode, {
+    emit: false, parameters: { 'draft-tint.amount': 'stale-effect-override' }
+  });
+  assert.strictEqual(draftCompile.valid, true, 'a disconnected authoring node must not invalidate the executable Output chain');
+  assert.deepStrictEqual(draftCompile.order, ['scene', 'gray', 'output'], 'only nodes upstream-reachable from Output belong to the compile plan');
+  assert.strictEqual(draftCompile.fragmentSource, compiled.fragmentSource, 'disconnected nodes must not alter generated GLSL');
+  assert.strictEqual(draftCompile.shaderKey, compiled.shaderKey, 'disconnected nodes must not invalidate a reusable GPU filter');
+
+  let preview = engine.shaders.evaluate(graph.id, { color: [1, 0, 0, 0.75], uv: [0.2, 0.4], resolution: [320, 180] });
+  near(preview.color[0], 0.2126, 1e-8, 'CPU preview grayscale red');
+  near(preview.color[1], 0.2126, 1e-8, 'CPU preview grayscale green');
+  near(preview.color[2], 0.2126, 1e-8, 'CPU preview grayscale blue');
+  near(preview.color[3], 0.75, 1e-8, 'CPU preview preserves alpha');
+  assert.deepStrictEqual(preview.uv, [0.2, 0.4]);
+
+  engine.postProcess.configure('custom-grade', { graphId: ` ${graph.id} ` });
+  assert.strictEqual(engine.postProcess.get('custom-grade').graphId, graph.id, 'live Effect configuration must use the same canonical Graph ID');
+  const resolved = engine.postProcess.resolvedActive[0];
+  assert.strictEqual(resolved.kind, 'shaderGraph');
+  assert.strictEqual(resolved.graphId, graph.id, 'Shader Graph Effect references must be canonicalized after document validation');
+  assert.strictEqual(resolved.valid, true);
+  const effectAmount = Object.values(resolved.compiled.uniforms).find(item => item.nodeId === 'gray' && item.parameter === 'amount');
+  assert.strictEqual(effectAmount.value, 0.5, 'Effect parameters must override authored node parameters without modifying the Asset');
+  assert.strictEqual(resolved.customEffectField, 'kept');
+
+  engine.shaders.configure(graph.id, 'gray', { amount: 0 });
+  preview = engine.shaders.evaluate(graph.id, [1, 0, 0, 1]);
+  assert.deepStrictEqual(preview.color, [1, 0, 0, 1], 'Runtime node parameter edits must affect CPU evaluation immediately');
+  assert.strictEqual(engine.shaders.toJSON()[0].nodes.find(node => node.id === 'gray').parameters.amount, 0);
+  assert.strictEqual(engine.shaders.toJSON()[0].nodes.find(node => node.id === 'gray').customParameter, 7);
+
+  engine.shaders.setNodeParameters(graph.id, 'gray', { amount: 0.4 });
+  const snapshot = engine.captureSnapshot();
+  engine.shaders.setNodeParameters(graph.id, 'gray', { amount: 0.9 });
+  assert.strictEqual(engine.restoreSnapshot(snapshot), true);
+  assert.strictEqual(engine.shaders.get(graph.id).nodes.find(node => node.id === 'gray').parameters.amount, 0.4, 'Play snapshots must restore the live Shader Asset library');
+  const exported = engine.export();
+  assert.strictEqual(exported.shaderGraphs[0].extension.keep, true);
+  assert.strictEqual(exported.shaderGraphs[0].nodes.find(node => node.id === 'gray').parameters.amount, 0.4);
+  assert.strictEqual(exported.postProcess.effects[0].graphId, graph.id);
+  assert.strictEqual(exported.postProcess.effects[0].customEffectField, 'kept');
+};
+
+const testPostProcessEffectIdentityIsAtomic = () => {
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  engine.load({
+    format: 'AH2D', version: 4, scene: [{ id: 'kept' }],
+    postProcess: { enabled: true, effects: [{ id: 'kept-effect', type: 'vignette', enabled: true }] }
+  });
+  const before = {
+    document: JSON.stringify(engine.document),
+    postProcess: JSON.stringify(engine.postProcess.toJSON()),
+    shaders: JSON.stringify(engine.shaders.toJSON())
+  };
+  assert.throws(
+    () => engine.load({
+      format: 'AH2D', version: 4, scene: [{ id: 'replacement' }],
+      postProcess: { enabled: true, effects: [
+        { id: 'duplicate', type: 'vignette' },
+        { id: ' duplicate ', type: 'bloom' }
+      ] }
+    }),
+    error => error?.name === 'ComponentSchemaError' &&
+      error.code === 'E_POST_PROCESS_EFFECT_ID_DUPLICATE' &&
+      error.pointer === '/postProcess/effects/1/id'
+  );
+  assert.strictEqual(JSON.stringify(engine.document), before.document, 'duplicate Post Process identities must reject Engine load before document commit');
+  assert.strictEqual(JSON.stringify(engine.postProcess.toJSON()), before.postProcess, 'duplicate Post Process identities must not partially replace the active stack');
+  assert.strictEqual(JSON.stringify(engine.shaders.toJSON()), before.shaders, 'duplicate Post Process identities must not mutate the Shader library');
+  assert.strictEqual(engine.ecs.entities.has('kept'), true);
+  assert.strictEqual(engine.ecs.entities.has('replacement'), false);
+};
+
+const testShaderGraphNodeEvaluation = () => {
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  const unary = (type, parameters) => ({
+    id: `node-${type}`, name: type, version: 1, domain: 'postProcess', outputNodeId: 'output',
+    nodes: [
+      { id: 'scene', type: 'sceneTexture', position: { x: 0, y: 0 }, parameters: {} },
+      { id: 'effect', type, position: { x: 100, y: 0 }, parameters },
+      { id: 'output', type: 'output', position: { x: 200, y: 0 }, parameters: {} }
+    ],
+    links: [
+      { id: 'source-effect', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'effect', port: 'color' } },
+      { id: 'effect-output', from: { nodeId: 'effect', port: 'color' }, to: { nodeId: 'output', port: 'color' } }
+    ]
+  });
+  const evaluate = (type, parameters, input) => {
+    const graph = unary(type, parameters);
+    assert.strictEqual(engine.shaders.compile(graph, { emit: false }).valid, true, `${type} must generate valid GLSL`);
+    return engine.shaders.evaluate(graph, input);
+  };
+
+  let result = evaluate('tint', { color: '#ff0000', amount: 1 }, { color: [0.5, 0.5, 0.5, 1] });
+  assert.deepStrictEqual(result.color, [0.5, 0, 0, 1]);
+  result = evaluate('tint', { color: '#ff000080', amount: 1 }, { color: [0.8, 0.4, 0.2, 0.25] });
+  near(result.color[0], 0.8); near(result.color[1], 0); near(result.color[2], 0);
+  near(result.color[3], 0.25 * 128 / 255);
+  assert.ok(result.color[0] > result.color[3], 'CPU Preview must return straight/unassociated RGBA rather than premultiplied RGB');
+  result = evaluate('grayscale', { amount: 1 }, { color: [1, 0, 0, 0] });
+  near(result.color[0], 0.2126); near(result.color[1], 0.2126); near(result.color[2], 0.2126); near(result.color[3], 0);
+  result = evaluate('brightnessContrast', { brightness: 0.1, contrast: 1 }, { color: [0.2, 0.3, 0.4, 1] });
+  near(result.color[0], 0.3); near(result.color[1], 0.4); near(result.color[2], 0.5);
+  result = evaluate('saturation', { amount: 0 }, { color: [1, 0, 0, 1] });
+  near(result.color[0], 0.2126); near(result.color[1], 0.2126); near(result.color[2], 0.2126);
+  result = evaluate('invert', { amount: 1 }, { color: [0.2, 0.3, 0.4, 0.8] });
+  near(result.color[0], 0.8); near(result.color[1], 0.7); near(result.color[2], 0.6); near(result.color[3], 0.8);
+  result = evaluate('vignette', { intensity: 1, softness: 0.5, radius: 0.75 }, { color: [1, 1, 1, 1], uv: [0, 0] });
+  assert.ok(result.color[0] < 0.01, 'vignette must darken the edge in CPU Preview');
+  result = evaluate('pixelate', { size: 10 }, {
+    color: [0, 0, 0, 1], uv: [0.51, 0.51], resolution: [100, 100], sample: uv => [uv[0], uv[1], 0, 1]
+  });
+  near(result.uv[0], 0.55); near(result.uv[1], 0.55); near(result.color[0], 0.55);
+  result = evaluate('chromaticAberration', { amount: 2 }, {
+    color: [0, 0, 0, 1], uv: [0.5, 0.25], resolution: [100, 100], sample: uv => [uv[0], uv[1], uv[0], 1]
+  });
+  near(result.color[0], 0.52); near(result.color[1], 0.25); near(result.color[2], 0.48);
+
+  const spatialAfterTint = (type, parameters, color) => ({
+    id: `composed-${type}`, name: `Tint then ${type}`, version: 1, domain: 'postProcess', outputNodeId: 'output',
+    nodes: [
+      { id: 'scene', type: 'sceneTexture', position: { x: 0, y: 0 }, parameters: {} },
+      { id: 'tint', type: 'tint', position: { x: 100, y: 0 }, parameters: { color, amount: 1 } },
+      { id: 'spatial', type, position: { x: 200, y: 0 }, parameters },
+      { id: 'output', type: 'output', position: { x: 300, y: 0 }, parameters: {} }
+    ],
+    links: [
+      { id: 'scene-tint', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'tint', port: 'color' } },
+      { id: 'tint-spatial', from: { nodeId: 'tint', port: 'color' }, to: { nodeId: 'spatial', port: 'color' } },
+      { id: 'spatial-output', from: { nodeId: 'spatial', port: 'color' }, to: { nodeId: 'output', port: 'color' } }
+    ]
+  });
+  const pixelatedTint = spatialAfterTint('pixelate', { size: 10 }, '#ff0000');
+  let composed = engine.shaders.compile(pixelatedTint, { emit: false });
+  assert.strictEqual(composed.valid, true);
+  assert.strictEqual((composed.fragmentSource.match(/texture\(uTexture/g) || []).length, 1, 'Pixelate GLSL must resample its upstream sampler rather than bypassing it');
+  result = engine.shaders.evaluate(pixelatedTint, {
+    color: [0, 0, 0, 1], uv: [0.51, 0.51], resolution: [100, 100], sample: uv => [uv[0], uv[1], 0.4, 1]
+  });
+  near(result.color[0], 0.55); near(result.color[1], 0); near(result.color[2], 0);
+
+  const chromaticTint = spatialAfterTint('chromaticAberration', { amount: 2 }, '#00ff00');
+  composed = engine.shaders.compile(chromaticTint, { emit: false });
+  assert.strictEqual(composed.valid, true);
+  assert.strictEqual((composed.fragmentSource.match(/texture\(uTexture/g) || []).length, 1, 'Chromatic GLSL must resample its upstream sampler for every channel');
+  result = engine.shaders.evaluate(chromaticTint, {
+    color: [0, 0, 0, 1], uv: [0.5, 0.25], resolution: [100, 100], sample: uv => [uv[0], uv[1], 0.4, 1]
+  });
+  near(result.color[0], 0); near(result.color[1], 0.25); near(result.color[2], 0);
+
+  const mix = {
+    id: 'mix-node', name: 'Mix', version: 1, domain: 'postProcess', outputNodeId: 'output',
+    nodes: [
+      { id: 'scene', type: 'sceneTexture', position: { x: 0, y: 0 }, parameters: {} },
+      { id: 'invert', type: 'invert', position: { x: 100, y: 80 }, parameters: { amount: 1 } },
+      { id: 'mix', type: 'mix', position: { x: 200, y: 0 }, parameters: { factor: 0.25 } },
+      { id: 'output', type: 'output', position: { x: 300, y: 0 }, parameters: {} }
+    ],
+    links: [
+      { id: 'scene-invert', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'invert', port: 'color' } },
+      { id: 'scene-mix-a', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'mix', port: 'a' } },
+      { id: 'invert-mix-b', from: { nodeId: 'invert', port: 'color' }, to: { nodeId: 'mix', port: 'b' } },
+      { id: 'mix-output', from: { nodeId: 'mix', port: 'color' }, to: { nodeId: 'output', port: 'color' } }
+    ]
+  };
+  result = engine.shaders.evaluate(mix, { color: [0.2, 0.4, 0.6, 1] });
+  near(result.color[0], 0.35); near(result.color[1], 0.45); near(result.color[2], 0.55);
+};
+
+const testShaderGraphDiagnosticsRejectInvalidPlans = () => {
+  const engine = new AH2D.Engine({ physics: 'builtin' });
+  const missingInput = shaderGraphFixture('missing-input');
+  missingInput.links = missingInput.links.filter(link => link.id !== 'scene-gray');
+  let compiled = engine.shaders.compile(missingInput, { emit: false });
+  assert.strictEqual(compiled.valid, false);
+  assert.ok(compiled.diagnostics.some(item => item.code === 'E_SHADER_INPUT_REQUIRED' && item.nodeId === 'gray' && item.port === 'color'));
+
+  const missingMixPort = shaderGraphFixture('missing-mix');
+  missingMixPort.nodes[1] = { id: 'blend', type: 'mix', position: { x: 280, y: 100 }, parameters: { factor: 0.5 } };
+  missingMixPort.links = [
+    { id: 'scene-blend-a', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'blend', port: 'a' } },
+    { id: 'blend-output', from: { nodeId: 'blend', port: 'color' }, to: { nodeId: 'output', port: 'color' } }
+  ];
+  compiled = engine.shaders.compile(missingMixPort, { emit: false });
+  assert.ok(compiled.diagnostics.some(item => item.code === 'E_SHADER_INPUT_REQUIRED' && item.nodeId === 'blend' && item.port === 'b'));
+
+  const multipleOutputs = shaderGraphFixture('multiple-outputs');
+  multipleOutputs.nodes.push({ id: 'output-2', type: 'output', position: { x: 500, y: 250 }, parameters: {} });
+  compiled = engine.shaders.compile(multipleOutputs, { emit: false });
+  assert.ok(compiled.diagnostics.some(item => item.code === 'E_SHADER_OUTPUT_COUNT' && item.count === 2));
+
+  const duplicateLink = shaderGraphFixture('duplicate-link');
+  duplicateLink.links[1].id = duplicateLink.links[0].id;
+  compiled = engine.shaders.compile(duplicateLink, { emit: false });
+  assert.ok(compiled.diagnostics.some(item => item.code === 'E_SHADER_LINK_ID_DUPLICATE'));
+
+  const dangling = shaderGraphFixture('dangling');
+  dangling.links[1].from.nodeId = 'missing-node';
+  compiled = engine.shaders.compile(dangling, { emit: false });
+  assert.strictEqual(compiled.valid, false);
+  assert.ok(compiled.diagnostics.some(item => item.code === 'E_SHADER_LINK_DANGLING'));
+  assert.strictEqual(compiled.fragmentSource, '');
+  assert.throws(
+    () => engine.shaders.compile(dangling, { emit: false, throwOnError: true }),
+    error => error instanceof AH2D.ShaderGraphCompileError && error.code === 'E_SHADER_LINK_DANGLING'
+  );
+
+  engine.shaders.load([shaderGraphFixture('parameter-guards', 0.3)], { emit: false });
+  assert.throws(
+    () => engine.shaders.setNodeParameters('parameter-guards', 'gray', { amount: 4 }),
+    error => error instanceof AH2D.ShaderGraphCompileError && error.code === 'E_SHADER_PARAMETER_RANGE'
+  );
+  assert.strictEqual(engine.shaders.get('parameter-guards').nodes.find(node => node.id === 'gray').parameters.amount, 0.3, 'a rejected parameter edit must roll back atomically');
+  compiled = engine.shaders.compile('parameter-guards', { emit: false, parameters: { gray: { amount: 'invalid' } } });
+  assert.ok(compiled.diagnostics.some(item => item.code === 'E_SHADER_PARAMETER_OVERRIDE_TYPE'));
+
+  const tintGuards = shaderGraphFixture('tint-guards');
+  const tintNode = tintGuards.nodes.find(node => node.id === 'gray');
+  tintNode.type = 'tint';
+  tintNode.parameters = { color: '#8fb7ff', amount: 0.5 };
+  engine.shaders.load([tintGuards], { emit: false });
+  assert.throws(
+    () => engine.shaders.setNodeParameters('tint-guards', 'gray', { color: 'not-a-color' }),
+    error => error instanceof AH2D.ShaderGraphCompileError && error.code === 'E_SHADER_PARAMETER_VALUE'
+  );
+  assert.strictEqual(engine.shaders.get('tint-guards').nodes.find(node => node.id === 'gray').parameters.color, '#8fb7ff', 'an invalid Tint edit must roll back atomically');
+  compiled = engine.shaders.compile('tint-guards', { emit: false, parameters: { gray: { color: 'rgb(1, 2, 3)' } } });
+  assert.ok(compiled.diagnostics.some(item => item.code === 'E_SHADER_PARAMETER_OVERRIDE_VALUE'));
+
+  const cyclic = shaderGraphFixture('cycle');
+  cyclic.nodes.splice(1, 0, { id: 'invert', type: 'invert', position: { x: 380, y: 180 }, parameters: { amount: 1 } });
+  cyclic.links = [
+    { id: 'gray-invert', from: { nodeId: 'gray', port: 'color' }, to: { nodeId: 'invert', port: 'color' } },
+    { id: 'invert-gray', from: { nodeId: 'invert', port: 'color' }, to: { nodeId: 'gray', port: 'color' } },
+    { id: 'invert-output', from: { nodeId: 'invert', port: 'color' }, to: { nodeId: 'output', port: 'color' } }
+  ];
+  compiled = engine.shaders.compile(cyclic, { emit: false });
+  assert.strictEqual(compiled.valid, false);
+  assert.ok(compiled.diagnostics.some(item => item.code === 'E_SHADER_GRAPH_CYCLE'));
+
+  const disconnectedCycle = shaderGraphFixture('disconnected-cycle');
+  disconnectedCycle.nodes.push(
+    { id: 'draft-a', type: 'tint', position: { x: 100, y: 300 }, parameters: { color: '#ffffff', amount: 1 } },
+    { id: 'draft-b', type: 'invert', position: { x: 300, y: 300 }, parameters: { amount: 1 } }
+  );
+  disconnectedCycle.links.push(
+    { id: 'draft-a-b', from: { nodeId: 'draft-a', port: 'color' }, to: { nodeId: 'draft-b', port: 'color' } },
+    { id: 'draft-b-a', from: { nodeId: 'draft-b', port: 'color' }, to: { nodeId: 'draft-a', port: 'color' } }
+  );
+  compiled = engine.shaders.compile(disconnectedCycle, { emit: false });
+  assert.strictEqual(compiled.valid, true, 'a disconnected WIP cycle must not invalidate the executable Output chain');
+  assert.deepStrictEqual(compiled.order, ['scene', 'gray', 'output']);
+  assert.ok(!compiled.diagnostics.some(item => item.code === 'E_SHADER_GRAPH_CYCLE'));
+
+  const unknown = shaderGraphFixture('unknown');
+  unknown.nodes[1].type = 'gameSpecificFutureNode';
+  engine.shaders.load([unknown], { emit: false });
+  assert.strictEqual(engine.shaders.get('unknown').nodes[1].type, 'gameSpecificFutureNode', 'unsupported future nodes remain lossless');
+  assert.ok(engine.shaders.getDiagnostics('unknown').some(item => item.code === 'E_SHADER_NODE_TYPE'));
+  const fallback = engine.shaders.evaluate('unknown', { color: [0.2, 0.3, 0.4, 1] });
+  assert.deepStrictEqual(fallback.color, [0.2, 0.3, 0.4, 1]);
+  assert.strictEqual(fallback.valid, false);
 };
 
 const testGravityAndSchemaSync = () => {
@@ -2204,6 +2572,35 @@ const createFakePixi = ({ asyncInit = false, initDeferred = null, assetDeferred 
     }
     destroy() { this.destroyed = true; this.geometry?.destroy?.(); }
   }
+  class Filter {
+    constructor(optionsOrVertex = {}, fragment = '', uniforms = {}) {
+      this.enabled = true;
+      this.destroyCount = 0;
+      if (typeof optionsOrVertex === 'string') {
+        this.vertexSource = optionsOrVertex;
+        this.fragmentSource = fragment;
+        this.uniforms = { ...uniforms };
+        this.resources = {};
+      } else {
+        this.options = optionsOrVertex;
+        this.vertexSource = optionsOrVertex.gl?.vertex || optionsOrVertex.glProgram?.vertex || '';
+        this.fragmentSource = optionsOrVertex.gl?.fragment || optionsOrVertex.glProgram?.fragment || '';
+        this.resources = {};
+        for (const [groupName, entries] of Object.entries(optionsOrVertex.resources || {})) {
+          this.resources[groupName] = {
+            uniforms: Object.fromEntries(Object.entries(entries).map(([name, metadata]) => [name,
+              Array.isArray(metadata?.value) || ArrayBuffer.isView(metadata?.value)
+                ? new Float32Array(metadata.value)
+                : metadata?.value
+            ])),
+            update() { this.updateCount = (this.updateCount || 0) + 1; }
+          };
+        }
+      }
+    }
+    static from(options) { return new Filter(options); }
+    destroy() { this.destroyed = true; this.destroyCount += 1; }
+  }
   const setupApplication = (app, options = {}) => {
     app.stage = new Container();
     app.canvas = { nodeName: 'CANVAS', parentNode: null };
@@ -2253,7 +2650,7 @@ const createFakePixi = ({ asyncInit = false, initDeferred = null, assetDeferred 
       return assetDeferred ? assetDeferred.promise : Promise.resolve({ id: String(source) });
     }
   };
-  return { Application, Container, Sprite, Graphics, Mesh, MeshGeometry, Matrix, Rectangle, Texture, Assets, applications, assetLoads };
+  return { Application, Container, Sprite, Graphics, Mesh, MeshGeometry, Matrix, Rectangle, Texture, Filter, Assets, applications, assetLoads };
 };
 
 const fakeHost = (width = 960, height = 600) => ({
@@ -2317,6 +2714,7 @@ const testPixiV8AsyncMountAndNativeScene = async () => {
   assert.strictEqual(app.initOptions.width, 640);
   assert.strictEqual(app.initOptions.height, 360);
   assert.strictEqual(host.children.length, 0, 'the canvas must not mount until Application.init resolves');
+  assert.strictEqual(runtime.postProcessRoot, null);
   assert.strictEqual(runtime.world, null);
 
   initDeferred.resolve();
@@ -2325,8 +2723,14 @@ const testPixiV8AsyncMountAndNativeScene = async () => {
 
   assert.strictEqual(runtime.backend, 'pixijs');
   assert.strictEqual(runtime.native, true);
+  assert.ok(runtime.postProcessRoot instanceof PIXI.Container, 'Post Process must own a stable viewport-space root');
   assert.ok(runtime.world instanceof PIXI.Container, 'the native world must be a real PIXI.Container');
-  assert.strictEqual(app.stage.children[0], runtime.world);
+  assert.strictEqual(app.stage.children[0], runtime.postProcessRoot);
+  assert.strictEqual(runtime.world.parent, runtime.postProcessRoot);
+  assert.deepStrictEqual(
+    { x: runtime.postProcessRoot.filterArea.x, y: runtime.postProcessRoot.filterArea.y, width: runtime.postProcessRoot.filterArea.width, height: runtime.postProcessRoot.filterArea.height },
+    { x: 0, y: 0, width: 640, height: 360 }
+  );
   assert.strictEqual(host.children[0], app.canvas, 'the v8 canvas must mount in the supplied host');
   assert.strictEqual(app.stopped, true, 'Application ticker must remain stopped');
   assert.strictEqual(app.ticker.stopped, true, 'the native ticker must remain stopped');
@@ -2494,6 +2898,194 @@ const testPixiSourceRectSubtextures = () => {
   runtime.render();
   assert.strictEqual(record.visual.texture, baseTexture);
   assert.strictEqual(secondTexture.destroyed, true);
+  engine.stop({ restore: false });
+};
+
+const testPixiPostProcessGraphFiltersAndLifecycle = () => {
+  const PIXI = createFakePixi();
+  const graph = shaderGraphFixture('pixi-grade', 0.25);
+  const engine = new AH2D.Engine({ runtime: 'pixijs', runtimeOptions: { PIXI }, physics: 'builtin' });
+  engine.load({
+    format: 'AH2D', version: 4, shaderGraphs: [graph],
+    scene: [{ id: 'filtered-shape', components: { Renderable: { width: 20, height: 20, color: '#336699' } } }],
+    postProcess: { enabled: true, effects: [
+      { id: 'pixels', type: 'pixelate', enabled: true, size: 5 },
+      { id: 'graph-filter', type: 'shaderGraph', graphId: graph.id, enabled: true }
+    ] }
+  });
+  const postProcessErrors = [];
+  engine.events.on('runtime:postProcessError', event => postProcessErrors.push(event));
+  engine.start(fakeHost(), { restoreOnStop: false });
+  const runtime = engine.runtime;
+  const viewportRoot = runtime.postProcessRoot;
+  const world = runtime.world;
+  assert.strictEqual(runtime.postProcessRoot.filters.length, 2, 'Pixi must apply built-in and graph Effects to the stable viewport Container');
+  assert.ok(runtime.postProcessRoot.filters.every(filter => filter instanceof PIXI.Filter));
+  assert.strictEqual(runtime.postProcessFilters.size, 2);
+  const builtinFilter = runtime.postProcessRoot.filters[0];
+  const graphFilter = runtime.postProcessRoot.filters[1];
+  assert.ok(builtinFilter.fragmentSource.includes('floor'));
+  assert.ok(graphFilter.fragmentSource.includes('0.2126'));
+
+  runtime.render();
+  assert.strictEqual(runtime.postProcessRoot.filters[0], builtinFilter, 'an unchanged Post Process frame must reuse the native built-in Filter');
+  assert.strictEqual(runtime.postProcessRoot.filters[1], graphFilter, 'an unchanged Post Process frame must reuse the native graph Filter');
+
+  engine.postProcess.effects.reverse();
+  runtime.render();
+  assert.deepStrictEqual(runtime.postProcessRoot.filters, [graphFilter, builtinFilter], 'stable Effect ids must reuse Filters while stack order changes');
+  engine.postProcess.effects.reverse();
+  runtime.render();
+
+  engine.postProcess.configure('pixels', { size: 9 });
+  engine.shaders.setNodeParameters(graph.id, 'gray', { amount: 0.8 });
+  runtime.render();
+  assert.strictEqual(runtime.postProcessRoot.filters[0], builtinFilter, 'uniform-only built-in edits must not rebuild its Filter');
+  assert.strictEqual(runtime.postProcessRoot.filters[1], graphFilter, 'uniform-only graph edits must not rebuild its Filter');
+  const builtinUniform = Object.entries(engine.postProcess.resolve('pixels').compiled.uniforms).find(([, metadata]) => metadata.parameter === 'size')[0];
+  const graphUniform = Object.entries(engine.shaders.compile(graph.id, { emit: false }).uniforms).find(([, metadata]) => metadata.nodeId === 'gray' && metadata.parameter === 'amount')[0];
+  assert.strictEqual(builtinFilter.resources.ah2dUniforms.uniforms[builtinUniform], 9);
+  assert.strictEqual(graphFilter.resources.ah2dUniforms.uniforms[graphUniform], 0.8);
+
+  engine.postProcess.configure('graph-filter', { graphId: 'missing-runtime-graph' });
+  runtime.render();
+  assert.deepStrictEqual(runtime.postProcessRoot.filters, [builtinFilter], 'one invalid Effect must not remove a valid neighboring filter');
+  assert.strictEqual(builtinFilter.destroyed, undefined, 'failure isolation must keep a valid reusable filter alive');
+  assert.strictEqual(graphFilter.destroyCount, 1, 'an Effect that becomes invalid must release its stale native filter');
+  assert.strictEqual(postProcessErrors.at(-1).code, 'E_SHADER_GRAPH_MISSING');
+  engine.postProcess.configure('graph-filter', { graphId: graph.id });
+  runtime.render();
+  const restoredGraphFilter = runtime.postProcessRoot.filters[1];
+  assert.notStrictEqual(restoredGraphFilter, graphFilter);
+  assert.strictEqual(runtime.postProcessRoot.filters[0], builtinFilter, 'recovering a failed Effect must still reuse unaffected filters');
+
+  engine.postProcess.configure('graph-filter', { enabled: false });
+  runtime.render();
+  assert.deepStrictEqual(runtime.postProcessRoot.filters, [builtinFilter]);
+  assert.strictEqual(restoredGraphFilter.destroyed, true, 'a disabled graph Effect must destroy its owned native Filter');
+  assert.strictEqual(restoredGraphFilter.destroyCount, 1);
+
+  engine.postProcess.enabled = false;
+  runtime.render();
+  assert.deepStrictEqual(runtime.postProcessRoot.filters, [], 'a disabled stack must remove every native Filter');
+  assert.strictEqual(builtinFilter.destroyed, true);
+  assert.strictEqual(builtinFilter.destroyCount, 1);
+  assert.strictEqual(runtime.postProcessFilters.size, 0);
+
+  engine.postProcess.enabled = true;
+  engine.postProcess.configure('pixels', { enabled: true });
+  runtime.render();
+  const replacement = runtime.postProcessRoot.filters[0];
+  assert.notStrictEqual(replacement, builtinFilter);
+  engine.stop({ restore: false });
+  assert.strictEqual(replacement.destroyed, true, 'unmount must destroy the remaining Post Process Filter');
+  assert.strictEqual(replacement.destroyCount, 1);
+  assert.strictEqual(viewportRoot.destroyed, true, 'unmount must destroy the viewport Post Process root');
+  assert.strictEqual(world.destroyed, true, 'unmount must destroy the nested world');
+  assert.strictEqual(runtime.postProcessRoot, null);
+  assert.strictEqual(runtime.world, null);
+};
+
+const testPixiBloomNestedPaddingUpdatesWithoutRebuild = () => {
+  const PIXI = createFakePixi();
+  const engine = new AH2D.Engine({ runtime: 'pixijs', runtimeOptions: { PIXI, resizeTo: false }, physics: 'builtin' });
+  engine.load({
+    format: 'AH2D', version: 4,
+    scene: [{
+      id: 'viewport-camera',
+      components: {
+        Transform: { x: 100, y: 50, rotation: 0, scaleX: 1, scaleY: 1 },
+        Camera: { active: true, zoom: 1, viewportWidth: 320, viewportHeight: 180 }
+      }
+    }],
+    postProcess: { enabled: true, effects: [
+      {
+        id: 'bloom-pass', type: 'bloom', enabled: true,
+        parameters: { intensity: 0.2, radius: 7, threshold: 0.75 }
+      },
+      {
+        id: 'grade-after-bloom', type: 'colorAdjust', enabled: true,
+        parameters: { brightness: 1, contrast: 1, saturation: 1, hue: 0 }
+      }
+    ] }
+  });
+  const errors = [], fallbacks = [];
+  engine.events.on('runtime:postProcessError', event => errors.push(event));
+  engine.events.on('runtime:postProcessFallback', event => fallbacks.push(event));
+  engine.start(fakeHost(), { restoreOnStop: false });
+  const runtime = engine.runtime;
+  const viewportRoot = runtime.postProcessRoot;
+  const viewportArea = viewportRoot.filterArea;
+  const filter = viewportRoot.filters[0];
+  const straightRgbFilter = viewportRoot.filters[1];
+  assert.deepStrictEqual(viewportRoot.localMatrix, [1, 0, 0, 1, 0, 0], 'the Post Process root must remain in viewport coordinates');
+  assert.notDeepStrictEqual(runtime.world.localMatrix, [1, 0, 0, 1, 0, 0], 'only the world must receive the active Camera transform');
+  assert.deepStrictEqual(
+    { x: viewportArea.x, y: viewportArea.y, width: viewportArea.width, height: viewportArea.height },
+    { x: 0, y: 0, width: 960, height: 600 },
+    'the filter area must cover the full renderer viewport instead of transformed world bounds'
+  );
+  assert.ok(filter.fragmentSource.includes('vec4 glow=b*strength'));
+  assert.ok(filter.fragmentSource.includes('float outAlpha='));
+  assert.ok(straightRgbFilter.fragmentSource.includes('c.a>0.000001?c.rgb/c.a:vec3(0.0)'), 'a straight-RGB pass after Bloom must safely consume its PMA output');
+  assert.strictEqual(filter.padding, 7, 'Bloom padding must read the canonical nested parameter form');
+  engine.postProcess.configure('bloom-pass', {
+    parameters: { intensity: 0.2, radius: 19, threshold: 0.75 }
+  });
+  runtime.render();
+  assert.strictEqual(viewportRoot.filters[0], filter, 'a Bloom radius edit must reuse the compiled native Filter');
+  assert.strictEqual(viewportRoot.filters[1], straightRgbFilter, 'a neighboring pass must remain reusable while Bloom changes');
+  assert.strictEqual(filter.padding, 19, 'cached Bloom Filter padding must update with its live radius');
+  const radiusUniform = Object.entries(engine.postProcess.resolve('bloom-pass').compiled.uniforms)
+    .find(([, metadata]) => metadata.parameter === 'radius')[0];
+  assert.strictEqual(filter.resources.ah2dUniforms.uniforms[radiusUniform], 19);
+  runtime.resize(1280, 720);
+  assert.strictEqual(runtime.postProcessRoot, viewportRoot, 'renderer resize must preserve the stable Post Process root');
+  assert.strictEqual(viewportRoot.filterArea, viewportArea, 'renderer resize must update rather than replace the viewport bounds object');
+  assert.deepStrictEqual(
+    { x: viewportArea.x, y: viewportArea.y, width: viewportArea.width, height: viewportArea.height },
+    { x: 0, y: 0, width: 1280, height: 720 }
+  );
+  assert.deepStrictEqual(viewportRoot.localMatrix, [1, 0, 0, 1, 0, 0]);
+  assert.notDeepStrictEqual(runtime.world.localMatrix, [1, 0, 0, 1, 0, 0]);
+  assert.strictEqual(viewportRoot.filters[0], filter, 'resize must not rebuild Bloom');
+  assert.strictEqual(viewportRoot.filters[1], straightRgbFilter, 'resize must not rebuild following filters');
+  runtime.app.renderer.type = 2;
+  const rendersBeforeFallback = runtime.app.renderCount;
+  assert.strictEqual(runtime.render(), true, 'a WebGPU-only filter fallback must not stop native scene rendering');
+  assert.strictEqual(runtime.app.renderCount, rendersBeforeFallback + 1);
+  assert.deepStrictEqual(runtime.postProcessRoot.filters, []);
+  assert.strictEqual(filter.destroyCount, 1);
+  assert.strictEqual(straightRgbFilter.destroyCount, 1);
+  assert.strictEqual(errors[0].code, 'E_PIXI_FILTER_RENDERER_UNSUPPORTED');
+  assert.strictEqual(fallbacks[0].fallback, 'effect-skipped');
+  engine.stop({ restore: false });
+  assert.strictEqual(filter.destroyed, true);
+  assert.strictEqual(runtime.postProcessRoot, null);
+};
+
+const testPixiPostProcessFallbackDoesNotBreakScene = () => {
+  const PIXI = createFakePixi();
+  delete PIXI.Filter;
+  const engine = new AH2D.Engine({ runtime: 'pixijs', runtimeOptions: { PIXI }, physics: 'builtin' });
+  engine.load({
+    format: 'AH2D', version: 4,
+    scene: [{ id: 'still-rendered', components: { Renderable: { width: 10, height: 10, color: '#fff' } } }],
+    postProcess: { enabled: true, effects: [{ id: 'pixels', type: 'pixelate', enabled: true, size: 3 }] }
+  });
+  const errors = [], fallbacks = [];
+  engine.events.on('runtime:postProcessError', event => errors.push(event));
+  engine.events.on('runtime:postProcessFallback', event => fallbacks.push(event));
+  engine.start(fakeHost(), { restoreOnStop: false });
+  assert.strictEqual(engine.runtime.backend, 'pixijs', 'an unavailable Effect API must not discard the working Pixi scene renderer');
+  assert.ok(engine.runtime.nodes.get('still-rendered').visual instanceof PIXI.Graphics);
+  assert.deepStrictEqual(engine.runtime.postProcessRoot.filters, []);
+  assert.strictEqual(errors.length, 1);
+  assert.strictEqual(fallbacks.length, 1);
+  assert.strictEqual(errors[0].code, 'E_PIXI_FILTER_UNAVAILABLE');
+  assert.strictEqual(errors[0].fallback, 'effect-skipped');
+  engine.runtime.render();
+  assert.strictEqual(errors.length, 1, 'the same unsupported Effect must not flood error events every frame');
   engine.stop({ restore: false });
 };
 
@@ -4106,6 +4698,10 @@ const run = async () => {
   testLoadCommitSurvivesCollisionEndListener();
   testLoadCommitSurvivesEntityCreateListener();
   testPostProcessProjectContract();
+  testShaderGraphCompilationEvaluationAndSnapshots();
+  testPostProcessEffectIdentityIsAtomic();
+  testShaderGraphNodeEvaluation();
+  testShaderGraphDiagnosticsRejectInvalidPlans();
   testGravityAndSchemaSync();
   testStaticCollisionAndSleeping();
   testWideGroundBoxContact();
@@ -4126,6 +4722,9 @@ const run = async () => {
   await testPixiV8AsyncMountAndNativeScene();
   await testPixiRuntimeMutationsAndAssetStaleness();
   testPixiSourceRectSubtextures();
+  testPixiPostProcessGraphFiltersAndLifecycle();
+  testPixiBloomNestedPaddingUpdatesWithoutRebuild();
+  testPixiPostProcessFallbackDoesNotBreakScene();
   await testPixiParticleGraphicsSpritesAndCleanup();
   testPixiLiveChildrenSurviveParentDeletion();
   await testPixiStopWhileInitializationPending();

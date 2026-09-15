@@ -6,7 +6,7 @@ This document is the operational guide for an Agent building a game with AH2D Ed
 
 An Agent may work in four distinct layers:
 
-1. **Authoring data** — Universal AH2D Project JSON, scenes, entities, components, assets, prefabs, animations, and particles.
+1. **Authoring data** — Universal AH2D Project JSON, scenes, entities, components, assets, prefabs, animations, particles, Shader Graphs, and Post Process.
 2. **Reusable engine code** — framework-neutral behavior in `engine/AH2DEngine.js`.
 3. **Game code** — controllers, rules, UI, renderer mappings, content loading, and tests in the game project.
 4. **Studio services** — the open local-trusted Next.js project APIs, comments, history, presence, and the Editor bridge under `src/`.
@@ -31,6 +31,7 @@ Keep Studio attribution and collaboration concerns outside the framework-neutral
 - Use the `authoring` schema profile for persisted project data, `runtime` for Engine/system values, and `snapshot` only for active ECS exports. Authoring normalization removes registered runtime-derived fields while preserving unknown JSON extensions.
 - Compatibility validation may accept legacy numeric/boolean strings without coercing them; runtime decoding remains strict. Normalize authored scalar types before Engine load, and use `--strict` in CI.
 - Top-level `postProcess` is project authoring data. Preserve effect IDs, unknown effect types, ordering, and unknown parameters unless the task explicitly changes them.
+- Top-level `shaderGraphs[]` is project authoring data. Graph, Node, Link, and referenced Effect IDs are stable identity. Preserve ordering and unknown graph/node/link/endpoint/parameter fields; read [`docs/SHADERS.md`](./docs/SHADERS.md) before extending this contract or a renderer mapping.
 - A CLI-managed file uses a SHA-256 precondition (`--expect-sha256`). A Studio-managed project uses a numeric document `revision` (`expectedRevision`). These are separate concurrency domains and must not be substituted for one another.
 
 ## Required discovery before editing
@@ -191,7 +192,7 @@ The development collaboration store, event hub, and presence are single-process 
 
 ## Post Process workflow
 
-New projects contain six editable defaults: Bloom, Vignette, Color Adjust, Chromatic Aberration, Pixelate, and CRT. The Editor saves them at top-level `postProcess`; the Engine exposes the same data through `engine.postProcess`.
+New projects contain six editable defaults: Bloom, Vignette, Color Adjust, Chromatic Aberration, Pixelate, and CRT. The Editor saves them at top-level `postProcess`; Node-Based post-process graphs live independently in top-level `shaderGraphs[]`. An Effect of type `shaderGraph` references its Graph by stable `graphId` and must not embed a copied graph.
 
 Runtime-side use:
 
@@ -200,11 +201,15 @@ engine.load(project);
 engine.postProcess.configure('bloom', { enabled: true, intensity: 0.45 });
 engine.postProcess.configure('colorAdjust', { saturation: 1.15 });
 
-const activeEffects = engine.postProcess.active;
+const graph = engine.shaders.compile('cinematic-grade');
+const activeEffects = engine.postProcess.resolvedActive;
 project.postProcess = engine.postProcess.toJSON();
+project.shaderGraphs = engine.shaders.toJSON();
 ```
 
-The Engine stores and normalizes the stack but a PixiJS, PhaserJS, or Custom host must map `activeEffects` to renderer-native filters/shaders. Do not claim a renderer applies a filter merely because it appears in `active`.
+The Engine normalizes and compiles the graph, validates typed ports, rejects cycles/ambiguous inputs, and emits diagnostics. PixiJS maps active built-in and compiled graph effects to reusable native Filters and synchronizes uniforms on its WebGL renderer; WebGPU/Canvas currently use the documented effect-skipped fallback. PhaserJS and Custom hosts must map `resolvedActive` to renderer-native filters/shaders. Do not claim those hosts apply a filter merely because it appears in `active`.
+
+Use `resource list|get|put|delete ... shader` for lossless CLI access. Discover the exact graph schema with `schema show --name shaderGraph`; do not hand-rewrite a Universal Project or persist compiled GPU resources. For the full node/port contract and renderer boundaries, read [`docs/SHADERS.md`](./docs/SHADERS.md).
 
 For a CLI-managed project, patch Post Process with the standard safe hash workflow:
 
@@ -450,18 +455,18 @@ Use `designWidth`/`designHeight` or `viewport: { width, height, fit }` for the l
 
 If PixiJS is unavailable or initialization fails, `runtime.backend` reports `editor-bridge` and `runtime.native` is false. Do not claim native rendering based only on `runtime.name`. Handle `runtime:error`, `runtime:fallback`, and `runtime:textureError` when the host needs error UI or recovery.
 
-PixiJS currently maps Transform, Renderable, Skin mesh, ParticleEmitter visuals, Hidden, hierarchy, Camera, and resize. Particle visuals may be texture-backed through `appearance.assetId` or graphics-backed; the adapter owns their display lifecycle, not shared Asset textures. When `Renderable.sourceRect` is present, the adapter creates and reuses a cropped Pixi subtexture for that rectangle. A bare `Renderable.frame` number is not enough to derive a crop without sprite-sheet metadata supplied by the Asset or host. Light/Shadow, Tilemap drawing, and Post Process filters remain host responsibilities.
+PixiJS currently maps Transform, Renderable, Skin mesh, ParticleEmitter visuals, Hidden, hierarchy, Camera, resize, and built-in/Shader Graph Post Process filters. Particle visuals may be texture-backed through `appearance.assetId` or graphics-backed; the adapter owns their display lifecycle, not shared Asset textures. When `Renderable.sourceRect` is present, the adapter creates and reuses a cropped Pixi subtexture for that rectangle. A bare `Renderable.frame` number is not enough to derive a crop without sprite-sheet metadata supplied by the Asset or host. Light/Shadow and Tilemap drawing remain host responsibilities.
 
 ### PhaserJS
 
-Phaser remains host-owned. Selecting `phaserjs` reports native availability when `Phaser.Game` exists, but the project must create and cache Game Objects, synchronize ECS Transform/Renderable state (including sprite frame/rectangle data), remove stale objects, and apply Camera, Light, Shadow, Particle, Tilemap, and Post Process rendering. The built-in AnimationSystem still evaluates and applies its tracks before that host synchronization.
+Phaser remains host-owned. Selecting `phaserjs` reports native availability when `Phaser.Game` exists, but the project must create and cache Game Objects, synchronize ECS Transform/Renderable state (including sprite frame/rectangle data), remove stale objects, and apply Camera, Light, Shadow, Particle, Tilemap, and Post Process rendering from `engine.postProcess.resolvedActive`. The built-in AnimationSystem still evaluates and applies its tracks before that host synchronization.
 
 ```js
 engine.useRuntime('phaserjs', { Phaser: window.Phaser });
 console.log(engine.runtime.backend); // phaserjs or editor-bridge
 ```
 
-## Animation, prefab, and particle rules
+## Animation, prefab, particle, and shader rules
 
 - The built-in AnimationSystem advances each bound clip, samples/interpolates its tracks, applies Position and Rotation to local `Transform`, applies Sprite values to `Renderable`, stores sampled Hitbox state on `Animation`, and dispatches Event Track entries through the Engine event bus.
 - Bone Tracks write local Bone transforms; IK Tracks write the target Transform and constraint settings. Runtime order is Animation, Transform/FK, CCD IK, Transform, Physics, final Transform, then linear-blend Skinning.
@@ -483,6 +488,9 @@ console.log(engine.runtime.backend); // phaserjs or editor-bridge
 - `ParticleEmitter.particles`, `emissionAccumulator`, `completed`, and `rngState` are derived Runtime state. Persist with the authoring profile so they never enter the Universal Project or standalone Particle Asset export.
 - Per-emitter `seed`, fixed-step emission, burst boundaries, capacity, and snapshot/restore are deterministic contracts. Gameplay must not consume a global random stream that makes one emitter depend on another.
 - PixiJS renders particles natively. PhaserJS and Custom hosts must map the same `ParticleEmitter.particles` Runtime state without modifying the authored Asset.
+- Shader Graphs use stable Graph/Node/Link IDs and typed color ports. The current executable domain is `postProcess`; one Output owns the result, inputs have at most one incoming Link, and the reachable graph must be acyclic.
+- Use `engine.shaders`/`engine.shaderGraphs` for graph load, compile, diagnostics, evaluation, and mutation. `Transform`, ECS snapshots, and renderer objects are unrelated to graph layout coordinates.
+- PixiJS WebGL owns reusable Filter instances and uniform synchronization for active compiled effects. PhaserJS/Custom consume `engine.postProcess.resolvedActive`; compiled programs, textures, GPU handles, and Filter objects remain Runtime-only Maps.
 - Do not invent missing fields during a read-only task. When a requested feature requires a schema extension, update validation, migration, Editor export/load, CLI, runtime consumption, tests, and docs together.
 
 ## Runtime and headless testing
@@ -555,6 +563,7 @@ A game-development task is complete only when all applicable items are true:
 - Component storage provenance, `components.*` precedence, legacy copies, and unknown custom components are preserved unless explicit migration requirements say otherwise.
 - `scene` mirrors the active Scene.
 - Post Process effect IDs, ordering, custom parameters, and project-specific values are preserved.
+- Shader Graph IDs, Node/Link identity, typed connectivity, project references, and unknown extensions are validated and preserved.
 - Dry-run was reviewed before material project writes.
 - Final writes used `--expect-sha256` when working concurrently.
 - Studio document writes used the latest `expectedRevision` and an idempotent `clientMutationId`.

@@ -18,6 +18,12 @@
   const ANIMATION_TRACK_TYPES = Object.freeze(['sprite', 'position', 'rotation', 'event', 'hitbox', 'bone', 'ik']);
   const PARTICLE_CURVE_PROPERTIES = Object.freeze(['emission', 'scale', 'speed', 'opacity', 'hue']);
   const PARTICLE_CURVE_INTERPOLATIONS = Object.freeze(['linear', 'step', 'cubic']);
+  const SHADER_NODE_TYPES = Object.freeze([
+    'sceneTexture', 'output', 'tint', 'grayscale', 'brightnessContrast',
+    'saturation', 'invert', 'vignette', 'pixelate', 'chromaticAberration', 'mix'
+  ]);
+  const SHADER_VALUE_TYPES = Object.freeze(['color']);
+  const SHADER_HEX_COLOR_PATTERN = '^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$';
   const PROFILE_NAMES = Object.freeze(Object.values(PROFILES));
   const COMPONENT_NAME_PATTERN = '^[A-Z][A-Za-z0-9]*$';
   const COMPONENT_NAME_RE = new RegExp(COMPONENT_NAME_PATTERN);
@@ -563,6 +569,93 @@
     }, { required: ['color', 'blend', 'baseScale', 'baseOpacity', 'baseHue'] }),
     curves: { type: 'array', items: PARTICLE_CURVE_SCHEMA }
   }, { required: ['id', 'name', 'duration', 'loop', 'maxParticles', 'emission', 'lifetime', 'velocity', 'shape', 'appearance', 'curves'] });
+  const SHADER_NODE_DEFINITIONS = {
+    sceneTexture: {
+      inputs: {}, outputs: { color: 'color' }, parameters: {}
+    },
+    output: {
+      inputs: { color: 'color' }, outputs: {}, parameters: {}
+    },
+    tint: {
+      inputs: { color: 'color' }, outputs: { color: 'color' },
+      parameters: { color: { type: 'string', pattern: SHADER_HEX_COLOR_PATTERN, default: '#ffffff' }, amount: { type: 'number', default: 1, minimum: 0, maximum: 1 } }
+    },
+    grayscale: {
+      inputs: { color: 'color' }, outputs: { color: 'color' },
+      parameters: { amount: { type: 'number', default: 1, minimum: 0, maximum: 1 } }
+    },
+    brightnessContrast: {
+      inputs: { color: 'color' }, outputs: { color: 'color' },
+      parameters: {
+        brightness: { type: 'number', default: 0, minimum: -1, maximum: 1 },
+        contrast: { type: 'number', default: 1, minimum: 0, maximum: 2 }
+      }
+    },
+    saturation: {
+      inputs: { color: 'color' }, outputs: { color: 'color' },
+      parameters: { amount: { type: 'number', default: 1, minimum: 0, maximum: 2 } }
+    },
+    invert: {
+      inputs: { color: 'color' }, outputs: { color: 'color' },
+      parameters: { amount: { type: 'number', default: 1, minimum: 0, maximum: 1 } }
+    },
+    vignette: {
+      inputs: { color: 'color' }, outputs: { color: 'color' },
+      parameters: {
+        intensity: { type: 'number', default: 0.35, minimum: 0, maximum: 1 },
+        radius: { type: 'number', default: 0.75, minimum: 0, maximum: 1 },
+        softness: { type: 'number', default: 0.5, minimum: 0, maximum: 1 }
+      }
+    },
+    pixelate: {
+      inputs: { color: 'color' }, outputs: { color: 'color' },
+      parameters: { size: { type: 'number', default: 4, minimum: 1 } }
+    },
+    chromaticAberration: {
+      inputs: { color: 'color' }, outputs: { color: 'color' },
+      parameters: { amount: { type: 'number', default: 2, minimum: 0 } }
+    },
+    mix: {
+      inputs: { a: 'color', b: 'color' }, outputs: { color: 'color' },
+      parameters: { factor: { type: 'number', default: 0.5, minimum: 0, maximum: 1 } }
+    }
+  };
+  const SHADER_PORT_SCHEMA = object({
+    nodeId: string({ minLength: 1, pattern: '\\S' }),
+    port: string({ minLength: 1, pattern: '\\S' })
+  }, { required: ['nodeId', 'port'] });
+  const SHADER_NODE_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    type: string({ minLength: 1, pattern: '\\S' }),
+    position: object({ x: number(), y: number() }, { required: ['x', 'y'] }),
+    parameters: object()
+  }, { required: ['id', 'type', 'position', 'parameters'] });
+  const SHADER_LINK_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    from: SHADER_PORT_SCHEMA,
+    to: SHADER_PORT_SCHEMA
+  }, { required: ['id', 'from', 'to'] });
+  const SHADER_GRAPH_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    name: string({ minLength: 1, pattern: '\\S' }),
+    version: { const: 1 },
+    domain: { const: 'postProcess' },
+    nodes: { type: 'array', items: SHADER_NODE_SCHEMA, minItems: 2 },
+    links: { type: 'array', items: SHADER_LINK_SCHEMA, minItems: 1 },
+    outputNodeId: string({ minLength: 1, pattern: '\\S' })
+  }, { required: ['id', 'name', 'version', 'domain', 'nodes', 'links', 'outputNodeId'] });
+  const POST_PROCESS_EFFECT_SCHEMA = object({
+    id: string({ minLength: 1, pattern: '\\S' }),
+    type: string({ minLength: 1, pattern: '\\S' }),
+    name: string(),
+    enabled: boolean(),
+    graphId: string({ minLength: 1, pattern: '\\S' }),
+    parameters: object()
+  }, { required: ['id', 'type'] });
+  const POST_PROCESS_SCHEMA = object({
+    enabled: boolean(),
+    effects: { type: 'array', items: POST_PROCESS_EFFECT_SCHEMA }
+  }, { required: ['effects'] });
   const JSON_SCHEMAS = {
     components: COMPONENT_SCHEMAS,
     componentProfiles: PROFILE_SCHEMAS,
@@ -575,8 +668,457 @@
     animationClip: ANIMATION_CLIP_SCHEMA,
     particleCurveKey: PARTICLE_CURVE_KEY_SCHEMA,
     particleCurve: PARTICLE_CURVE_SCHEMA,
-    particleAsset: PARTICLE_ASSET_SCHEMA
+    particleAsset: PARTICLE_ASSET_SCHEMA,
+    shaderPort: SHADER_PORT_SCHEMA,
+    shaderNode: SHADER_NODE_SCHEMA,
+    shaderLink: SHADER_LINK_SCHEMA,
+    shaderGraph: SHADER_GRAPH_SCHEMA,
+    postProcessEffect: POST_PROCESS_EFFECT_SCHEMA,
+    postProcess: POST_PROCESS_SCHEMA
   };
+
+  const SHADER_GRAPH_DEFAULTS = deepFreeze({
+    version: 1,
+    domain: 'postProcess',
+    nodes: [
+      { id: 'scene', type: 'sceneTexture', position: { x: 80, y: 160 }, parameters: {} },
+      { id: 'output', type: 'output', position: { x: 520, y: 160 }, parameters: {} }
+    ],
+    links: [
+      { id: 'scene-color-output-color', from: { nodeId: 'scene', port: 'color' }, to: { nodeId: 'output', port: 'color' } }
+    ],
+    outputNodeId: 'output'
+  });
+
+  function shaderSlug(value, fallback = 'shader') {
+    const slug = String(value == null ? '' : value)
+      .trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    return slug || fallback;
+  }
+
+  function shaderGeneratedId(base, used, fallback = 'shader') {
+    const stem = shaderSlug(base, fallback);
+    let candidate = stem;
+    let suffix = 2;
+    while (used.has(candidate)) candidate = `${stem}-${suffix++}`;
+    used.add(candidate);
+    return candidate;
+  }
+
+  function shaderCanonicalType(value, fallback = 'tint') {
+    const authored = typeof value === 'string' && value.trim() ? value.trim() : fallback;
+    const canonical = SHADER_NODE_TYPES.find(type => type.toLowerCase() === authored.toLowerCase());
+    return canonical || authored;
+  }
+
+  function shaderFinite(value, fallback) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim() !== '') {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) return numeric;
+    }
+    return fallback;
+  }
+
+  function normalizeShaderGraph(input, options = {}) {
+    if (Number.isInteger(options)) options = { index: options };
+    const source = isPlainObject(input) ? cloneJson(input) : {};
+    const output = source;
+    const index = Number.isInteger(options.index) && options.index >= 0 ? options.index : 0;
+    const name = typeof source.name === 'string' && source.name.trim()
+      ? source.name.trim()
+      : (typeof source.id === 'string' && source.id.trim() ? source.id.trim() : `Shader Graph ${index + 1}`);
+    output.id = typeof source.id === 'string' && source.id.trim()
+      ? source.id.trim()
+      : shaderSlug(name, `shader-graph-${index + 1}`);
+    output.name = name;
+    output.version = 1;
+    output.domain = 'postProcess';
+
+    const rawNodes = Array.isArray(source.nodes) ? source.nodes.filter(isPlainObject) : [];
+    const seededDefault = rawNodes.length === 0;
+    if (seededDefault) rawNodes.push(...cloneJson(SHADER_GRAPH_DEFAULTS.nodes));
+    const reservedNodeIds = new Set(rawNodes
+      .map(node => typeof node.id === 'string' ? node.id.trim() : '')
+      .filter(Boolean));
+    const usedNodeIds = new Set(reservedNodeIds);
+    output.nodes = rawNodes.map((rawNode, nodeIndex) => {
+      const node = cloneJson(rawNode);
+      node.type = shaderCanonicalType(node.type, nodeIndex === 0 ? 'sceneTexture' : 'tint');
+      if (typeof node.id === 'string' && node.id.trim()) node.id = node.id.trim();
+      else node.id = shaderGeneratedId(node.type, usedNodeIds, `node-${nodeIndex + 1}`);
+      const position = isPlainObject(node.position) ? cloneJson(node.position) : {};
+      position.x = shaderFinite(position.x, 80 + (nodeIndex * 220));
+      position.y = shaderFinite(position.y, 160);
+      node.position = position;
+      const parameters = isPlainObject(node.parameters) ? cloneJson(node.parameters) : {};
+      const definition = SHADER_NODE_DEFINITIONS[node.type];
+      for (const [parameter, descriptor] of Object.entries(definition?.parameters || {})) {
+        if (!hasOwn(parameters, parameter)) defineJsonProperty(parameters, parameter, cloneJson(descriptor.default));
+      }
+      node.parameters = parameters;
+      return node;
+    });
+
+    let outputNode = output.nodes.find(node => node.type === 'output');
+    if (!outputNode) {
+      const id = shaderGeneratedId('output', usedNodeIds, 'output');
+      outputNode = { id, type: 'output', position: { x: 520, y: 160 }, parameters: {} };
+      output.nodes.push(outputNode);
+    }
+    output.outputNodeId = typeof source.outputNodeId === 'string' && source.outputNodeId.trim()
+      ? source.outputNodeId.trim()
+      : outputNode.id;
+
+    const rawLinks = Array.isArray(source.links) ? source.links.filter(isPlainObject) : [];
+    if (seededDefault && rawLinks.length === 0) rawLinks.push(...cloneJson(SHADER_GRAPH_DEFAULTS.links));
+    const reservedLinkIds = new Set(rawLinks
+      .map(link => typeof link.id === 'string' ? link.id.trim() : '')
+      .filter(Boolean));
+    const usedLinkIds = new Set(reservedLinkIds);
+    output.links = rawLinks.map((rawLink, linkIndex) => {
+      const link = cloneJson(rawLink);
+      const from = isPlainObject(link.from) ? cloneJson(link.from) : {};
+      const to = isPlainObject(link.to) ? cloneJson(link.to) : {};
+      from.nodeId = typeof from.nodeId === 'string' ? from.nodeId.trim() : '';
+      from.port = typeof from.port === 'string' ? from.port.trim() : '';
+      to.nodeId = typeof to.nodeId === 'string' ? to.nodeId.trim() : '';
+      to.port = typeof to.port === 'string' ? to.port.trim() : '';
+      link.from = from;
+      link.to = to;
+      if (typeof link.id === 'string' && link.id.trim()) link.id = link.id.trim();
+      else link.id = shaderGeneratedId(
+        `${from.nodeId || 'source'}-${from.port || 'port'}-${to.nodeId || 'target'}-${to.port || 'port'}`,
+        usedLinkIds,
+        `link-${linkIndex + 1}`
+      );
+      return link;
+    });
+    return output;
+  }
+
+  function normalizeShaderGraphs(input, options = {}) {
+    const source = Array.isArray(input) ? input : [];
+    const entries = source.map((graph, index) => ({ graph, index })).filter(entry => isPlainObject(entry.graph));
+    const reservedIds = new Set(entries
+      .map(entry => typeof entry.graph.id === 'string' ? entry.graph.id.trim() : '')
+      .filter(Boolean));
+    const usedIds = new Set(reservedIds);
+    return entries.map(({ graph: rawGraph, index }) => {
+      const graph = normalizeShaderGraph(rawGraph, { ...options, index });
+      if (typeof rawGraph.id !== 'string' || !rawGraph.id.trim()) {
+        graph.id = shaderGeneratedId(graph.id, usedIds, `shader-graph-${index + 1}`);
+      }
+      return graph;
+    });
+  }
+
+  function shaderJsonSafetyDiagnostics(value, pointer) {
+    return jsonSafetyDiagnostics(value, pointer).map(item => ({
+      ...item,
+      code: item.code.replace(/^E_COMPONENT_JSON_/, 'E_SHADER_JSON_'),
+      message: item.message.replace(/Component/g, 'Shader Graph').replace(/component/g, 'shader graph')
+    }));
+  }
+
+  function postProcessJsonSafetyDiagnostics(value, pointer) {
+    return jsonSafetyDiagnostics(value, pointer).map(item => ({
+      ...item,
+      code: item.code === 'E_COMPONENT_JSON_NUMBER'
+        ? 'E_POST_PROCESS_NUMBER'
+        : item.code.replace(/^E_COMPONENT_JSON_/, 'E_POST_PROCESS_JSON_'),
+      message: item.message.replace(/Component/g, 'Post Process').replace(/component/g, 'post process')
+    }));
+  }
+
+  function shaderValueMatchesDescriptor(value, descriptor, strict) {
+    if (descriptor.type === 'number') {
+      if (typeof value === 'number' && Number.isFinite(value)) return true;
+      return !strict && typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value));
+    }
+    return typeof value === descriptor.type;
+  }
+
+  function validateShaderGraphDocument(document, options = {}) {
+    const output = [];
+    const strict = Boolean(options.strict);
+    let graphs;
+    let basePointer = '/shaderGraphs';
+    const projectShapedDocument = isPlainObject(document) && (
+      document.format === 'AH2D' || hasOwn(document, 'shaderGraphs') || hasOwn(document, 'currentSceneId') ||
+      hasOwn(document, 'postProcess') || Array.isArray(document.scenes) || Array.isArray(document.scene)
+    );
+    const standaloneGraph = isPlainObject(document) && !projectShapedDocument && (
+      hasOwn(document, 'nodes') || hasOwn(document, 'links') || hasOwn(document, 'outputNodeId') ||
+      hasOwn(document, 'domain') || (hasOwn(document, 'version') && hasOwn(document, 'id') && hasOwn(document, 'name'))
+    );
+    const projectDocument = isPlainObject(document) && !standaloneGraph;
+    if (Array.isArray(document)) graphs = document;
+    else if (standaloneGraph) {
+      graphs = [document];
+      basePointer = '';
+    } else if (isPlainObject(document)) graphs = document.shaderGraphs == null ? [] : document.shaderGraphs;
+    else return [diagnostic('E_SHADER_DOCUMENT', 'Shader Graph document must be a plain object or array', '')];
+    if (!Array.isArray(graphs)) {
+      output.push(diagnostic('E_SHADER_GRAPHS_TYPE', 'shaderGraphs must be an array', basePointer));
+      graphs = [];
+    }
+
+    const graphIds = new Map();
+    graphs.forEach((graph, graphIndex) => {
+      const pointer = basePointer ? joinPointer(basePointer, graphIndex) : '';
+      if (!isPlainObject(graph)) {
+        output.push(diagnostic('E_SHADER_GRAPH_TYPE', 'Shader Graph must be a plain object', pointer));
+        return;
+      }
+      output.push(...shaderJsonSafetyDiagnostics(graph, pointer));
+      const graphId = typeof graph.id === 'string' ? graph.id.trim() : '';
+      if (!graphId) output.push(diagnostic('E_SHADER_GRAPH_ID', 'Shader Graph id must be a non-empty stable ID', joinPointer(pointer, 'id')));
+      else if (graphIds.has(graphId)) output.push(diagnostic('E_SHADER_GRAPH_ID_DUPLICATE', `Duplicate Shader Graph id: ${graphId}`, joinPointer(pointer, 'id'), { firstPointer: graphIds.get(graphId) }));
+      else graphIds.set(graphId, joinPointer(pointer, 'id'));
+      if (typeof graph.name !== 'string' || !graph.name.trim()) output.push(diagnostic('E_SHADER_GRAPH_NAME', 'Shader Graph name must be a non-empty string', joinPointer(pointer, 'name')));
+      const validVersion = graph.version === 1 || (!strict && graph.version === '1');
+      if (!validVersion) output.push(diagnostic('E_SHADER_GRAPH_VERSION', 'Shader Graph version must be 1', joinPointer(pointer, 'version'), { expected: 1, actual: graph.version }));
+      if (graph.domain !== 'postProcess') output.push(diagnostic('E_SHADER_GRAPH_DOMAIN', 'Shader Graph domain must be postProcess', joinPointer(pointer, 'domain'), { expected: 'postProcess', actual: graph.domain }));
+
+      const nodesPointer = joinPointer(pointer, 'nodes');
+      const linksPointer = joinPointer(pointer, 'links');
+      if (!Array.isArray(graph.nodes)) {
+        output.push(diagnostic('E_SHADER_NODES', 'Shader Graph nodes must be an array', nodesPointer));
+        return;
+      }
+      if (!Array.isArray(graph.links)) {
+        output.push(diagnostic('E_SHADER_LINKS', 'Shader Graph links must be an array', linksPointer));
+        return;
+      }
+
+      const nodesById = new Map();
+      const nodePointers = new Map();
+      const outputNodes = [];
+      graph.nodes.forEach((node, nodeIndex) => {
+        const nodePointer = joinPointer(nodesPointer, nodeIndex);
+        if (!isPlainObject(node)) {
+          output.push(diagnostic('E_SHADER_NODE_TYPE', 'Shader node must be a plain object', nodePointer));
+          return;
+        }
+        const nodeId = typeof node.id === 'string' ? node.id.trim() : '';
+        if (!nodeId) output.push(diagnostic('E_SHADER_NODE_ID', 'Shader node id must be a non-empty stable ID', joinPointer(nodePointer, 'id')));
+        else if (nodesById.has(nodeId)) output.push(diagnostic('E_SHADER_NODE_ID_DUPLICATE', `Duplicate Shader node id: ${nodeId}`, joinPointer(nodePointer, 'id'), { firstPointer: nodePointers.get(nodeId) }));
+        else {
+          nodesById.set(nodeId, node);
+          nodePointers.set(nodeId, nodePointer);
+        }
+        const type = typeof node.type === 'string' ? node.type.trim() : '';
+        if (!type) output.push(diagnostic('E_SHADER_NODE_KIND', 'Shader node type must be a non-empty string', joinPointer(nodePointer, 'type')));
+        else if (!SHADER_NODE_DEFINITIONS[type]) output.push(diagnostic(
+          strict ? 'E_SHADER_NODE_UNKNOWN' : 'W_SHADER_NODE_UNKNOWN',
+          `Unknown Shader node type is preserved but cannot be validated: ${type}`,
+          joinPointer(nodePointer, 'type'),
+          { type },
+          strict ? 'error' : 'warning'
+        ));
+        if (type === 'output') outputNodes.push({ id: nodeId, pointer: nodePointer });
+        const positionPointer = joinPointer(nodePointer, 'position');
+        if (!isPlainObject(node.position)) output.push(diagnostic('E_SHADER_NODE_POSITION', 'Shader node position must be an object', positionPointer));
+        else for (const axis of ['x', 'y']) {
+          const axisValue = node.position[axis];
+          const finite = typeof axisValue === 'number' && Number.isFinite(axisValue);
+          const compatible = !strict && typeof axisValue === 'string' && axisValue.trim() !== '' && Number.isFinite(Number(axisValue));
+          if (!finite && !compatible) output.push(diagnostic('E_SHADER_NODE_POSITION_VALUE', `Shader node position.${axis} must be finite`, joinPointer(positionPointer, axis), { axis }));
+        }
+        const parametersPointer = joinPointer(nodePointer, 'parameters');
+        if (!isPlainObject(node.parameters)) output.push(diagnostic('E_SHADER_NODE_PARAMETERS', 'Shader node parameters must be an object', parametersPointer));
+        else if (SHADER_NODE_DEFINITIONS[type]) {
+          for (const [parameter, descriptor] of Object.entries(SHADER_NODE_DEFINITIONS[type].parameters)) {
+            if (!hasOwn(node.parameters, parameter)) continue;
+            const value = node.parameters[parameter];
+            if (!shaderValueMatchesDescriptor(value, descriptor, strict)) {
+              output.push(diagnostic('E_SHADER_PARAMETER_TYPE', `${type}.${parameter} must be ${descriptor.type}`, joinPointer(parametersPointer, parameter), { nodeType: type, parameter, expected: descriptor.type }));
+              continue;
+            }
+            if (descriptor.type === 'number') {
+              const numeric = Number(value);
+              if (descriptor.minimum != null && numeric < descriptor.minimum) output.push(diagnostic('E_SHADER_PARAMETER_RANGE', `${type}.${parameter} must be at least ${descriptor.minimum}`, joinPointer(parametersPointer, parameter), { minimum: descriptor.minimum }));
+              if (descriptor.maximum != null && numeric > descriptor.maximum) output.push(diagnostic('E_SHADER_PARAMETER_RANGE', `${type}.${parameter} must be at most ${descriptor.maximum}`, joinPointer(parametersPointer, parameter), { maximum: descriptor.maximum }));
+            } else if (descriptor.type === 'string') {
+              const parameterPointer = joinPointer(parametersPointer, parameter);
+              if (!value.trim()) output.push(diagnostic('E_SHADER_PARAMETER_VALUE', `${type}.${parameter} must be a non-empty string`, parameterPointer));
+              else if (descriptor.pattern && !(new RegExp(descriptor.pattern)).test(value)) output.push(diagnostic(
+                'E_SHADER_PARAMETER_VALUE',
+                `${type}.${parameter} must match ${descriptor.pattern}`,
+                parameterPointer,
+                { nodeType: type, parameter, pattern: descriptor.pattern }
+              ));
+            }
+          }
+        }
+      });
+
+      if (outputNodes.length !== 1) output.push(diagnostic('E_SHADER_OUTPUT_COUNT', 'Shader Graph must contain exactly one output node', nodesPointer, { count: outputNodes.length }));
+      const outputNodeId = typeof graph.outputNodeId === 'string' ? graph.outputNodeId.trim() : '';
+      if (!outputNodeId) output.push(diagnostic('E_SHADER_OUTPUT_ID', 'Shader Graph outputNodeId must be a non-empty node ID', joinPointer(pointer, 'outputNodeId')));
+      else if (!nodesById.has(outputNodeId)) output.push(diagnostic('E_SHADER_OUTPUT_REFERENCE', `Shader Graph output node does not exist: ${outputNodeId}`, joinPointer(pointer, 'outputNodeId'), { outputNodeId }));
+      else if (nodesById.get(outputNodeId).type !== 'output') output.push(diagnostic('E_SHADER_OUTPUT_KIND', 'Shader Graph outputNodeId must reference an output node', joinPointer(pointer, 'outputNodeId'), { outputNodeId, type: nodesById.get(outputNodeId).type }));
+      else if (outputNodes.length === 1 && outputNodes[0].id !== outputNodeId) output.push(diagnostic('E_SHADER_OUTPUT_AMBIGUOUS', 'Shader Graph outputNodeId does not identify its only output node', joinPointer(pointer, 'outputNodeId'), { outputNodeId, expected: outputNodes[0].id }));
+
+      const linkIds = new Map();
+      const targetInputs = new Map();
+      const incomingInputs = new Set();
+      const incomingSources = new Map();
+      const adjacency = new Map([...nodesById.keys()].map(id => [id, []]));
+      graph.links.forEach((link, linkIndex) => {
+        const linkPointer = joinPointer(linksPointer, linkIndex);
+        if (!isPlainObject(link)) {
+          output.push(diagnostic('E_SHADER_LINK_TYPE', 'Shader link must be a plain object', linkPointer));
+          return;
+        }
+        const linkId = typeof link.id === 'string' ? link.id.trim() : '';
+        if (!linkId) output.push(diagnostic('E_SHADER_LINK_ID', 'Shader link id must be a non-empty stable ID', joinPointer(linkPointer, 'id')));
+        else if (linkIds.has(linkId)) output.push(diagnostic('E_SHADER_LINK_ID_DUPLICATE', `Duplicate Shader link id: ${linkId}`, joinPointer(linkPointer, 'id'), { firstPointer: linkIds.get(linkId) }));
+        else linkIds.set(linkId, joinPointer(linkPointer, 'id'));
+        const fromPointer = joinPointer(linkPointer, 'from');
+        const toPointer = joinPointer(linkPointer, 'to');
+        if (!isPlainObject(link.from)) output.push(diagnostic('E_SHADER_LINK_FROM', 'Shader link from must be an endpoint object', fromPointer));
+        if (!isPlainObject(link.to)) output.push(diagnostic('E_SHADER_LINK_TO', 'Shader link to must be an endpoint object', toPointer));
+        if (!isPlainObject(link.from) || !isPlainObject(link.to)) return;
+        const fromNodeId = typeof link.from.nodeId === 'string' ? link.from.nodeId.trim() : '';
+        const fromPort = typeof link.from.port === 'string' ? link.from.port.trim() : '';
+        const toNodeId = typeof link.to.nodeId === 'string' ? link.to.nodeId.trim() : '';
+        const toPort = typeof link.to.port === 'string' ? link.to.port.trim() : '';
+        if (!fromNodeId) output.push(diagnostic('E_SHADER_LINK_NODE_ID', 'Shader link source nodeId must be non-empty', joinPointer(fromPointer, 'nodeId')));
+        else if (!nodesById.has(fromNodeId)) output.push(diagnostic('E_SHADER_LINK_NODE_REFERENCE', `Shader link source node does not exist: ${fromNodeId}`, joinPointer(fromPointer, 'nodeId'), { nodeId: fromNodeId }));
+        if (!toNodeId) output.push(diagnostic('E_SHADER_LINK_NODE_ID', 'Shader link target nodeId must be non-empty', joinPointer(toPointer, 'nodeId')));
+        else if (!nodesById.has(toNodeId)) output.push(diagnostic('E_SHADER_LINK_NODE_REFERENCE', `Shader link target node does not exist: ${toNodeId}`, joinPointer(toPointer, 'nodeId'), { nodeId: toNodeId }));
+        if (!fromPort) output.push(diagnostic('E_SHADER_LINK_PORT', 'Shader link source port must be non-empty', joinPointer(fromPointer, 'port')));
+        if (!toPort) output.push(diagnostic('E_SHADER_LINK_PORT', 'Shader link target port must be non-empty', joinPointer(toPointer, 'port')));
+        const fromDefinition = SHADER_NODE_DEFINITIONS[nodesById.get(fromNodeId)?.type];
+        const toDefinition = SHADER_NODE_DEFINITIONS[nodesById.get(toNodeId)?.type];
+        const sourceType = fromDefinition?.outputs[fromPort];
+        const targetType = toDefinition?.inputs[toPort];
+        if (fromDefinition && fromPort && !sourceType) output.push(diagnostic('E_SHADER_LINK_OUTPUT_PORT', `Node ${fromNodeId} has no output port named ${fromPort}`, joinPointer(fromPointer, 'port'), { nodeId: fromNodeId, port: fromPort }));
+        if (toDefinition && toPort && !targetType) output.push(diagnostic('E_SHADER_LINK_INPUT_PORT', `Node ${toNodeId} has no input port named ${toPort}`, joinPointer(toPointer, 'port'), { nodeId: toNodeId, port: toPort }));
+        if (sourceType && targetType && sourceType !== targetType) output.push(diagnostic('E_SHADER_LINK_VALUE_TYPE', `Cannot connect ${sourceType} to ${targetType}`, linkPointer, { sourceType, targetType }));
+        if (toNodeId && toPort) {
+          const targetKey = `${toNodeId}\u0000${toPort}`;
+          if (targetInputs.has(targetKey)) output.push(diagnostic('E_SHADER_LINK_TARGET_DUPLICATE', `Input ${toNodeId}.${toPort} already has a link`, toPointer, { firstPointer: targetInputs.get(targetKey), nodeId: toNodeId, port: toPort }));
+          else targetInputs.set(targetKey, toPointer);
+          if (targetType && nodesById.has(fromNodeId) && nodesById.has(toNodeId) && (sourceType || !fromDefinition)) {
+            incomingInputs.add(targetKey);
+            if (!incomingSources.has(targetKey)) incomingSources.set(targetKey, fromNodeId);
+          }
+        }
+        if (nodesById.has(fromNodeId) && nodesById.has(toNodeId)) adjacency.get(fromNodeId).push({ id: toNodeId, pointer: linkPointer });
+      });
+
+      const requiredVisited = new Set();
+      const validateRequiredInputs = nodeId => {
+        if (!nodeId || requiredVisited.has(nodeId)) return;
+        requiredVisited.add(nodeId);
+        const node = nodesById.get(nodeId);
+        const definition = SHADER_NODE_DEFINITIONS[node?.type];
+        if (!definition) return;
+        for (const inputPort of Object.keys(definition.inputs)) {
+          const targetKey = `${nodeId}\u0000${inputPort}`;
+          if (!incomingInputs.has(targetKey)) output.push(diagnostic(
+            'E_SHADER_INPUT_REQUIRED',
+            `Required input is not connected: ${nodeId}.${inputPort}`,
+            joinPointer(nodePointers.get(nodeId) || nodesPointer, 'id'),
+            { nodeId, port: inputPort }
+          ));
+          else validateRequiredInputs(incomingSources.get(targetKey));
+        }
+      };
+      if (nodesById.get(outputNodeId)?.type === 'output') validateRequiredInputs(outputNodeId);
+
+      const visiting = new Set();
+      const visited = new Set();
+      const stack = [];
+      let cycleReported = false;
+      const visit = id => {
+        if (cycleReported || visited.has(id)) return;
+        if (visiting.has(id)) {
+          const start = stack.indexOf(id);
+          const cycle = [...stack.slice(start), id];
+          output.push(diagnostic('E_SHADER_GRAPH_CYCLE', `Shader Graph contains a directed cycle: ${cycle.join(' -> ')}`, linksPointer, { cycle }));
+          cycleReported = true;
+          return;
+        }
+        visiting.add(id);
+        stack.push(id);
+        for (const edge of adjacency.get(id) || []) if (requiredVisited.has(edge.id)) visit(edge.id);
+        stack.pop();
+        visiting.delete(id);
+        visited.add(id);
+      };
+      for (const id of requiredVisited) visit(id);
+    });
+
+    if (projectDocument && hasOwn(document, 'postProcess')) {
+      const postProcessPointer = '/postProcess';
+      if (!isPlainObject(document.postProcess)) {
+        output.push(diagnostic('E_POST_PROCESS_TYPE', 'postProcess must be a plain object', postProcessPointer));
+      } else {
+        output.push(...postProcessJsonSafetyDiagnostics(document.postProcess, postProcessPointer));
+        if (hasOwn(document.postProcess, 'enabled') && typeof document.postProcess.enabled !== 'boolean') {
+          output.push(diagnostic('E_POST_PROCESS_ENABLED', 'postProcess.enabled must be boolean', joinPointer(postProcessPointer, 'enabled')));
+        }
+        const effectsPointer = joinPointer(postProcessPointer, 'effects');
+        if (!Array.isArray(document.postProcess.effects)) {
+          output.push(diagnostic('E_POST_PROCESS_EFFECTS_TYPE', 'postProcess.effects must be an array', effectsPointer));
+          return output;
+        }
+        const effects = document.postProcess.effects;
+        const effectIds = new Map();
+        const knownGraphIds = new Set(graphs
+          .filter(isPlainObject)
+          .map(graph => typeof graph.id === 'string' ? graph.id.trim() : '')
+          .filter(Boolean));
+        effects.forEach((effect, effectIndex) => {
+          const effectPointer = joinPointer(effectsPointer, effectIndex);
+          if (!isPlainObject(effect)) {
+            output.push(diagnostic('E_POST_PROCESS_EFFECT_OBJECT', 'Post Process effect must be a plain object', effectPointer));
+            return;
+          }
+          const effectIdPointer = joinPointer(effectPointer, 'id');
+          const effectId = typeof effect.id === 'string' ? effect.id.trim() : '';
+          if (!effectId) output.push(diagnostic('E_POST_PROCESS_EFFECT_ID', 'Post Process effect id must be a non-empty stable ID', effectIdPointer));
+          else if (effectIds.has(effectId)) output.push(diagnostic('E_POST_PROCESS_EFFECT_ID_DUPLICATE', `Duplicate Post Process effect id: ${effectId}`, effectIdPointer, { firstPointer: effectIds.get(effectId) }));
+          else effectIds.set(effectId, effectIdPointer);
+          const effectTypePointer = joinPointer(effectPointer, 'type');
+          const effectType = typeof effect.type === 'string' ? effect.type.trim() : '';
+          if (!effectType) output.push(diagnostic('E_POST_PROCESS_EFFECT_TYPE', 'Post Process effect type must be a non-empty string', effectTypePointer));
+          if (hasOwn(effect, 'name') && typeof effect.name !== 'string') {
+            output.push(diagnostic('E_POST_PROCESS_EFFECT_NAME', 'Post Process effect name must be a string', joinPointer(effectPointer, 'name')));
+          }
+          if (hasOwn(effect, 'enabled') && typeof effect.enabled !== 'boolean') {
+            output.push(diagnostic('E_POST_PROCESS_EFFECT_ENABLED', 'Post Process effect enabled must be boolean', joinPointer(effectPointer, 'enabled')));
+          }
+          if (hasOwn(effect, 'parameters') && !isPlainObject(effect.parameters)) {
+            output.push(diagnostic('E_POST_PROCESS_EFFECT_PARAMETERS', 'Post Process effect parameters must be a plain object', joinPointer(effectPointer, 'parameters')));
+          }
+          const graphPointer = joinPointer(effectPointer, 'graphId');
+          const graphId = typeof effect.graphId === 'string' ? effect.graphId.trim() : '';
+          if (effectType === 'shaderGraph') {
+            if (!graphId) output.push(diagnostic('E_SHADER_EFFECT_GRAPH_ID', 'shaderGraph effect requires a non-empty graphId', graphPointer));
+            else if (!knownGraphIds.has(graphId)) output.push(diagnostic('E_SHADER_EFFECT_GRAPH_REFERENCE', `Shader Graph does not exist: ${graphId}`, graphPointer, { graphId }));
+          } else if (hasOwn(effect, 'graphId') && !graphId) {
+            output.push(diagnostic('E_POST_PROCESS_EFFECT_GRAPH_ID', 'Post Process effect graphId must be a non-empty stable ID when provided', graphPointer));
+          }
+        });
+      }
+    }
+    return output;
+  }
+
+  function assertShaderGraphDocument(document, options = {}) {
+    const diagnostics = validateShaderGraphDocument(document, options);
+    const errors = diagnostics.filter(item => item.severity === 'error');
+    if (errors.length) {
+      const first = errors[0];
+      throw new ComponentSchemaError(first.code, first.message, { pointer: first.pointer, details: first.details, diagnostics });
+    }
+    return diagnostics;
+  }
 
   const PARTICLE_ASSET_DEFAULTS = deepFreeze({
     duration: 1,
@@ -3562,6 +4104,13 @@
   deepFreeze(PARTICLE_CURVE_KEY_SCHEMA);
   deepFreeze(PARTICLE_CURVE_SCHEMA);
   deepFreeze(PARTICLE_ASSET_SCHEMA);
+  deepFreeze(SHADER_NODE_DEFINITIONS);
+  deepFreeze(SHADER_PORT_SCHEMA);
+  deepFreeze(SHADER_NODE_SCHEMA);
+  deepFreeze(SHADER_LINK_SCHEMA);
+  deepFreeze(SHADER_GRAPH_SCHEMA);
+  deepFreeze(POST_PROCESS_EFFECT_SCHEMA);
+  deepFreeze(POST_PROCESS_SCHEMA);
   deepFreeze(JSON_SCHEMAS);
 
   return Object.freeze({
@@ -3575,6 +4124,11 @@
     PARTICLE_CURVE_PROPERTIES,
     PARTICLE_CURVE_INTERPOLATIONS,
     PARTICLE_ASSET_DEFAULTS,
+    SHADER_NODE_TYPES,
+    SHADER_VALUE_TYPES,
+    SHADER_HEX_COLOR_PATTERN,
+    SHADER_NODE_DEFINITIONS,
+    SHADER_GRAPH_DEFAULTS,
     ComponentSchemaError,
     ComponentSchemaRegistry,
     EntityCodec,
@@ -3591,6 +4145,12 @@
     PARTICLE_CURVE_KEY_SCHEMA,
     PARTICLE_CURVE_SCHEMA,
     PARTICLE_ASSET_SCHEMA,
+    SHADER_PORT_SCHEMA,
+    SHADER_NODE_SCHEMA,
+    SHADER_LINK_SCHEMA,
+    SHADER_GRAPH_SCHEMA,
+    POST_PROCESS_EFFECT_SCHEMA,
+    POST_PROCESS_SCHEMA,
     JSON_SCHEMAS,
     PREFAB_OVERRIDE_OPERATIONS,
     isSafeComponentName,
@@ -3614,6 +4174,10 @@
     sampleParticleCurve,
     validateParticleDocument,
     assertParticleDocument,
+    normalizeShaderGraph,
+    normalizeShaderGraphs,
+    validateShaderGraphDocument,
+    assertShaderGraphDocument,
     createDefaultComponentRegistry,
     createDefaultEntityCodec
   });

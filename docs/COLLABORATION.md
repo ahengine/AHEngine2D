@@ -298,7 +298,9 @@ eventهای جاری عبارت‌اند از `connected`، `document.changed`،
 
 ## Post Process در Collaboration
 
-`postProcess` جزئی از Universal document و همان optimistic revision است. هر پروژه stack خودش را دارد و تغییر slider/toggle در autosave بعدی ذخیره می‌شود. برای تغییر بیرون Editor نیز `PATCH document` روی JSON Pointer مناسب بفرستید و effect را در snapshot همان revision با `id` پیدا کنید.
+`postProcess` و `shaderGraphs[]` جزئی از Universal document و همان optimistic revision هستند. هر پروژه stack و Graph library خودش را دارد و تغییر Effect/Node/Link در autosave بعدی ذخیره می‌شود. برای تغییر بیرون Editor نیز `PATCH document` روی JSON Pointer مناسب بفرستید و Effect، Graph، Node یا Link را در snapshot همان revision با ID پایدار پیدا کنید. Effect نوع `shaderGraph` با `graphId` به Graph وصل است؛ تغییر هماهنگ Graph و Effect مرجع آن را در یک mutation انجام دهید تا هیچ revision میانی با reference شکسته ساخته نشود.
+
+Bridge ادیتور آرایه‌های `shaderGraphs`، `nodes`، `links` و `postProcess.effects` را با ID پایدار merge می‌کند: ترتیب، اضافه‌شدن و حذف متعلق به snapshot authored است، ولی metadata و parameterهای ناشناخته‌ی record متناظر حفظ می‌شوند. این merge جای optimistic concurrency را نمی‌گیرد؛ روی `REVISION_CONFLICT` تازه‌ترین document را بگیرید، semantic merge کنید و با `clientMutationId` جدید بفرستید. قرارداد کامل در [`SHADERS.md`](./SHADERS.md) آمده است.
 
 ## محدودیت store محلی و adapter تولیدی
 

@@ -37,7 +37,7 @@ stdout is JSON by default:
 
 Errors use the same protocol on stderr and a non-zero, categorized exit code. `capabilities` is the machine-readable discovery contract. It reports `dataModel`, the three component-schema profiles, registry types, `unknownComponents: "preserve"`, and `precedence: "components"`. Human-readable output is opt-in with `--format text`.
 
-The `sceneGraph` capability declares `parentId` storage, local authoring Transform space, the derived world-matrix shape, the default Reparent mode, both preservation flags, and the tree/world inspection command. `prefabs` declares canonical storage, expanded-instance behavior, RFC 6901 override paths, operations, and root-placement rules. `skeletons` declares the four canonical Components, reference scope, Bone hierarchy/IK-chain rules, Skin weights, Runtime-only outputs, and animation Track types. `enums.physicsBackend` and `options.physicsBackend` expose the supported Physics execution backends and the commands accepting `--backend`. Agents should discover these fields instead of assuming Editor behavior.
+The `sceneGraph` capability declares `parentId` storage, local authoring Transform space, the derived world-matrix shape, the default Reparent mode, both preservation flags, and the tree/world inspection command. `prefabs` declares canonical storage, expanded-instance behavior, RFC 6901 override paths, operations, and root-placement rules. `skeletons` declares the four canonical Components, reference scope, Bone hierarchy/IK-chain rules, Skin weights, Runtime-only outputs, and animation Track types. `shaders` declares canonical storage, schema/domain/version, built-in node types, typed ports, Post Process references, and supported resource mutations. `enums.physicsBackend` and `options.physicsBackend` expose the supported Physics execution backends and the commands accepting `--backend`. Agents should discover these fields instead of assuming Editor behavior.
 
 Exit codes:
 
@@ -127,6 +127,9 @@ npm run ah2d -- schema list --pretty
 npm run ah2d -- schema show --name project --pretty
 npm run ah2d -- schema show --name prefabAsset --pretty
 npm run ah2d -- schema show --name particleAsset --pretty
+npm run ah2d -- schema show --name shaderGraph --pretty
+npm run ah2d -- schema show --name postProcess --pretty
+npm run ah2d -- schema show --name postProcessEffect --pretty
 npm run ah2d -- schema show --component Transform --pretty
 npm run ah2d -- schema show --component Skeleton --pretty
 npm run ah2d -- schema show --component Bone --pretty
@@ -135,7 +138,7 @@ npm run ah2d -- schema show --component Skin --pretty
 npm run ah2d -- schema show component:Body --pretty
 ```
 
-`schema list` returns the document schemas (`project`, `prefabAsset`, `animationClip`, `particleAsset`, `operation`, `batch`) and all built-in component types. `schema show --component TYPE` returns the canonical type, aliases, schema version, required/removable/tag flags, defaults, `authoring`/`runtime`/`snapshot` schemas, runtime-only fields, and storage metadata. Aliases resolve to the canonical descriptor, so `component:Body` reports `component:Rigidbody`.
+`schema list` returns the document schemas (`project`, `prefabAsset`, `animationClip`, `particleAsset`, `shaderGraph`, `postProcessEffect`, `postProcess`, `operation`, `batch`) and all built-in component types. `postProcessEffect` describes stable Effect identity plus the optional `graphId` and `parameters` fields; both Post Process schemas allow JSON-safe extension fields for custom runtimes. `schema show --component TYPE` returns the canonical type, aliases, schema version, required/removable/tag flags, defaults, `authoring`/`runtime`/`snapshot` schemas, runtime-only fields, and storage metadata. Aliases resolve to the canonical descriptor, so `component:Body` reports `component:Rigidbody`.
 
 ## Components
 
@@ -289,7 +292,17 @@ npm run ah2d -- patch --file game.ah2d.json --patch @changes.patch.json --dry-ru
 npm run ah2d -- project patch --file game.ah2d.json --patch '{"meta":{"name":"Renamed"}}' --write
 ```
 
-Resources are accessible with `resource list|get|put|delete` for `assets`, `folders`, `prefabs`, `animations`, and `particles`. Prefer the `prefab` domain commands for reusable Prefab lifecycle changes; generic resource writes are intentionally raw.
+Resources are accessible with `resource list|get|put|delete` for `assets`, `folders`, `prefabs`, `animations`, `particles`, and `shaderGraphs`. The case-insensitive aliases `shader`, `shaders`, `shaderGraph`, and `shaderGraphs` address the same top-level Shader Graph library. Prefer the `prefab` domain commands for reusable Prefab lifecycle changes; generic resource writes are intentionally raw.
+
+```text
+npm run ah2d -- resource list --file game.ah2d.json shader --pretty
+npm run ah2d -- resource get --file game.ah2d.json shader cinematic-grade --pretty
+npm run ah2d -- resource put --file game.ah2d.json shader --value @cinematic-grade.shader.json --dry-run --include-document --pretty
+npm run ah2d -- resource put --file game.ah2d.json shader --value @cinematic-grade.shader.json --write --expect-sha256 <sha256>
+npm run ah2d -- resource delete --file game.ah2d.json shader cinematic-grade --write --expect-sha256 <sha256>
+```
+
+Shader resource mutation validates graph/node/link identity, typed endpoints, output ownership, references, and acyclicity with the same compatibility/strict policy as project validation. Read [`../docs/SHADERS.md`](../docs/SHADERS.md) before introducing a node type or renderer mapping.
 
 ## ECS export and migration
 

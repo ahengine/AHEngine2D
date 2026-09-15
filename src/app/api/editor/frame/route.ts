@@ -157,6 +157,93 @@ const WORKSPACE_BRIDGE = String.raw`
     });
   }
 
+  function stableRecordMatch(records, authored, fallbackField) {
+    if (!authored || typeof authored !== "object" || Array.isArray(authored)) return null;
+    const authoredId = authored.id != null ? String(authored.id).trim() : "";
+    const authoredFallback = fallbackField && authored[fallbackField] != null
+      ? String(authored[fallbackField]).trim()
+      : "";
+    let legacyFallback = null;
+    let canonicalFallback = null;
+    for (const record of Array.isArray(records) ? records : []) {
+      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+      const recordId = record.id != null ? String(record.id).trim() : "";
+      if (authoredId && recordId === authoredId) return record;
+      if (!authoredFallback || !fallbackField || String(record[fallbackField] ?? "").trim() !== authoredFallback) continue;
+      if (!recordId && !legacyFallback) legacyFallback = record;
+      if (!canonicalFallback) canonicalFallback = record;
+    }
+    // A fallback is only a migration bridge when one side has no canonical ID.
+    return authoredId ? legacyFallback : canonicalFallback;
+  }
+
+  function mergeNestedRecord(baseValue, authoredValue) {
+    const merged = mergeRecord(baseValue, authoredValue);
+    if (!authoredValue || typeof authoredValue !== "object" || Array.isArray(authoredValue)) return merged;
+    for (const [key, value] of Object.entries(authoredValue)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const previous = baseValue && typeof baseValue === "object" && !Array.isArray(baseValue)
+        ? baseValue[key]
+        : undefined;
+      merged[key] = mergeNestedRecord(previous, value);
+    }
+    return merged;
+  }
+
+  function mergePostProcess(basePostProcess, authoredPostProcess) {
+    const merged = mergeRecord(basePostProcess, authoredPostProcess);
+    if (!authoredPostProcess || typeof authoredPostProcess !== "object" || Array.isArray(authoredPostProcess)) return merged;
+    if (!Array.isArray(authoredPostProcess.effects)) return merged;
+    const baseEffects = Array.isArray(basePostProcess && basePostProcess.effects) ? basePostProcess.effects : [];
+    merged.effects = authoredPostProcess.effects.map((effect) => {
+      if (!effect || typeof effect !== "object" || Array.isArray(effect)) return clone(effect);
+      const original = stableRecordMatch(baseEffects, effect, "type");
+      const mergedEffect = mergeRecord(original, effect);
+      if (effect.parameters !== undefined) {
+        mergedEffect.parameters = mergeNestedRecord(original && original.parameters, effect.parameters);
+      }
+      return mergedEffect;
+    });
+    return merged;
+  }
+
+  function mergeShaderGraphs(baseGraphs, authoredGraphs) {
+    if (!Array.isArray(authoredGraphs)) return clone(baseGraphs);
+    const baseList = Array.isArray(baseGraphs) ? baseGraphs : [];
+    return authoredGraphs.map((graph) => {
+      if (!graph || typeof graph !== "object" || Array.isArray(graph)) return clone(graph);
+      const original = stableRecordMatch(baseList, graph, "name");
+      const mergedGraph = mergeRecord(original, graph);
+      if (Array.isArray(graph.nodes)) {
+        const originalNodes = Array.isArray(original && original.nodes) ? original.nodes : [];
+        mergedGraph.nodes = graph.nodes.map((node) => {
+          if (!node || typeof node !== "object" || Array.isArray(node)) return clone(node);
+          const originalNode = stableRecordMatch(originalNodes, node, null);
+          const mergedNode = mergeRecord(originalNode, node);
+          if (node.position !== undefined) {
+            mergedNode.position = mergeRecord(originalNode && originalNode.position, node.position);
+          }
+          if (node.parameters !== undefined) {
+            mergedNode.parameters = mergeNestedRecord(originalNode && originalNode.parameters, node.parameters);
+          }
+          return mergedNode;
+        });
+      }
+      if (Array.isArray(graph.links)) {
+        const originalLinks = Array.isArray(original && original.links) ? original.links : [];
+        mergedGraph.links = graph.links.map((link) => {
+          if (!link || typeof link !== "object" || Array.isArray(link)) return clone(link);
+          const originalLink = stableRecordMatch(originalLinks, link, null);
+          const mergedLink = mergeRecord(originalLink, link);
+          if (link.from !== undefined) mergedLink.from = mergeRecord(originalLink && originalLink.from, link.from);
+          if (link.to !== undefined) mergedLink.to = mergeRecord(originalLink && originalLink.to, link.to);
+          return mergedLink;
+        });
+      }
+      return mergedGraph;
+    });
+  }
+
   // Merge the fields authored by the current editor into the original
   // universal document. Runtime extensions and future schema fields must
   // survive an editor autosave even when this UI cannot render them yet.
@@ -169,7 +256,7 @@ const WORKSPACE_BRIDGE = String.raw`
     }
 
     merged.engine = mergeRecord(baseProject.engine, editorDocument.engine);
-    merged.postProcess = mergeRecord(baseProject.postProcess, editorDocument.postProcess);
+    merged.postProcess = mergePostProcess(baseProject.postProcess, editorDocument.postProcess);
     if (Array.isArray(editorDocument.scenes)) {
       merged.scenes = mergeScenes(baseProject.scenes, editorDocument.scenes);
     }
@@ -197,6 +284,13 @@ const WORKSPACE_BRIDGE = String.raw`
     // additions, deletions, ordering, and known values come from the Editor.
     if (Array.isArray(editorDocument.particles)) {
       merged.particles = mergeParticles(baseProject.particles, editorDocument.particles);
+    }
+
+    // Shader Graphs are authored as stable-ID graphs with stable-ID nodes and
+    // links. Deep-merge matching records so custom compiler metadata survives,
+    // while the Editor owns ordering, additions, and deletions at every level.
+    if (Array.isArray(editorDocument.shaderGraphs)) {
+      merged.shaderGraphs = mergeShaderGraphs(baseProject.shaderGraphs, editorDocument.shaderGraphs);
     }
 
     // Keep non-image/runtime asset descriptors the editor cannot display.
