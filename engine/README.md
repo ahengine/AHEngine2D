@@ -2,7 +2,7 @@
 
 For the complete Universal Editor output contract and game-programming examples, see [`../README.md`](../README.md). For the coding-Agent workflow, see [`../Agent.md`](../Agent.md).
 
-AH2D keeps editor data independent from a specific renderer. The editor can preview the same universal scene through the `pixijs`, `phaserjs`, or `custom` runtime adapter. If PixiJS or Phaser is not loaded, the selected adapter runs through the editor Canvas compatibility bridge and reports that backend explicitly.
+AH2D keeps editor data independent from a specific renderer. The `pixijs`, `phaserjs`, and `custom` adapters consume the same loaded Universal Project version 4 and live ECS/Scene Graph; they do not generate, convert, or persist a runtime-specific document. Missing renderer dependencies or a failed mount report `backend: "editor-bridge"` and `native: false` so the Editor can present its compatibility preview explicitly.
 
 ## Stack
 
@@ -11,7 +11,7 @@ AH2D keeps editor data independent from a specific renderer. The editor can prev
 - Transform, Camera, Lighting, Shadow, Animation, deterministic Particle, Skeleton/FK/IK/Skinning, Shader Graph/Post Process, and Tilemap systems
 - Native Box2D-compatible backend through Planck with pixel/metre conversion
 - Deterministic built-in 2D physics backend available by explicit selection
-- Runtime adapters for PixiJS, PhaserJS, and custom hosts, with native PixiJS Post Process filters
+- Native runtime adapters for PixiJS, PhaserJS, and framework-free Canvas2D/custom hosts, with native PixiJS Post Process filters and Phaser/Custom effect hooks
 - Editor bridge for `AH2DEdtior.html`
 - Multi-Scene project loading and runtime Scene switching
 - Reusable Prefab Assets with expanded Scene Instances, path-based Overrides, Apply/Revert, and lossless Unpack
@@ -137,7 +137,7 @@ engine.postProcess.configure('cinematic-grade-effect', { enabled: true });
 console.log(engine.postProcess.resolvedActive);
 ```
 
-`engine.shaderGraphs` aliases `engine.shaders`. PixiJS WebGL creates and synchronizes reusable native Filters for supported built-in and compiled graph effects; its WebGPU/Canvas renderers currently skip those effects without stopping the Scene. PhaserJS and custom hosts map `resolvedActive` themselves. See [`../docs/SHADERS.md`](../docs/SHADERS.md) for the complete data contract, nodes, Editor workflow, and CLI examples.
+`engine.shaderGraphs` aliases `engine.shaders`. PixiJS WebGL creates and synchronizes reusable native Filters for supported built-in and compiled graph effects; its WebGPU/Canvas renderers currently skip those effects without stopping the Scene. PhaserJS and built-in Custom Canvas2D pass `resolvedActive` to their optional `postProcess` hooks; the host maps those descriptors to Phaser Pipelines, Canvas passes, or another renderer implementation. See [`../docs/SHADERS.md`](../docs/SHADERS.md) for the complete data contract, nodes, Editor workflow, and CLI examples.
 
 ## Prefab lifecycle
 
@@ -174,29 +174,108 @@ engine.skeleton.deform('character-skin');
 engine.skeleton.rebind('character-skin');
 ```
 
-The system performs deterministic 2D CCD IK and CPU linear-blend skinning. `Skeleton.pose`, `Skeleton.boneMatrices`, inverse bind matrices, and `Skin.deformedVertices` are Runtime-derived state. PixiJS v8 maps a complete Skin to a native `PIXI.Mesh`; PhaserJS and custom hosts can consume `deformedVertices`. Bone/IK animation Tracks run before IK and deformation. Prefab references are authored as source Entity IDs and resolved inside the exact concrete Instance group.
+The system performs deterministic 2D CCD IK and CPU linear-blend skinning. `Skeleton.pose`, `Skeleton.boneMatrices`, inverse bind matrices, and `Skin.deformedVertices` are Runtime-derived state. PixiJS v8 maps a complete Skin to a native `PIXI.Mesh`; PhaserJS and built-in Custom Canvas2D draw basic untextured triangles from `deformedVertices`, while a custom host may supply a richer mesh implementation. Bone/IK animation Tracks run before IK and deformation. Prefab references are authored as source Entity IDs and resolved inside the exact concrete Instance group.
 
 See [`../docs/SKELETONS.md`](../docs/SKELETONS.md) for schemas, coordinates, validation, Editor/Timeline usage, Prefab behavior, animation payloads, renderer responsibilities, and safe CLI mutations.
 
 ## Runtime selection and preview lifecycle
 
+Every adapter reads the same active ECS produced from Universal Project version 4. Runtime Game Objects, Canvas images, textures, Pipelines, and derived simulation values stay Runtime-only and are never serialized back into the authoring document. `engine.start()` owns the AH2D update loop; a renderer callback must not call `engine.update()` again.
+
+For an asynchronous renderer, call `engine.start(target, { paused: true })`, await `engine.runtime.ready`, verify `runtime.native`, and then `engine.resume()`. This prevents Animation, Physics, and particles from advancing behind a loading screen. `stop()` also settles a pending mount and invalidates late Phaser/host callbacks.
+
+### PhaserJS
+
+The native adapter can create and own a managed `Phaser.Game`:
+
 ```js
 const engine = new AH2D.Engine({ runtime: 'pixijs' });
 
-engine.useRuntime('phaserjs', { Phaser: window.Phaser });
-engine.start(previewElement, { restoreOnStop: true });
-engine.pause();
+engine.useRuntime('phaserjs', {
+  Phaser: window.Phaser,
+  designWidth: 1920,
+  designHeight: 1080,
+  fit: 'contain',
+  transparent: true,
+  textureResolver(renderable) {
+    return runtimeAssetUrls.get(renderable.assetId) || renderable.imageSrc || null;
+  },
+  gameConfig: {},
+  postProcess(scene, resolvedActive, engine, adapter) {
+    mapEffectsToPhaserPipelines(scene, resolvedActive);
+  }
+});
+engine.start(previewElement, { restoreOnStop: true, paused: true });
+await engine.runtime.ready;
+if (!engine.runtime.native) throw engine.runtime.error;
 engine.resume();
+engine.pause();
 engine.stop(); // Restores the pre-play snapshot when restoreOnStop is true.
+```
 
+An application that already owns Phaser can inject a Scene or Game:
+
+```js
+engine.useRuntime('phaserjs', { Phaser, scene: existingScene });
+engine.useRuntime('phaserjs', {
+  Phaser,
+  game: existingGame,
+  sceneKey: 'AH2D',
+  sceneConfig: {}
+});
+```
+
+The adapter mirrors every Entity as a nested Phaser Container, synchronizes local transforms and hierarchy changes, creates/removes Image or Rectangle Game Objects, resolves Universal Assets, loads textures, maps `Renderable.sourceRect` to a size/origin-correct Phaser crop, and applies visibility, anchor, size, tint, opacity, blend, sibling layer order, Camera, and viewport settings. Managed Games default to Phaser WebGL, `loader.imageLoadType: "HTMLImageElement"`, and `Scale.RESIZE`, leaving AH2D as the single owner of Camera/viewport fitting. Phaser Canvas is rejected with `E_RUNTIME_CAPABILITY` because it cannot preserve the Universal tint/hue contract; use the Custom Canvas2D adapter instead. Injected host Scenes get a dedicated identity Camera unless `isolateCamera: false` is explicitly selected. An injected Scene must already be active; a missing explicit `sceneKey` creates an adapter-owned integration Scene and never falls back to an unrelated host Scene. `transparent: true` overrides the active Camera clear color. It also maps correctly sized deterministic particle instances and draws basic untextured Skin triangles. Optional `preload`, `create`, `sync`, `render`, `postProcess`, and `destroy` hooks extend this lifecycle. Light/Shadow, Tilemap drawing, textured Skin meshes, and renderer-native Post Process Pipelines remain host integrations. Phaser may own its rendering loop, but AH2D remains the sole simulation loop.
+
+### Custom Canvas2D and exclusive host mode
+
+With no `render` hook, `custom` creates a framework-free Canvas2D renderer:
+
+```js
+engine.useRuntime('custom', {
+  designWidth: 1920,
+  designHeight: 1080,
+  fit: 'contain',
+  transparent: true,
+  imageResolver(renderable, entityId, engine, adapter) {
+    return imageCache.get(renderable.assetId) || null;
+  },
+  postProcess(context, canvas, resolvedActive, engine, adapter) {
+    applyCanvasEffects(context, canvas, resolvedActive);
+  }
+});
+engine.start(previewElement, { restoreOnStop: true, paused: true });
+await engine.runtime.ready;
+engine.resume();
+```
+
+The built-in Custom adapter accepts a Canvas target, an explicit `canvas`, or creates a Canvas in the target container. It applies the active Camera/viewport and exact world matrices, preserves hierarchy and inherited visibility, sorts Renderables by layer, resolves `imageSrc`/Universal Assets, applies image tint and particle hue, draws `sourceRect` through Canvas's nine-argument `drawImage`, and renders particles plus basic untextured Skin triangles. Missing authored image dimensions use a stable `64x64` fallback. `resize(width, height)` updates the backing Canvas even while paused. `imageResolver`, `imageFactory`, `postProcess`, and `afterRender` are optional extension hooks.
+
+Studio keeps relative asset paths in Universal JSON. Folder projects are resolved to temporary `data:image/...;base64` sources for the opaque-origin Editor iframe; these sources are shared by all Runtime selectors and are never persisted. A standalone JSON file cannot expose sibling image files, so open the containing project folder when relative assets are used.
+
+Supplying `render(engine, alpha, adapter)` preserves the legacy exclusive host-renderer contract unless `canvas: true` or `builtin: true` explicitly keeps the Canvas path:
+
+```js
 engine.useRuntime('custom', {
   mount(engine, target) {},
-  render(engine, alpha) {},
+  render(engine, alpha, adapter) {},
+  unmount(adapter) {},
   destroy() {}
 });
 ```
 
-`runtime.name` is the requested runtime and `runtime.backend` identifies the active implementation (`pixijs`, `phaserjs`, `custom`, or `editor-bridge`).
+In exclusive mode the host owns drawing but not simulation. `runtime.name` is the requested runtime, `runtime.backend` identifies the active implementation (`pixijs`, `phaserjs`, `custom`, or `editor-bridge`), and Custom additionally reports `implementation: "canvas2d"` or `"host"`.
+
+In a plain Browser page, load the runtime dependencies before the Engine in this order:
+
+```html
+<script src="../node_modules/pixi.js/dist/pixi.min.js"></script>
+<script src="../node_modules/pixi.js/dist/packages/unsafe-eval.min.js"></script>
+<script src="../node_modules/phaser/dist/phaser.min.js"></script>
+<script src="../node_modules/planck/dist/planck.min.js"></script>
+<script src="./AH2DDataModel.js"></script>
+<script src="./AH2DEngine.js"></script>
+```
 
 ## Rigidbody and Collider schema
 
@@ -254,6 +333,7 @@ The universal AH2D JSON remains the source of truth, so scenes and physics compo
 
 ```text
 node engine/AH2DEngine.test.js
+node engine/AH2DRuntimeAdapters.test.js
 ```
 
-The suite covers deep nested local/world transforms, dirty propagation, traversal, cycle protection, preserve-world reparent/detach, atomic singular/shear rejection, graph-aware deletion, runtime selection, gravity and damping, native contacts, triggers, collision filters, automatic mass, forces, torque, impulses, kinematic bodies, sleeping, bounded substeps, Skeleton/FK inheritance, CCD IK, linear-blend skinning, Prefab rig isolation, Bone/IK animation, Pixi mesh synchronization, native-handle access, lifecycle restoration, native Box2D conversion, and the Editor contract.
+The suite covers deep nested local/world transforms, dirty propagation, traversal, cycle protection, preserve-world reparent/detach, atomic singular/shear rejection, graph-aware deletion, native Pixi/Phaser/Custom adapter synchronization, Custom host-hook compatibility, source-rectangle rendering, particles, gravity and damping, native contacts, triggers, collision filters, automatic mass, forces, torque, impulses, kinematic bodies, sleeping, bounded substeps, Skeleton/FK inheritance, CCD IK, linear-blend skinning, Prefab rig isolation, Bone/IK animation, native-handle access, lifecycle restoration, native Box2D conversion, and the Editor contract.

@@ -2669,6 +2669,572 @@ const fakeHost = (width = 960, height = 600) => ({
   }
 });
 
+const createFakePhaserScene = ({ textures = [] } = {}) => {
+  const textureKeys = new Set(textures), created = [];
+
+  class GameObject {
+    constructor(kind) {
+      this.kind = kind;
+      this.parentContainer = null;
+      this.x = 0; this.y = 0; this.rotation = 0;
+      this.scaleX = 1; this.scaleY = 1;
+      this.visible = true; this.alpha = 1; this.depth = 0;
+      created.push(this);
+    }
+    setPosition(x, y) { this.x = x; this.y = y; return this; }
+    setRotation(rotation) { this.rotation = rotation; return this; }
+    setScale(x, y = x) { this.scaleX = x; this.scaleY = y; return this; }
+    setVisible(visible) { this.visible = visible; return this; }
+    setDepth(depth) { this.depth = depth; return this; }
+    setAlpha(alpha) { this.alpha = alpha; return this; }
+    setBlendMode(blendMode) { this.blendMode = blendMode; return this; }
+    setOrigin(x, y = x) { this.originX = x; this.originY = y; return this; }
+    setDisplaySize(width, height) { this.displayWidth = width; this.displayHeight = height; return this; }
+    setSize(width, height) { this.width = width; this.height = height; return this; }
+    setTint(tint) { this.tint = tint; return this; }
+    setTintMode(mode) { this.tintMode = mode; return this; }
+    setFillStyle(color, alpha = 1) { this.fillColor = color; this.fillAlpha = alpha; return this; }
+    setFlip(x, y) { this.flipX = x; this.flipY = y; return this; }
+    destroy() {
+      this.parentContainer?.remove?.(this, false);
+      this.destroyed = true;
+      this.destroyCount = (this.destroyCount || 0) + 1;
+    }
+  }
+
+  class Container extends GameObject {
+    constructor() { super('container'); this.list = []; }
+    add(value) {
+      for (const child of Array.isArray(value) ? value : [value]) {
+        if (!child || this.list.includes(child)) continue;
+        child.parentContainer?.remove?.(child, false);
+        this.list.push(child);
+        child.parentContainer = this;
+      }
+      return this;
+    }
+    remove(child, _destroy = false) {
+      const index = this.list.indexOf(child);
+      if (index >= 0) this.list.splice(index, 1);
+      if (child?.parentContainer === this) child.parentContainer = null;
+      return child;
+    }
+    moveTo(child, index) {
+      const current = this.list.indexOf(child);
+      if (current < 0) return this;
+      this.list.splice(current, 1);
+      this.list.splice(Math.max(0, Math.min(index, this.list.length)), 0, child);
+      return this;
+    }
+    removeAll(destroyChildren = false) {
+      for (const child of [...this.list]) {
+        this.remove(child, false);
+        if (destroyChildren) child.destroy?.();
+      }
+      return this;
+    }
+  }
+
+  class ImageObject extends GameObject {
+    constructor(key) {
+      super('image'); this.textureKey = key;
+      this.width = 64; this.height = 32;
+      this.frame = { realWidth: 64, realHeight: 32, width: 64, height: 32 };
+    }
+    setTexture(key) { this.textureKey = key; return this; }
+    setFrame(frame) { this.frame = frame; return this; }
+    setCrop(x, y, width, height) {
+      this.crop = arguments.length ? { x, y, width, height } : null;
+      return this;
+    }
+  }
+
+  class GraphicsObject extends GameObject {
+    constructor() { super('graphics'); this.paths = []; }
+    clear() { this.paths = []; return this; }
+    fillStyle(color, alpha) { this.fillColor = color; this.fillAlpha = alpha; return this; }
+    beginPath() { this.currentPath = []; return this; }
+    moveTo(x, y) { this.currentPath.push({ x, y }); return this; }
+    lineTo(x, y) { this.currentPath.push({ x, y }); return this; }
+    closePath() { return this; }
+    fillPath() { this.paths.push(this.currentPath); return this; }
+  }
+
+  const backgroundColors = [];
+  let cameraBit = 1;
+  const createCamera = () => ({
+    id: cameraBit <<= 1,
+    setViewport(x, y, width, height) { this.viewport = { x, y, width, height }; return this; },
+    setScroll(x, y) { this.scrollX = x; this.scrollY = y; return this; },
+    setZoom(value) { this.zoom = value; return this; },
+    setRotation(value) { this.rotation = value; return this; },
+    setBackgroundColor(color) { backgroundColors.push(color); this.backgroundColor = color; return this; },
+    ignore() { return this; }
+  });
+  const mainCamera = createCamera();
+  const cameras = {
+    main: mainCamera,
+    cameras: [mainCamera],
+    add(x, y, width, height, makeMain, name) {
+      const camera = createCamera();
+      camera.name = name; camera.setViewport(x, y, width, height);
+      this.cameras.push(camera);
+      if (makeMain) this.main = camera;
+      return camera;
+    },
+    remove(camera) {
+      const index = this.cameras.indexOf(camera);
+      if (index >= 0) this.cameras.splice(index, 1);
+      camera.destroyed = true;
+      return index >= 0 ? 1 : 0;
+    }
+  };
+  const scene = {
+    created,
+    textures: { exists: key => textureKeys.has(key) },
+    cameras,
+    add: {
+      container: () => new Container(),
+      image: (_x, _y, key) => new ImageObject(key),
+      rectangle: (_x, _y, width, height, color, alpha) => Object.assign(new GameObject('rectangle'), { width, height, fillColor: color, fillAlpha: alpha }),
+      circle: (_x, _y, radius, color, alpha) => Object.assign(new GameObject('circle'), { radius, fillColor: color, fillAlpha: alpha }),
+      graphics: () => new GraphicsObject()
+    }
+  };
+  return {
+    Phaser: {
+      AUTO: 0,
+      CANVAS: 1,
+      WEBGL: 2,
+      Scale: { RESIZE: 3, FIT: 4, CENTER_BOTH: 5 },
+      BlendModes: { NORMAL: 0, ADD: 1 },
+      TintModes: { MULTIPLY: 2 }
+    },
+    scene,
+    textureKeys,
+    backgroundColors,
+    classes: { Container, ImageObject, GameObject },
+    mainCamera
+  };
+};
+
+const testPhaserInjectedSceneUsesUniversalProject = () => {
+  const fake = createFakePhaserScene({ textures: ['ah2d:hero-image:eeznha'] });
+  const host = fakeHost(800, 400);
+  const particle = particleAsset('phaser-particles', {
+    emission: { rate: 0, burst: 1 },
+    lifetime: { min: 0.1, max: 0.1 },
+    appearance: { assetId: 'hero-image', color: '#ff0000', blend: 'additive', size: 8, baseScale: 1.5, baseOpacity: 0.6, baseHue: 120 }
+  });
+  const document = {
+    format: 'AH2D', version: 4,
+    dataModel: { id: 'ah2d.ecs', version: 1, componentSchemaVersion: 1 },
+    currentSceneId: 'main',
+    customProjectData: { keep: 'same-universal-json' },
+    assets: [{ id: 'hero-image', imageSrc: '/textures/hero.png' }],
+    particles: [particle],
+    scenes: [{
+      id: 'main', name: 'Main', objects: [
+        {
+          id: 'camera',
+          components: {
+            Transform: { x: 80, y: 30 },
+            Camera: { active: true, zoom: 2, viewportWidth: 400, viewportHeight: 200, clearColor: '#123456' }
+          }
+        },
+        {
+          id: 'parent',
+          components: {
+            Transform: { x: 20, y: 30, rotation: 30, scaleX: 2, scaleY: 3 },
+            Renderable: { width: 80, height: 40, color: '#336699', layer: 2 }
+          }
+        },
+        {
+          id: 'child', parentId: 'parent',
+          components: {
+            Transform: { x: 7, y: -4, rotation: -15, scaleX: 0.5, scaleY: 1.25 },
+            Renderable: {
+              assetId: 'hero-image', width: 32, height: 18,
+              anchorX: 0.25, anchorY: 0.75, layer: 5,
+              sourceRect: { x: 16, y: 8, width: 32, height: 18 }
+            }
+          }
+        },
+        {
+          id: 'hidden', parentId: 'parent',
+          components: { Renderable: { width: 10, height: 12, color: '#abcdef' }, Hidden: {} }
+        },
+        {
+          id: 'emitter', parentId: 'parent', x: 3, y: 4,
+          components: { ParticleEmitter: { assetId: particle.id, seed: 7 } }
+        }
+      ]
+    }]
+  };
+  const engine = new AH2D.Engine({
+    physics: 'builtin', particleStep: 1 / 120,
+    runtime: 'phaserjs',
+    runtimeOptions: {
+      Phaser: fake.Phaser,
+      scene: fake.scene,
+      viewport: { width: 400, height: 200, fit: 'contain' }
+    }
+  });
+  engine.load(document);
+  const readyEvents = [];
+  engine.events.on('runtime:ready', event => readyEvents.push(event));
+  engine.start(host, { restoreOnStop: false });
+  const runtime = engine.runtime;
+
+  assert.strictEqual(runtime.backend, 'phaserjs', runtime.error?.stack || runtime.error?.message);
+  assert.strictEqual(runtime.native, true);
+  assert.strictEqual(runtime.scene, fake.scene, 'an injected Phaser Scene must be used without creating a second Game');
+  assert.strictEqual(runtime.game, null);
+  assert.notStrictEqual(runtime.camera, fake.mainCamera, 'an injected Scene must receive an isolated identity camera');
+  assert.strictEqual(readyEvents.length, 1);
+  assert.deepStrictEqual(engine.document.customProjectData, { keep: 'same-universal-json' }, 'renderer setup must not rewrite unknown Universal Project data');
+
+  const parent = runtime.nodes.get('parent'), child = runtime.nodes.get('child'), hidden = runtime.nodes.get('hidden');
+  assert.ok(parent.node instanceof fake.classes.Container);
+  assert.ok(parent.visual instanceof fake.classes.GameObject);
+  assert.strictEqual(parent.visual.kind, 'rectangle', 'an untextured Renderable must use a native Phaser rectangle');
+  assert.ok(child.visual instanceof fake.classes.ImageObject, 'an Asset-backed Renderable must use a native Phaser image');
+  assert.strictEqual(parent.node.parentContainer, runtime.world);
+  assert.strictEqual(child.node.parentContainer, parent.childrenHost, 'Phaser nesting must mirror the AH2D Scene Graph');
+  assert.strictEqual(parent.childrenHost.list.at(-1), child.node, 'Renderable layer must determine stable sibling order inside Phaser Containers');
+  near(parent.node.x, 20, 1e-8, 'Phaser parent local x');
+  near(parent.node.y, 30, 1e-8, 'Phaser parent local y');
+  near(parent.node.rotation, 30 * Math.PI / 180, 1e-8, 'Phaser parent local rotation');
+  near(parent.node.scaleX, 2, 1e-8, 'Phaser parent local scaleX');
+  near(parent.node.scaleY, 3, 1e-8, 'Phaser parent local scaleY');
+  near(child.node.x, 7, 1e-8, 'Phaser child local x');
+  near(child.node.y, -4, 1e-8, 'Phaser child local y');
+  near(child.node.rotation, -15 * Math.PI / 180, 1e-8, 'Phaser child local rotation');
+  assert.strictEqual(parent.visual.fillColor, 0x336699);
+  assert.strictEqual(parent.visual.displayWidth, 80);
+  assert.strictEqual(parent.visual.displayHeight, 40);
+  assert.strictEqual(parent.node.depth, 2);
+  assert.strictEqual(child.node.depth, 5);
+  assert.strictEqual(child.visual.textureKey, 'ah2d:hero-image:eeznha');
+  assert.deepStrictEqual(child.visual.crop, { x: 16, y: 8, width: 32, height: 18 });
+  near(child.visual.originX, 0.375, 1e-8, 'cropped image compensated origin x');
+  near(child.visual.originY, 0.671875, 1e-8, 'cropped image compensated origin y');
+  assert.strictEqual(child.visual.displayWidth, 64);
+  near(child.visual.displayHeight, 32, 1e-8, 'cropped image compensated full-frame display height');
+  assert.strictEqual(hidden.node.visible, false, 'Hidden must disable the complete native Entity node');
+
+  assert.deepStrictEqual(
+    { width: runtime.viewport.width, height: runtime.viewport.height, logicalWidth: runtime.viewport.logicalWidth, logicalHeight: runtime.viewport.logicalHeight },
+    { width: 800, height: 400, logicalWidth: 400, logicalHeight: 200 }
+  );
+  const worldTransform = AH2D.Matrix2D.compose(
+    runtime.world.x, runtime.world.y, runtime.world.rotation * 180 / Math.PI,
+    runtime.world.scaleX, runtime.world.scaleY
+  );
+  matrixNear(worldTransform, runtime.viewport.view, 1e-8, 'Phaser viewport/camera matrix');
+  assert.strictEqual(runtime.camera.backgroundColor, '#123456');
+  runtime.options.transparent = true;
+  runtime.render();
+  assert.strictEqual(runtime.camera.backgroundColor, 'rgba(0,0,0,0)', 'transparent Runtime output must take precedence over Camera.clearColor');
+  runtime.options.transparent = false;
+  runtime.render();
+  assert.strictEqual(runtime.camera.backgroundColor, '#123456', 'opaque Runtime output must retain the Universal Camera clear color');
+
+  engine.update(0);
+  runtime.render();
+  const emitter = runtime.nodes.get('emitter');
+  assert.strictEqual(emitter.particleVisuals.size, 1, 'Phaser must render the shared deterministic Particle Runtime state');
+  const particleVisual = [...emitter.particleVisuals.values()][0];
+  assert.strictEqual(particleVisual.kind, 'image');
+  assert.strictEqual(particleVisual.alpha, 0.6);
+  assert.strictEqual(particleVisual.tint, 0x00ff00, 'particle hue must map to the native Phaser tint');
+  assert.strictEqual(particleVisual.blendMode, fake.Phaser.BlendModes.ADD);
+  near(particleVisual.scaleX, 0.1875, 1e-8, 'texture particle width must honor authored appearance size');
+  near(particleVisual.scaleY, 0.375, 1e-8, 'texture particle height must honor authored appearance size');
+
+  engine.ecs.get('child', 'Renderable').visible = false;
+  runtime.render();
+  assert.strictEqual(child.node.visible, false, 'Renderable.visible changes must synchronize live');
+  engine.ecs.get('child', 'Renderable').visible = true;
+  engine.createEntity({ id: 'created', x: -8, y: 6, components: { Renderable: { width: 14, height: 12, color: '#fedcba' } } });
+  runtime.render();
+  const created = runtime.nodes.get('created'), childNode = child.node;
+  assert.strictEqual(created.node.parentContainer, runtime.world);
+  assert.strictEqual(created.visual.fillColor, 0xfedcba);
+  engine.reparent('child', 'created');
+  runtime.render();
+  assert.strictEqual(child.node, childNode, 'reparenting must retain the native Phaser Entity node');
+  assert.strictEqual(child.node.parentContainer, created.childrenHost);
+  engine.reparent('child', 'parent');
+  runtime.render();
+  const createdNode = created.node, createdVisual = created.visual;
+  engine.destroyEntity('created');
+  runtime.render();
+  assert.strictEqual(runtime.nodes.has('created'), false);
+  assert.strictEqual(createdNode.destroyed, true);
+  assert.strictEqual(createdVisual.destroyed, true);
+  assert.strictEqual(child.node.parentContainer, parent.childrenHost);
+
+  engine.update(0.2);
+  runtime.render();
+  assert.strictEqual(emitter.particleVisuals.size, 0, 'expired particles must be removed from the Phaser display tree');
+  assert.strictEqual(particleVisual.destroyed, true);
+
+  const world = runtime.world, parentNode = parent.node, childVisual = child.visual;
+  const runtimeCamera = runtime.camera;
+  engine.stop({ restore: false });
+  assert.strictEqual(runtime.world, null);
+  assert.strictEqual(runtime.nodes.size, 0);
+  assert.strictEqual(runtime.objects.size, 0);
+  assert.strictEqual(runtime.particleObjects.size, 0);
+  assert.strictEqual(world.destroyed, true, 'unmount must destroy the adapter-owned Phaser world');
+  assert.strictEqual(parentNode.destroyed, true);
+  assert.strictEqual(childVisual.destroyed, true);
+  assert.strictEqual(runtimeCamera.destroyed, true, 'the adapter-owned isolated camera must be removed on unmount');
+  assert.strictEqual(fake.scene.cameras.cameras.length, 1, 'the host main camera must remain untouched');
+  assert.strictEqual(runtime.scene, fake.scene, 'unmounting must not destroy or detach the injected host Scene');
+};
+
+const testPhaserRendererConfiguration = () => {
+  const fake = createFakePhaserScene();
+  const adapter = new AH2D.PhaserRuntimeAdapter(fake.Phaser, {});
+  const config = adapter._gameConfig(fakeHost(640, 360), {});
+  assert.strictEqual(config.type, fake.Phaser.WEBGL, 'managed Phaser must default to WebGL so Universal tint and particle hue are preserved');
+  assert.strictEqual(config.transparent, false, 'managed Phaser is opaque unless transparency is explicitly requested');
+  assert.strictEqual(config.loader.imageLoadType, 'HTMLImageElement', 'sandbox-compatible image loading must not depend on fetch or a Worker');
+  assert.strictEqual(config.scale.mode, fake.Phaser.Scale.RESIZE, 'AH2D must own viewport fitting exactly once');
+
+  const transparent = new AH2D.PhaserRuntimeAdapter(fake.Phaser, { transparent: true });
+  assert.strictEqual(transparent._gameConfig(fakeHost(), {}).transparent, true);
+
+  const forcedCanvas = new AH2D.PhaserRuntimeAdapter(fake.Phaser, { type: fake.Phaser.CANVAS });
+  assert.throws(
+    () => forcedCanvas._gameConfig(fakeHost(), {}),
+    error => error.code === 'E_RUNTIME_CAPABILITY' && /Canvas renderer/.test(error.message),
+    'an explicitly forced Canvas renderer must fail instead of silently dropping tint'
+  );
+
+  const injected = createFakePhaserScene();
+  injected.scene.sys = {
+    game: { renderer: { type: injected.Phaser.CANVAS } },
+    settings: { key: 'CanvasHost' },
+    isActive: () => true
+  };
+  const engine = new AH2D.Engine({
+    physics: 'builtin', runtime: 'phaserjs',
+    runtimeOptions: { Phaser: injected.Phaser, scene: injected.scene }
+  });
+  engine.load({ format: 'AH2D', version: 4, scene: [] });
+  engine.start(fakeHost(), { restoreOnStop: false });
+  assert.strictEqual(engine.runtime.backend, 'editor-bridge', 'an injected Canvas-rendered Scene must fail closed');
+  assert.strictEqual(engine.runtime.error?.code, 'E_RUNTIME_CAPABILITY');
+  engine.stop({ restore: false });
+
+  const keyed = createFakePhaserScene({ textures: ['host-hero'] });
+  const keyedEngine = new AH2D.Engine({
+    physics: 'builtin', runtime: 'phaserjs',
+    runtimeOptions: { Phaser: keyed.Phaser, scene: keyed.scene, textureResolver: () => 'host-hero' }
+  });
+  keyedEngine.load({
+    format: 'AH2D', version: 4,
+    scene: [{ id: 'hero', components: { Renderable: { assetId: 'portable-hero', width: 32, height: 32 } } }]
+  });
+  keyedEngine.start(fakeHost(), { restoreOnStop: false });
+  assert.strictEqual(keyedEngine.runtime.nodes.get('hero').visual.textureKey, 'host-hero', 'an existing resolver string must remain a preloaded Phaser texture key');
+  assert.strictEqual(keyedEngine.runtime.textureLoads.size, 0, 'a preloaded resolver key must not be queued as an image URL');
+  keyedEngine.stop({ restore: false });
+};
+
+const testPhaserInjectedGameHonorsExplicitSceneKey = async () => {
+  const makeDocument = () => ({ format: 'AH2D', version: 4, scene: [] });
+  const exact = createFakePhaserScene(), unrelated = createFakePhaserScene();
+  exact.Phaser.Game = function FakeGame() {};
+  const lifecycle = { started: [], stopped: [], removed: [], added: [] };
+  const sceneManager = {
+    getScene: key => key === 'AH2D' ? exact.scene : null,
+    getScenes: () => [unrelated.scene],
+    isSleeping: () => false,
+    isActive: () => true,
+    start: key => lifecycle.started.push(key),
+    stop: key => lifecycle.stopped.push(key),
+    remove: key => lifecycle.removed.push(key),
+    add: key => lifecycle.added.push(key)
+  };
+  const game = { scene: sceneManager };
+  exact.scene.sys = { game, settings: { key: 'AH2D' } };
+  const engine = new AH2D.Engine({
+    physics: 'builtin', runtime: 'phaserjs',
+    runtimeOptions: { Phaser: exact.Phaser, game, sceneKey: 'AH2D' }
+  });
+  engine.load(makeDocument());
+  engine.start(fakeHost(), { restoreOnStop: false });
+  assert.strictEqual(engine.runtime.scene, exact.scene, 'an explicit sceneKey must never fall back to an unrelated active host Scene');
+  assert.deepStrictEqual(lifecycle.started, [], 'the adapter must not take over the lifecycle of an active host Scene');
+  assert.deepStrictEqual(lifecycle.added, []);
+  engine.stop({ restore: false });
+  assert.deepStrictEqual(lifecycle.stopped, [], 'adapter cleanup must not stop a host-owned Scene');
+  assert.deepStrictEqual(lifecycle.removed, [], 'adapter cleanup must not remove a host-owned Scene');
+
+  const sleeping = createFakePhaserScene();
+  sleeping.Phaser.Game = function FakeGame() {};
+  const sleepingLifecycle = { woke: [], started: [] };
+  const sleepingGame = {
+    scene: {
+      getScene: key => key === 'SleepingAH2D' ? sleeping.scene : null,
+      getScenes: () => [unrelated.scene],
+      isSleeping: () => true,
+      isActive: () => false,
+      wake: key => sleepingLifecycle.woke.push(key),
+      start: key => sleepingLifecycle.started.push(key)
+    }
+  };
+  sleeping.scene.sys = { game: sleepingGame, settings: { key: 'SleepingAH2D' } };
+  const sleepingEngine = new AH2D.Engine({
+    physics: 'builtin', runtime: 'phaserjs',
+    runtimeOptions: { Phaser: sleeping.Phaser, game: sleepingGame, sceneKey: 'SleepingAH2D' }
+  });
+  sleepingEngine.load(makeDocument());
+  sleepingEngine.start(fakeHost(), { restoreOnStop: false });
+  assert.strictEqual(sleepingEngine.runtime.backend, 'editor-bridge', 'a sleeping host Scene must fail closed instead of mounting before Phaser create');
+  assert.match(sleepingEngine.runtime.error?.message || '', /must already be active/);
+  assert.deepStrictEqual(sleepingLifecycle.woke, [], 'the adapter must not wake a host-owned Scene');
+  assert.deepStrictEqual(sleepingLifecycle.started, [], 'the adapter must not restart a host-owned Scene');
+  sleepingEngine.stop({ restore: false });
+
+  const direct = createFakePhaserScene();
+  direct.scene.sys = { settings: { key: 'DirectAH2D' }, isActive: () => false };
+  const directEngine = new AH2D.Engine({
+    physics: 'builtin', runtime: 'phaserjs',
+    runtimeOptions: { Phaser: direct.Phaser, scene: direct.scene }
+  });
+  directEngine.load(makeDocument());
+  directEngine.start(fakeHost(), { restoreOnStop: false });
+  assert.strictEqual(directEngine.runtime.backend, 'editor-bridge', 'a directly injected inactive Scene must fail closed');
+  assert.match(directEngine.runtime.error?.message || '', /must already be active/);
+  directEngine.stop({ restore: false });
+
+  const failed = createFakePhaserScene();
+  failed.Phaser.Game = function FakeGame() {};
+  let failedSceneConfig = null;
+  const failedLifecycle = { stopped: [], removed: [] };
+  const failedGame = {
+    scene: {
+      getScene: () => null,
+      getScenes: () => [],
+      add(key, config) {
+        failedSceneConfig = config;
+        failed.scene.sys = { game: failedGame, settings: { key } };
+        config.preload.call(failed.scene);
+        config.create.call(failed.scene);
+      },
+      stop: key => failedLifecycle.stopped.push(key),
+      remove: key => failedLifecycle.removed.push(key)
+    }
+  };
+  const failedEngine = new AH2D.Engine({
+    physics: 'builtin', runtime: 'phaserjs',
+    runtimeOptions: {
+      Phaser: failed.Phaser,
+      game: failedGame,
+      sceneKey: 'OwnedFailure',
+      sceneConfig: { preload() { throw new Error('preload failed'); } }
+    }
+  });
+  failedEngine.load(makeDocument());
+  let failedReadyEvents = 0;
+  failedEngine.events.on('runtime:ready', () => { failedReadyEvents += 1; });
+  failedEngine.start(fakeHost(), { restoreOnStop: false });
+  await failedEngine.runtime.ready;
+  assert.strictEqual(failedEngine.runtime.backend, 'editor-bridge');
+  assert.match(failedEngine.runtime.error?.message || '', /preload failed/);
+  assert.strictEqual(failedEngine.runtime.world, null);
+  assert.strictEqual(failedReadyEvents, 0);
+  failedSceneConfig.create.call(failed.scene);
+  assert.strictEqual(failedEngine.runtime.backend, 'editor-bridge', 'a late Phaser create callback must not revive a failed mount generation');
+  assert.deepStrictEqual(failedLifecycle.stopped, ['OwnedFailure']);
+  assert.deepStrictEqual(failedLifecycle.removed, ['OwnedFailure']);
+  failedEngine.stop({ restore: false });
+
+  const sheared = createFakePhaserScene();
+  const shearEngine = new AH2D.Engine({
+    physics: 'builtin', runtime: 'phaserjs',
+    runtimeOptions: { Phaser: sheared.Phaser, scene: sheared.scene, viewport: { width: 320, height: 180, fit: 'contain' } }
+  });
+  shearEngine.load({
+    format: 'AH2D', version: 4,
+    scene: [{
+      id: 'camera',
+      components: {
+        Transform: { x: 0, y: 0, rotation: 45, scaleX: 2, scaleY: 1 },
+        Camera: { active: true, zoom: 1, viewportWidth: 320, viewportHeight: 180 }
+      }
+    }]
+  });
+  shearEngine.start(fakeHost(320, 180), { restoreOnStop: false });
+  assert.strictEqual(shearEngine.runtime.backend, 'editor-bridge', 'Phaser must fail closed when the Universal Camera view contains unrepresentable shear');
+  assert.strictEqual(shearEngine.runtime.error?.code, 'E_TRANSFORM_SHEAR');
+  shearEngine.stop({ restore: false });
+
+  const paused = createFakePhaserScene();
+  paused.Phaser.Game = function FakeGame() {};
+  let pausedConfig = null;
+  const pausedLifecycle = { paused: [], resumed: [], stopped: [], removed: [] };
+  const pausedGame = {
+    scene: {
+      getScene: () => null,
+      getScenes: () => [],
+      add(key, config) { pausedConfig = config; paused.scene.sys = { game: pausedGame, settings: { key, status: 'STARTING' } }; },
+      pause: key => { pausedLifecycle.paused.push(key); paused.scene.sys.settings.status = 'PAUSED'; },
+      resume: key => { pausedLifecycle.resumed.push(key); paused.scene.sys.settings.status = 'RUNNING'; },
+      stop: key => pausedLifecycle.stopped.push(key),
+      remove: key => pausedLifecycle.removed.push(key)
+    }
+  };
+  const pausedEngine = new AH2D.Engine({
+    physics: 'builtin', runtime: 'phaserjs',
+    runtimeOptions: { Phaser: paused.Phaser, game: pausedGame, sceneKey: 'PausedUntilReady' }
+  });
+  pausedEngine.load(makeDocument());
+  pausedEngine.start(fakeHost(), { restoreOnStop: false, paused: true });
+  assert.strictEqual(pausedEngine.running, false);
+  pausedConfig.preload.call(paused.scene);
+  pausedConfig.create.call(paused.scene);
+  // Phaser SceneManager.create sets RUNNING after the user create callback.
+  paused.scene.sys.settings.status = 'RUNNING';
+  await pausedEngine.runtime.ready;
+  assert.deepStrictEqual(pausedLifecycle.paused, ['PausedUntilReady'], 'a managed Scene created after paused start must be paused before Runtime readiness');
+  assert.strictEqual(paused.scene.sys.settings.status, 'PAUSED', 'the deferred pause must win over Phaser SceneManager post-create status');
+  pausedEngine.resume();
+  assert.deepStrictEqual(pausedLifecycle.resumed, ['PausedUntilReady']);
+  pausedEngine.stop({ restore: false });
+
+  const cancelled = createFakePhaserScene();
+  cancelled.Phaser.Game = function FakeGame() {};
+  let cancelledConfig = null;
+  const cancelledGame = {
+    scene: {
+      getScene: () => null,
+      getScenes: () => [],
+      add(key, config) { cancelledConfig = config; cancelled.scene.sys = { game: cancelledGame, settings: { key } }; },
+      stop() {}, remove() {}
+    }
+  };
+  const cancelledEngine = new AH2D.Engine({
+    physics: 'builtin', runtime: 'phaserjs',
+    runtimeOptions: { Phaser: cancelled.Phaser, game: cancelledGame, sceneKey: 'CancelledBeforeCreate' }
+  });
+  cancelledEngine.load(makeDocument());
+  cancelledEngine.start(fakeHost(), { restoreOnStop: false });
+  const cancelledReady = cancelledEngine.runtime.ready;
+  cancelledEngine.stop({ restore: false });
+  await Promise.race([
+    cancelledReady,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('cancelled Phaser ready did not settle')), 50))
+  ]);
+  cancelledConfig.create.call(cancelled.scene);
+  assert.strictEqual(cancelledEngine.runtime.world, null, 'late create must not revive an unmounted Phaser generation');
+};
+
 const testPixiV8AsyncMountAndNativeScene = async () => {
   const initDeferred = deferred();
   const PIXI = createFakePixi({ asyncInit: true, initDeferred });
@@ -4662,10 +5228,26 @@ const testEditorRuntimeContract = () => {
   for (const token of ['data-add-component="rigidbody"', 'data-add-component="box-collider"', 'data-add-component="circle-collider"', 'ah2dEngine.pause()', 'ah2dEngine.resume()', 'pullSceneTransformsFromEngine()', 'function switchScene(', 'function createScene(', 'function saveCurrentScene()', 'currentSceneId:state.currentSceneId', 'scenes,scene:', '...dataModelDescriptor', "componentSchemas.create('Rigidbody'", 'writeEditorComponent(', 'postProcess:cloneData(state.postProcess)', 'function applyScenePostProcess(', "requestedPhysics:'box2d'", 'physics:state.requestedPhysics', 'state.requestedPhysics=next.requestedPhysics', 'requireConfiguredPhysics()']) {
     assert.ok(html.includes(token), `editor integration token is missing: ${token}`);
   }
-  const pixiScript = html.indexOf('./node_modules/pixi.js/dist/pixi.min.js'), pixiCspScript = html.indexOf('./node_modules/pixi.js/dist/packages/unsafe-eval.min.js'), planckScript = html.indexOf('./node_modules/planck/dist/planck.min.js'), dataModelScript = html.indexOf('./engine/AH2DDataModel.js'), engineScript = html.indexOf('./engine/AH2DEngine.js');
-  assert.ok(pixiScript >= 0 && pixiCspScript > pixiScript && planckScript > pixiCspScript && dataModelScript > planckScript && engineScript > dataModelScript, 'Pixi, its CSP-safe polyfill, Planck, DataModel, and Engine must load in dependency order');
+  const pixiScript = html.indexOf('./node_modules/pixi.js/dist/pixi.min.js'), pixiCspScript = html.indexOf('./node_modules/pixi.js/dist/packages/unsafe-eval.min.js'), phaserScript = html.indexOf('./node_modules/phaser/dist/phaser.min.js'), planckScript = html.indexOf('./node_modules/planck/dist/planck.min.js'), dataModelScript = html.indexOf('./engine/AH2DDataModel.js'), engineScript = html.indexOf('./engine/AH2DEngine.js');
+  assert.ok(pixiScript >= 0 && pixiCspScript > pixiScript && phaserScript > pixiCspScript && planckScript > phaserScript && dataModelScript > planckScript && engineScript > dataModelScript, 'Pixi, its CSP-safe polyfill, Phaser, Planck, DataModel, and Engine must load in dependency order');
+  assert.ok(html.includes("nativePreview=!stopped&&native&&backend!=='editor-bridge'"), 'every native Runtime canvas must use the Editor runtime stage');
+  assert.ok(!html.includes("nativePreview=!stopped&&state.runtime==='pixijs'"), 'native Runtime stage visibility must not be hardcoded to PixiJS');
   assert.ok(!html.includes('fallbackPhysicsSubstep'), 'editor must not run a second competing physics solver');
   assert.ok(html.includes("renderer:state.runtime"), 'Universal JSON must persist the selected runtime');
+  assert.ok(html.includes("paused:true"), 'Play must remain paused until the selected native Runtime is ready');
+  assert.ok(html.includes('textureResolver:renderable=>sourceFor(renderable)'), 'Phaser must resolve ephemeral local assets without rewriting Universal JSON');
+  assert.ok(html.includes('imageResolver:renderable=>sourceFor(renderable)'), 'Custom Canvas must resolve the same ephemeral local assets');
+  const safeImageSource = html.match(/const safeImageSrc=(value=>\{[^\r\n]+?\});/)?.[1];
+  assert.ok(safeImageSource, 'the Editor must expose one strict image-source gate');
+  const safeImageSrc = Function(`return (${safeImageSource})`)();
+  for (const source of [
+    'data:image/png;base64,AA==',
+    'data:image/bmp;base64,AA==',
+    'data:image/svg+xml;base64,PHN2Zy8+',
+  ]) assert.strictEqual(safeImageSrc(source), source, `${source.split(';', 1)[0]} must survive the local-asset bridge`);
+  for (const source of ['data:text/html;base64,AA==', 'data:image/svg+xml,<svg/>', 'javascript:alert(1)', 'https://example.com/image.png']) {
+    assert.strictEqual(safeImageSrc(source), '', `unsafe or remote source must be rejected: ${source}`);
+  }
 };
 
 const run = async () => {
@@ -4719,6 +5301,9 @@ const run = async () => {
   testLegacyInlineParticleEmitterCompatibility();
   testParticleCurvesMotionLifecycleAndControls();
   testParticleSnapshotRestoreAndSceneReset();
+  testPhaserInjectedSceneUsesUniversalProject();
+  testPhaserRendererConfiguration();
+  await testPhaserInjectedGameHonorsExplicitSceneKey();
   await testPixiV8AsyncMountAndNativeScene();
   await testPixiRuntimeMutationsAndAssetStaleness();
   testPixiSourceRectSubtextures();

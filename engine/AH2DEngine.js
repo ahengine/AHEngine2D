@@ -5469,16 +5469,1125 @@ void main(void) { gl_Position = filterVertexPosition(); vTextureCoord = filterTe
     }
   }
 
+  const runtimeColor = (value, fallback = 0xffffff) => {
+    if (value == null || value === '') return fallback;
+    if (Number.isFinite(Number(value))) return Number(value) >>> 0;
+    const source = String(value).trim();
+    if (/^#[0-9a-f]{3}$/i.test(source)) return Number.parseInt(source.slice(1).split('').map(part => part + part).join(''), 16);
+    if (/^#[0-9a-f]{6}$/i.test(source)) return Number.parseInt(source.slice(1), 16);
+    return fallback;
+  };
+
+  const runtimeColorCss = (value, fallback = '#ffffff') => {
+    if (typeof value === 'string' && /^#[0-9a-f]{3,8}$/i.test(value.trim())) return value.trim();
+    const number = runtimeColor(value, runtimeColor(fallback, 0xffffff));
+    return `#${number.toString(16).padStart(6, '0').slice(-6)}`;
+  };
+
+  const runtimeSourceRect = renderable => {
+    const rect = renderable?.sourceRect;
+    if (!rect || typeof rect !== 'object' || Array.isArray(rect)) return null;
+    const x = Number(rect.x), y = Number(rect.y), width = Number(rect.width), height = Number(rect.height);
+    return [x, y, width, height].every(Number.isFinite) && width > 0 && height > 0
+      ? { x, y, width, height }
+      : null;
+  };
+
+  const runtimeAnchor = (renderable, fallback = 0.5) => {
+    const anchor = renderable?.anchor;
+    return {
+      x: finite(renderable?.anchorX ?? (Array.isArray(anchor) ? anchor[0] : anchor?.x), fallback),
+      y: finite(renderable?.anchorY ?? (Array.isArray(anchor) ? anchor[1] : anchor?.y), fallback)
+    };
+  };
+
+  const runtimeAssetSources = engine => {
+    const index = new Map(), stack = [engine?.document?.assets], seen = new Set();
+    while (stack.length) {
+      const value = stack.pop();
+      if (!value || typeof value !== 'object' || seen.has(value)) continue;
+      seen.add(value);
+      if (!Array.isArray(value) && value.id != null) {
+        const source = value.imageSrc ?? value.src ?? value.url ?? value.dataUrl ?? value.dataURI;
+        if (source != null && source !== '') index.set(String(value.id), source);
+      }
+      if (Array.isArray(value)) value.forEach(item => stack.push(item));
+      else Object.values(value).forEach(item => { if (item && typeof item === 'object') stack.push(item); });
+    }
+    return index;
+  };
+
+  const runtimeTextureSource = (renderable, assetSources) => {
+    if (!renderable || typeof renderable !== 'object') return null;
+    for (const source of [renderable.imageSrc, renderable.src, assetSources?.get(String(renderable.assetId))]) {
+      if (source != null && source !== '') return source;
+    }
+    return null;
+  };
+
+  const runtimeSourceHash = value => {
+    const text = String(value);
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < text.length; index++) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(36);
+  };
+
+  const runtimeParticleSize = appearance => {
+    const radius = Math.max(0, finite(appearance?.radius, 0));
+    const size = Math.max(0, finite(appearance?.size, radius > 0 ? radius * 2 : 4)) || 4;
+    return {
+      width: Math.max(0, finite(appearance?.width, size)) || 4,
+      height: Math.max(0, finite(appearance?.height, size)) || 4,
+      circle: appearance?.shape !== 'box' && appearance?.particleShape !== 'box'
+    };
+  };
+
+  const runtimeHueColor = (value, hue) => {
+    const color = runtimeColor(value, 0xffffff) >>> 0;
+    const shift = finite(hue, 0);
+    if (Math.abs(shift) <= 1e-12) return color;
+    let r = ((color >> 16) & 255) / 255, g = ((color >> 8) & 255) / 255, b = (color & 255) / 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), delta = max - min;
+    let h = 0;
+    if (delta > 1e-12) {
+      if (max === r) h = ((g - b) / delta) % 6;
+      else if (max === g) h = (b - r) / delta + 2;
+      else h = (r - g) / delta + 4;
+      h /= 6;
+    }
+    h = ((h + shift / 360) % 1 + 1) % 1;
+    const saturation = max <= 1e-12 ? 0 : delta / max, valueChannel = max;
+    const sector = h * 6, index = Math.floor(sector), fraction = sector - index;
+    const p = valueChannel * (1 - saturation), q = valueChannel * (1 - saturation * fraction), t = valueChannel * (1 - saturation * (1 - fraction));
+    if (index === 0) [r, g, b] = [valueChannel, t, p];
+    else if (index === 1) [r, g, b] = [q, valueChannel, p];
+    else if (index === 2) [r, g, b] = [p, valueChannel, t];
+    else if (index === 3) [r, g, b] = [p, q, valueChannel];
+    else if (index === 4) [r, g, b] = [t, p, valueChannel];
+    else [r, g, b] = [valueChannel, p, q];
+    return (Math.round(r * 255) << 16) | (Math.round(g * 255) << 8) | Math.round(b * 255);
+  };
+
+  const runtimeActiveCamera = engine => {
+    const explicit = engine?.camera?.active;
+    if (explicit && engine.ecs.has(explicit, 'Camera')) return explicit;
+    return engine?.ecs?.query('Camera').find(id => engine.ecs.get(id, 'Camera')?.active === true) || null;
+  };
+
+  const runtimeViewport = (engine, target, options, width, height) => {
+    const cameraId = runtimeActiveCamera(engine);
+    const camera = cameraId ? engine.ecs.get(cameraId, 'Camera') : null;
+    const configured = options.viewport || {};
+    const logicalWidth = finite(camera?.viewportWidth ?? configured.width ?? options.viewportWidth ?? options.designWidth, width) || width || 1;
+    const logicalHeight = finite(camera?.viewportHeight ?? configured.height ?? options.viewportHeight ?? options.designHeight, height) || height || 1;
+    const hasDesignViewport = Boolean(options.viewport || options.viewportWidth || options.viewportHeight || options.designWidth || options.designHeight);
+    const fit = camera?.fit || configured.fit || options.fit || (hasDesignViewport ? 'contain' : 'none');
+    let fitX = 1, fitY = 1;
+    if (width > 0 && height > 0 && logicalWidth > 0 && logicalHeight > 0) {
+      if (fit === 'stretch') { fitX = width / logicalWidth; fitY = height / logicalHeight; }
+      else if (fit === 'contain' || fit === 'cover') {
+        const scale = fit === 'cover' ? Math.max(width / logicalWidth, height / logicalHeight) : Math.min(width / logicalWidth, height / logicalHeight);
+        fitX = scale; fitY = scale;
+      }
+    }
+    const offsetX = (width - logicalWidth * fitX) / 2, offsetY = (height - logicalHeight * fitY) / 2;
+    let view = [fitX, 0, 0, fitY, offsetX, offsetY];
+    if (cameraId) {
+      const zoom = finite(camera?.zoom, 1) || 1;
+      const cameraWorld = engine.transform.getWorldMatrix(cameraId);
+      view = multiply(view, multiply(matrix(logicalWidth / 2, logicalHeight / 2, 0, zoom, zoom), invert(cameraWorld)));
+    }
+    return { cameraId, camera, view, width, height, logicalWidth, logicalHeight, fit, clearColor: camera?.clearColor ?? options.clearColor };
+  };
+
+  /**
+   * A native Phaser display-tree adapter backed directly by AH2D's ECS.
+   * Phaser owns rendering only; AH2D remains the single simulation loop and
+   * the Universal document remains the authoring source of truth.
+   */
   class PhaserRuntimeAdapter extends RuntimeAdapter {
-    constructor(Phaser = global.Phaser) { super('phaserjs'); this.Phaser = Phaser; this.native = Boolean(Phaser?.Game); this.backend = this.native ? 'phaserjs' : 'editor-bridge'; }
-    mount(engine, target) { super.mount(engine, target); this.native = Boolean(this.Phaser?.Game); this.backend = this.native ? 'phaserjs' : 'editor-bridge'; }
+    constructor(Phaser = global.Phaser, options = {}) {
+      super('phaserjs');
+      this.Phaser = Phaser;
+      this.options = { ...options };
+      delete this.options.Phaser;
+      this.game = this.options.game || null;
+      this.scene = this.options.scene || null;
+      this.world = null;
+      this.nodes = new Map();
+      this.objects = new Map();
+      this.particleObjects = new Map();
+      this.textureKeys = new Map();
+      this.textureLoads = new Map();
+      this.ownedTextureKeys = new Set();
+      this.assetSources = new Map();
+      this._assetDocument = null;
+      this._mounted = false;
+      this._ownsGame = !this.options.game && !this.options.scene;
+      this._ownsScene = false;
+      this._sceneKey = null;
+      this._hostScene = Boolean(this.options.scene);
+      this._paused = false;
+      this.camera = null;
+      this._ownsCamera = false;
+      this._cameraIgnoredHostObjects = new Set();
+      this._mountGeneration = 0;
+      this._settleReady = null;
+      this.ready = Promise.resolve(this);
+      this.error = null;
+      this.native = this._supportsNative();
+      this.backend = this.native ? 'phaserjs' : 'editor-bridge';
+    }
+    _supportsScene(scene) { return Boolean(scene?.add?.container && (scene?.add?.image || scene?.add?.sprite) && scene?.add?.rectangle); }
+    _supportsNative() { return this._supportsScene(this.options.scene) || Boolean(this.Phaser?.Game); }
+    _isCanvas(target) { return String(target?.nodeName || target?.tagName || '').toUpperCase() === 'CANVAS'; }
+    _size() {
+      const canvas = this.game?.canvas;
+      const gameSize = this.game?.scale?.gameSize;
+      const positive = (...values) => {
+        for (const value of values) { const number = finite(value, 0); if (number > 0) return number; }
+        return 1;
+      };
+      return {
+        // Phaser renders in its game-coordinate space. This normally matches
+        // the host through RESIZE; it also stays correct when a host explicitly
+        // selects FIT, whose CSS dimensions must not become a second view scale.
+        width: positive(gameSize?.width, canvas?.width, this.target?.clientWidth, this.options.width, this.options.designWidth),
+        height: positive(gameSize?.height, canvas?.height, this.target?.clientHeight, this.options.height, this.options.designHeight)
+      };
+    }
+    _refreshAssets() {
+      if (this._assetDocument === this.engine?.document) return;
+      this._assetDocument = this.engine?.document || null;
+      this.assetSources = runtimeAssetSources(this.engine);
+      this.textureKeys.clear();
+    }
+    _textureInfo(renderable = {}, entityId = null) {
+      this._refreshAssets();
+      const resolved = this.options.textureResolver?.(renderable, entityId, this.engine, this.Phaser, this);
+      if (resolved && typeof resolved.then === 'function') throw new Error('Phaser textureResolver must return a texture key/source synchronously');
+      const resolvedString = typeof resolved === 'string' ? resolved : null;
+      const resolvedTextureKey = resolvedString && this.scene?.textures?.exists?.(resolvedString) ? resolvedString : null;
+      const resolvedSource = resolvedTextureKey ? null : (resolvedString ?? resolved?.source ?? resolved?.url);
+      const source = resolvedSource || runtimeTextureSource(renderable, this.assetSources);
+      const hostKey = resolvedTextureKey || resolved?.key || resolved?.textureKey || renderable.textureKey || renderable.phaserTexture || null;
+      if (hostKey) return { key: String(hostKey), source, sourceRect: runtimeSourceRect(renderable), hasTexture: true };
+      if (source == null || source === '') {
+        const assetKey = renderable.assetId == null ? null : String(renderable.assetId);
+        return { key: assetKey, source: null, sourceRect: runtimeSourceRect(renderable), hasTexture: Boolean(assetKey && this.scene?.textures?.exists?.(assetKey)) };
+      }
+      const sourceKey = String(source);
+      let key = this.textureKeys.get(sourceKey);
+      if (!key) {
+        const preferred = String(renderable.assetId || 'image').replace(/[^a-z0-9_-]+/gi, '-').slice(0, 64) || 'image';
+        key = `ah2d:${preferred}:${runtimeSourceHash(sourceKey)}`;
+        this.textureKeys.set(sourceKey, key);
+      }
+      return { key, source, sourceRect: runtimeSourceRect(renderable), hasTexture: true };
+    }
+    _collectTextureInputs() {
+      const inputs = [];
+      for (const id of this.engine.graph.traverse()) {
+        const renderable = this.engine.ecs.get(id, 'Renderable');
+        const skin = this.engine.ecs.get(id, 'Skin');
+        if (renderable || skin?.assetId) inputs.push({ entityId: id, input: { ...(renderable || {}), assetId: skin?.assetId || renderable?.assetId } });
+        const emitter = this.engine.ecs.get(id, 'ParticleEmitter');
+        const appearance = emitter ? this.engine.particles?.effectiveAsset(emitter)?.appearance : null;
+        if (appearance) inputs.push({ entityId: id, input: appearance });
+      }
+      return inputs;
+    }
+    _preloadScene(scene) {
+      this.scene = scene;
+      this._refreshAssets();
+      for (const { input, entityId } of this._collectTextureInputs()) {
+        const info = this._textureInfo(input, entityId);
+        if (!info.source || !info.key || scene.textures?.exists?.(info.key) || this.textureLoads.has(info.key)) continue;
+        scene.load?.image?.(info.key, info.source);
+        this.textureLoads.set(info.key, { status: 'queued', source: info.source, error: null });
+        this.ownedTextureKeys.add(info.key);
+      }
+      this.options.preload?.call(scene, this.engine, this);
+    }
+    _textureError(info, error) {
+      if (!info?.key) return;
+      const previous = this.textureLoads.get(info.key);
+      if (previous?.status === 'failed') return;
+      const failure = error instanceof Error ? error : new Error(`Failed to load Phaser texture: ${info.source || info.key}`);
+      this.textureLoads.set(info.key, { status: 'failed', source: info.source ?? previous?.source, error: failure });
+      this.engine?.events.emit('runtime:textureError', { runtime: this, entityId: info.entityId || null, key: info.key, source: info.source, error: failure, engine: this.engine });
+    }
+    _finalizePreloadedTextures() {
+      for (const [key, record] of this.textureLoads) {
+        if (record?.status !== 'queued') continue;
+        if (this.scene?.textures?.exists?.(key)) this.textureLoads.set(key, { ...record, status: 'loaded', error: null });
+        else this._textureError({ key, source: record.source }, new Error(`Phaser preload did not create texture: ${key}`));
+      }
+    }
+    _queueTexture(info) {
+      if (!info?.source || !info.key || !this.scene?.load?.image) return;
+      if (this.scene?.textures?.exists?.(info.key)) {
+        this.textureLoads.set(info.key, { status: 'loaded', source: info.source, error: null });
+        return;
+      }
+      if (this.textureLoads.has(info.key)) return;
+      this.ownedTextureKeys.add(info.key);
+      const completeEvent = 'filecomplete-image-' + info.key;
+      const cleanup = () => {
+        this.scene?.load?.off?.(completeEvent, finish);
+        this.scene?.load?.off?.('loaderror', fail);
+      };
+      const finish = () => {
+        cleanup();
+        this.textureLoads.set(info.key, { status: 'loaded', source: info.source, error: null });
+        if (this._mounted) this._syncScene();
+      };
+      const fail = file => {
+        if (file?.key !== info.key) return;
+        cleanup();
+        this._textureError(info, file?.error || new Error(`Failed to load Phaser texture: ${info.source}`));
+      };
+      this.textureLoads.set(info.key, { status: 'loading', source: info.source, error: null, cleanup });
+      this.scene.load.once?.(completeEvent, finish);
+      this.scene.load.on?.('loaderror', fail);
+      try {
+        this.scene.load.image(info.key, info.source);
+        if (!this.scene.load.isLoading?.()) this.scene.load.start?.();
+      } catch (error) {
+        cleanup();
+        this._textureError(info, error);
+      }
+    }
+    retryTexture(key) {
+      if (key != null) this.textureLoads.delete(String(key));
+      if (this._mounted) this._syncScene();
+      return this;
+    }
+    _gameConfig(target, sceneConfig) {
+      const configured = this.options.viewport || {};
+      const width = finite(this.options.width ?? configured.width ?? this.options.designWidth ?? target?.clientWidth, 800) || 800;
+      const height = finite(this.options.height ?? configured.height ?? this.options.designHeight ?? target?.clientHeight, 600) || 600;
+      const supplied = this.options.gameConfig || {};
+      const loader = { imageLoadType: 'HTMLImageElement', ...(supplied.loader || {}), ...(this.options.loader || {}) };
+      const scale = {
+        // AH2D owns Camera/design-viewport fitting. RESIZE keeps Phaser's game
+        // coordinates equal to its host surface so that fit is applied once.
+        mode: this.Phaser?.Scale?.RESIZE ?? this.Phaser?.Scale?.FIT,
+        autoCenter: this.Phaser?.Scale?.CENTER_BOTH,
+        width, height,
+        ...(supplied.scale || {}),
+        ...(this.options.scale || {})
+      };
+      const config = {
+        // Phaser's built-in texture tint is WebGL-only. Prefer WebGL so the
+        // Universal Renderable/particle color contract is not silently lost.
+        type: this.options.type ?? this.Phaser.WEBGL ?? this.Phaser.AUTO,
+        width, height,
+        transparent: this.options.transparent === true,
+        backgroundColor: this.options.clearColor || '#000000',
+        banner: false,
+        audio: { noAudio: true },
+        ...supplied,
+        loader,
+        scale,
+        scene: sceneConfig
+      };
+      if (this.Phaser?.CANVAS != null && config.type === this.Phaser.CANVAS) {
+        const error = new Error('Phaser Canvas renderer cannot preserve Universal Renderable tint and particle hue; use Phaser WebGL or the Custom Canvas2D Runtime');
+        error.code = 'E_RUNTIME_CAPABILITY';
+        throw error;
+      }
+      if (this._isCanvas(target)) config.canvas = target;
+      else if (target) config.parent = target;
+      return config;
+    }
+    _displayLeaves(entries, output = new Set()) {
+      for (const entry of Array.isArray(entries) ? entries : [entries]) {
+        if (!entry || output.has(entry)) continue;
+        if (entry.isParent && typeof entry.getChildren === 'function') this._displayLeaves(entry.getChildren(), output);
+        else output.add(entry);
+      }
+      return output;
+    }
+    _setupCameraIsolation() {
+      this.camera = this.scene?.cameras?.main || null;
+      if (!this._hostScene || this.options.isolateCamera === false) return;
+      if (!this.scene?.cameras?.add) throw new Error('An injected Phaser Scene requires CameraManager.add for an isolated AH2D viewport');
+      const size = this._size();
+      this.camera = this.scene.cameras.add(0, 0, size.width, size.height, false, `AH2D-${this._mountGeneration}`);
+      this._ownsCamera = Boolean(this.camera && this.camera !== this.scene.cameras.main);
+    }
+    _syncCameraIsolation() {
+      const camera = this.camera || this.scene?.cameras?.main;
+      if (!camera) return;
+      if (this._hostScene && !this._ownsCamera) return;
+      const size = this._size();
+      camera.setViewport?.(0, 0, size.width, size.height);
+      camera.setScroll?.(0, 0);
+      camera.setZoom?.(1);
+      camera.setRotation?.(0);
+      if (!this._ownsCamera) return;
+      const hostRoots = (this.scene?.children?.list || []).filter(entry => entry && entry !== this.world);
+      const hostLeaves = this._displayLeaves(hostRoots);
+      if (hostRoots.length) camera.ignore?.(hostRoots);
+      hostLeaves.forEach(entry => this._cameraIgnoredHostObjects.add(entry));
+      for (const other of this.scene?.cameras?.cameras || []) {
+        if (other !== camera && this.world) other.ignore?.(this.world);
+      }
+    }
+    _releaseCameraIsolation() {
+      if (!this._ownsCamera || !this.camera) { this.camera = null; this._ownsCamera = false; this._cameraIgnoredHostObjects.clear(); return; }
+      const cameraId = finite(this.camera.id, 0);
+      for (const entry of this._cameraIgnoredHostObjects) {
+        if (entry && Number.isFinite(entry.cameraFilter)) entry.cameraFilter &= ~cameraId;
+      }
+      this._cameraIgnoredHostObjects.clear();
+      try { this.scene?.cameras?.remove?.(this.camera, true); } catch (_) { /* Host camera cleanup is best-effort. */ }
+      this.camera = null;
+      this._ownsCamera = false;
+    }
+    _assertHostSceneActive(scene, key = scene?.sys?.settings?.key) {
+      const manager = scene?.sys?.game?.scene || this.game?.scene;
+      const sleeping = key ? manager?.isSleeping?.(key) : false;
+      const sceneActive = scene?.sys?.isActive?.();
+      const active = sceneActive == null && key ? manager?.isActive?.(key) : sceneActive;
+      if (sleeping || active === false) {
+        throw new Error(`Injected Phaser Scene "${key || 'unknown'}" must already be active; start or wake it in the host before mounting AH2D`);
+      }
+      return scene;
+    }
+    _assertRendererCapabilities() {
+      if (this.Phaser?.CANVAS != null && this.game?.renderer?.type === this.Phaser.CANVAS) {
+        const error = new Error('Phaser Canvas renderer cannot preserve Universal Renderable tint and particle hue; use Phaser WebGL or the Custom Canvas2D Runtime');
+        error.code = 'E_RUNTIME_CAPABILITY';
+        throw error;
+      }
+    }
+    _deferOwnedPause(scene, generation) {
+      const schedule = typeof global.queueMicrotask === 'function'
+        ? global.queueMicrotask.bind(global)
+        : callback => Promise.resolve().then(callback);
+      schedule(() => {
+        if (generation !== this._mountGeneration || !this._mounted || !this._paused || !(this._ownsGame || this._ownsScene)) return;
+        this.game?.scene?.pause?.(scene?.sys?.settings?.key || this._sceneKey);
+      });
+    }
+    _finishMount(scene, generation) {
+      if (generation !== this._mountGeneration) return this;
+      if (!this._supportsScene(scene)) throw new Error('Phaser Scene does not provide Container, Image, and Rectangle factories');
+      this.scene = scene;
+      this.game = this.game || scene.sys?.game || null;
+      this._assertRendererCapabilities();
+      this.world = scene.add.container(0, 0);
+      this.world.name = this.world.name || 'AH2D World';
+      this._setupCameraIsolation();
+      this._mounted = true;
+      this.error = null;
+      this.native = true;
+      this.backend = 'phaserjs';
+      this._finalizePreloadedTextures();
+      this._syncScene();
+      this.options.create?.call(scene, this.engine, this);
+      // Phaser marks a Scene RUNNING after its create callback returns. Pause
+      // on the following microtask so SceneManager cannot overwrite PAUSED.
+      if (this._paused && (this._ownsGame || this._ownsScene)) this._deferOwnedPause(scene, generation);
+      this.engine?.events.emit('runtime:ready', { runtime: this, engine: this.engine });
+      return this;
+    }
+    _fallback(error, generation) {
+      if (generation !== this._mountGeneration) return this;
+      this.error = error;
+      this.native = false;
+      this.backend = 'editor-bridge';
+      this._dispose();
+      try { this.engine?.events.emit('runtime:fallback', { runtime: this, error, engine: this.engine }); } catch (_) { /* Preserve initialization failure. */ }
+      return this;
+    }
+    mount(engine, target) {
+      this._dispose();
+      super.mount(engine, target);
+      this.error = null;
+      this.native = this._supportsNative();
+      this.backend = this.native ? 'phaserjs' : 'editor-bridge';
+      const generation = ++this._mountGeneration;
+      this._ownsScene = false;
+      this._sceneKey = null;
+      this._hostScene = Boolean(this.options.scene);
+      this._paused = false;
+      if (!this.native) { this.ready = Promise.resolve(this); return this; }
+      if (this.options.scene) {
+        try { this._finishMount(this._assertHostSceneActive(this.options.scene), generation); this.ready = Promise.resolve(this); }
+        catch (error) { this._fallback(error, generation); this.ready = Promise.resolve(this); }
+        return this;
+      }
+      let resolveReady, rejectReady;
+      this.ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+      let readySettled = false, mountFailed = false;
+      const settleReady = (error = null) => {
+        if (readySettled) return;
+        readySettled = true;
+        this._settleReady = null;
+        if (error) rejectReady(error); else resolveReady(this);
+      };
+      this._settleReady = () => settleReady();
+      const userScene = this.options.sceneConfig || {};
+      const adapter = this;
+      const sceneConfig = {
+        ...userScene,
+        key: userScene.key || this.options.sceneKey || `AH2DRuntime-${generation}`,
+        preload() {
+          try { userScene.preload?.call(this); adapter._preloadScene(this); }
+          catch (error) { mountFailed = true; settleReady(error); }
+        },
+        create() {
+          if (mountFailed || generation !== adapter._mountGeneration) return;
+          try {
+            userScene.create?.call(this);
+            adapter._finishMount(this, generation);
+            settleReady();
+          } catch (error) { mountFailed = true; settleReady(error); }
+        }
+      };
+      try {
+        this._ownsGame = !this.options.game;
+        if (this.options.game) {
+          this.game = this.options.game;
+          const requestedKey = userScene.key || this.options.sceneKey || null;
+          const exact = requestedKey ? this.game.scene?.getScene?.(requestedKey) : null;
+          const existing = exact || (!requestedKey ? this.game.scene?.getScenes?.(true)?.[0] : null);
+          if (existing) {
+            this._hostScene = true;
+            const existingKey = existing.sys?.settings?.key || requestedKey;
+            this._finishMount(this._assertHostSceneActive(existing, existingKey), generation);
+            settleReady();
+          } else {
+            this._ownsScene = true;
+            this._sceneKey = sceneConfig.key;
+            this.game.scene?.add?.(sceneConfig.key, sceneConfig, true);
+          }
+        } else this.game = new this.Phaser.Game(this._gameConfig(target, sceneConfig));
+        this.ready = this.ready.catch(error => this._fallback(error, generation));
+      } catch (error) {
+        this._fallback(error, generation);
+        this.ready = Promise.resolve(this);
+      }
+      return this;
+    }
+    _children(container) { return container?.list || container?.children || []; }
+    _contains(container, child) { return child?.parentContainer === container || this._children(container).includes(child); }
+    _add(container, child) { if (container && child && !this._contains(container, child)) container.add?.(child); }
+    _remove(container, child) { if (container && child && this._contains(container, child)) container.remove?.(child, false); }
+    _move(container, child, index) {
+      if (!container || !child || !this._contains(container, child)) return;
+      if (typeof container.moveTo === 'function') container.moveTo(child, index);
+      else {
+        const list = this._children(container), current = list.indexOf(child);
+        if (current >= 0 && current !== index) { list.splice(current, 1); list.splice(index, 0, child); }
+      }
+    }
+    _container(name) {
+      const value = this.scene.add.container(0, 0);
+      value.name = value.name || name;
+      return value;
+    }
+    _ensureNode(id) {
+      let record = this.nodes.get(id);
+      if (record) return record;
+      const node = this._container(`AH2D Entity ${id}`), visualHost = this._container(`AH2D Visual ${id}`), particleHost = this._container(`AH2D Particles ${id}`), childrenHost = this._container(`AH2D Children ${id}`);
+      node.add?.([visualHost, particleHost, childrenHost]);
+      record = { node, visualHost, particleHost, childrenHost, visual: null, visualKind: null, particleVisuals: new Map() };
+      this.nodes.set(id, record);
+      this.particleObjects.set(id, record.particleVisuals);
+      return record;
+    }
+    _destroyVisual(record) {
+      if (!record?.visual) return;
+      this._remove(record.visualHost, record.visual);
+      record.visual.destroy?.();
+      record.visual = null;
+      record.visualKind = null;
+    }
+    _destroyParticle(record, id) {
+      const visual = record?.particleVisuals?.get(id);
+      if (!visual) return;
+      this._remove(record.particleHost, visual);
+      visual.destroy?.();
+      record.particleVisuals.delete(id);
+    }
+    _removeNode(id) {
+      const record = this.nodes.get(id);
+      if (!record) return;
+      this._destroyVisual(record);
+      for (const particleId of [...record.particleVisuals.keys()]) this._destroyParticle(record, particleId);
+      for (const child of [...this._children(record.childrenHost)]) {
+        this._remove(record.childrenHost, child);
+        this._add(this.world, child);
+      }
+      if (record.node.parentContainer) this._remove(record.node.parentContainer, record.node);
+      record.node.removeAll?.(false);
+      for (const host of [record.visualHost, record.particleHost, record.childrenHost]) host.destroy?.();
+      record.node.destroy?.();
+      this.nodes.delete(id);
+      this.objects.delete(id);
+      this.particleObjects.delete(id);
+    }
+    _syncHierarchy(ids) {
+      const live = new Set(ids);
+      const graphOrder = new Map(ids.map((id, index) => [id, index]));
+      const byLayer = (left, right) => {
+        const a = this.engine.ecs.get(left, 'Renderable'), b = this.engine.ecs.get(right, 'Renderable');
+        const difference = finite(a?.zIndex ?? a?.zOrder ?? a?.layer, 0) - finite(b?.zIndex ?? b?.zOrder ?? b?.layer, 0);
+        return difference || finite(graphOrder.get(left), 0) - finite(graphOrder.get(right), 0);
+      };
+      for (const id of [...this.nodes.keys()]) if (!live.has(id)) this._removeNode(id);
+      ids.forEach(id => this._ensureNode(id));
+      for (const id of ids) {
+        const parentId = this.engine.graph.getParent(id);
+        const target = parentId == null ? this.world : this.nodes.get(parentId)?.childrenHost;
+        this._add(target, this.nodes.get(id).node);
+      }
+      this.engine.graph.roots(ids).sort(byLayer).forEach((id, index) => this._move(this.world, this.nodes.get(id)?.node, index));
+      for (const id of ids) this.engine.graph.getChildren(id).filter(child => live.has(child)).sort(byLayer).forEach((child, index) => this._move(this.nodes.get(id)?.childrenHost, this.nodes.get(child)?.node, index));
+    }
+    _local(id) {
+      const world = this.engine.transform.getWorldMatrix(id), parentId = this.engine.graph.getParent(id);
+      if (parentId == null) return decompose(world, { strict: false });
+      try { return decompose(multiply(invert(this.engine.transform.getWorldMatrix(parentId)), world), { strict: false }); }
+      catch (_) { return this.engine.transform.getLocal(id); }
+    }
+    _applyTransform(object, transform) {
+      object.setPosition?.(finite(transform?.x, 0), finite(transform?.y, 0));
+      if (!object.setPosition) { object.x = finite(transform?.x, 0); object.y = finite(transform?.y, 0); }
+      const rotation = finite(transform?.rotation, 0) * DEG_TO_RAD;
+      object.setRotation?.(rotation); if (!object.setRotation) object.rotation = rotation;
+      object.setScale?.(finite(transform?.scaleX, 1), finite(transform?.scaleY, 1));
+      if (!object.setScale) { object.scaleX = finite(transform?.scaleX, 1); object.scaleY = finite(transform?.scaleY, 1); }
+    }
+    _createVisual(record, kind, info = null) {
+      this._destroyVisual(record);
+      let visual;
+      if (kind === 'image') visual = (this.scene.add.image || this.scene.add.sprite).call(this.scene.add, 0, 0, info.key);
+      else if (kind === 'skin' && this.scene.add.graphics) visual = this.scene.add.graphics();
+      else visual = this.scene.add.rectangle(0, 0, 1, 1, 0xffffff, 1);
+      record.visual = visual;
+      record.visualKind = kind;
+      this._add(record.visualHost, visual);
+      return visual;
+    }
+    _drawSkin(record, skin, color) {
+      const visual = record.visual;
+      const vertices = Array.isArray(skin?.deformedVertices) && skin.deformedVertices.length === skin?.vertices?.length ? skin.deformedVertices : skin?.vertices;
+      if (!Array.isArray(vertices) || vertices.length < 3 || !visual) return false;
+      const indices = Array.isArray(skin.indices) && skin.indices.length ? skin.indices : Array.from({ length: Math.max(0, vertices.length - 2) }, (_, index) => [0, index + 1, index + 2]).flat();
+      visual.clear?.(); visual.fillStyle?.(color, 1);
+      for (let index = 0; index + 2 < indices.length; index += 3) {
+        const a = vertices[indices[index]], b = vertices[indices[index + 1]], c = vertices[indices[index + 2]];
+        if (![a, b, c].every(Boolean)) continue;
+        visual.beginPath?.(); visual.moveTo?.(finite(a.x, 0), finite(a.y, 0)); visual.lineTo?.(finite(b.x, 0), finite(b.y, 0)); visual.lineTo?.(finite(c.x, 0), finite(c.y, 0)); visual.closePath?.(); visual.fillPath?.();
+      }
+      return true;
+    }
+    _syncRenderable(id, record) {
+      const renderable = this.engine.ecs.get(id, 'Renderable'), skin = this.engine.ecs.get(id, 'Skin');
+      if (!renderable && !skin) {
+        this._destroyVisual(record); this.objects.delete(id);
+        record.node.setVisible?.(!this.engine.ecs.has(id, 'Hidden')); record.node.visible = !this.engine.ecs.has(id, 'Hidden');
+        return;
+      }
+      const textureInput = { ...(renderable || {}), assetId: skin?.assetId || renderable?.assetId };
+      const info = this._textureInfo(textureInput, id);
+      const loaded = Boolean(info.key && this.scene.textures?.exists?.(info.key));
+      if (info.hasTexture && !loaded) this._queueTexture(info);
+      const kind = skin && this.scene.add.graphics ? 'skin' : (loaded ? 'image' : 'rectangle');
+      const visual = record.visualKind === kind ? record.visual : this._createVisual(record, kind, info);
+      const color = runtimeColor(renderable?.tint ?? renderable?.color, 0xffffff);
+      const anchor = runtimeAnchor(renderable, 0.5), sourceRect = runtimeSourceRect(renderable);
+      const width = Math.max(0, finite(renderable?.width, sourceRect?.width ?? 64));
+      const height = Math.max(0, finite(renderable?.height, sourceRect?.height ?? 64));
+      if (kind === 'skin') this._drawSkin(record, skin, color);
+      else if (kind === 'image') {
+        visual.setTexture?.(info.key);
+        if (renderable?.frame != null && !sourceRect) { try { visual.setFrame?.(renderable.frame); } catch (_) { /* Host texture may not define authored frame metadata. */ } }
+        if (sourceRect) {
+          visual.setCrop?.(sourceRect.x, sourceRect.y, sourceRect.width, sourceRect.height);
+          // Phaser crop only clips the base frame; it intentionally does not
+          // change object dimensions or origin. Compensate the full-frame scale
+          // and pivot so the visible cropped region has AH2D's authored size and
+          // anchor, matching Pixi subtextures and Canvas drawImage.
+          const frameWidth = Math.max(1, finite(visual.frame?.realWidth ?? visual.frame?.width ?? visual.width, sourceRect.x + sourceRect.width));
+          const frameHeight = Math.max(1, finite(visual.frame?.realHeight ?? visual.frame?.height ?? visual.height, sourceRect.y + sourceRect.height));
+          visual.setDisplaySize?.(width * frameWidth / sourceRect.width, height * frameHeight / sourceRect.height);
+          visual.setOrigin?.(
+            (sourceRect.x + anchor.x * sourceRect.width) / frameWidth,
+            (sourceRect.y + anchor.y * sourceRect.height) / frameHeight
+          );
+        } else {
+          visual.setCrop?.();
+          visual.setOrigin?.(anchor.x, anchor.y);
+          visual.setDisplaySize?.(width, height);
+        }
+        visual.setTint?.(color);
+        if (this.Phaser?.TintModes?.MULTIPLY != null) visual.setTintMode?.(this.Phaser.TintModes.MULTIPLY);
+      } else {
+        visual.setSize?.(width, height); visual.setDisplaySize?.(width, height);
+        visual.setFillStyle?.(color, 1);
+        visual.setOrigin?.(anchor.x, anchor.y);
+      }
+      if (typeof visual.setFlip === 'function') visual.setFlip(Boolean(renderable?.flipX), Boolean(renderable?.flipY));
+      else { visual.setFlipX?.(Boolean(renderable?.flipX)); visual.setFlipY?.(Boolean(renderable?.flipY)); }
+      const alpha = clamp(finite(renderable?.alpha ?? renderable?.opacity, 1), 0, 1);
+      visual.setAlpha?.(alpha); visual.alpha = alpha;
+      const blend = String(renderable?.blendMode || 'normal').toLowerCase();
+      const blendMode = blend === 'additive' || blend === 'add' ? (this.Phaser?.BlendModes?.ADD ?? blend) : (this.Phaser?.BlendModes?.NORMAL ?? blend);
+      visual.setBlendMode?.(blendMode);
+      const visible = !(this.engine.ecs.has(id, 'Hidden') || renderable?.visible === false);
+      record.node.setVisible?.(visible); record.node.visible = visible;
+      const layer = finite(renderable?.zIndex ?? renderable?.zOrder ?? renderable?.layer, 0);
+      record.node.setDepth?.(layer); record.node.depth = layer;
+      this.objects.set(id, visual);
+    }
+    _createParticle(record, id, appearance, info) {
+      const size = runtimeParticleSize(appearance), loaded = Boolean(info.key && this.scene.textures?.exists?.(info.key));
+      let visual;
+      if (loaded) visual = (this.scene.add.image || this.scene.add.sprite).call(this.scene.add, 0, 0, info.key);
+      else if (size.circle && this.scene.add.circle) visual = this.scene.add.circle(0, 0, Math.max(size.width, size.height) / 2, 0xffffff, 1);
+      else visual = this.scene.add.rectangle(0, 0, size.width, size.height, 0xffffff, 1);
+      const nativeWidth = Math.max(1e-9, finite(visual.width ?? visual.displayWidth, size.width));
+      const nativeHeight = Math.max(1e-9, finite(visual.height ?? visual.displayHeight, size.height));
+      visual.__ah2dBaseScaleX = size.width / nativeWidth;
+      visual.__ah2dBaseScaleY = size.height / nativeHeight;
+      visual.__ah2dKind = loaded ? 'image' : (size.circle ? 'circle' : 'rectangle');
+      visual.__ah2dStyle = `${visual.__ah2dKind}|${info.key || ''}|${size.width}|${size.height}`;
+      record.particleVisuals.set(id, visual); this._add(record.particleHost, visual);
+      return visual;
+    }
+    _syncParticles(id, record) {
+      const emitter = this.engine.ecs.get(id, 'ParticleEmitter'), asset = emitter ? this.engine.particles?.effectiveAsset(emitter) : null;
+      const particles = Array.isArray(emitter?.particles) ? emitter.particles : [], appearance = asset?.appearance || {};
+      if (!emitter || !asset) {
+        for (const particleId of [...record.particleVisuals.keys()]) this._destroyParticle(record, particleId);
+        return;
+      }
+      const info = this._textureInfo(appearance, id), loaded = Boolean(info.key && this.scene.textures?.exists?.(info.key));
+      if (info.hasTexture && !loaded) this._queueTexture(info);
+      const size = runtimeParticleSize(appearance), kind = loaded ? 'image' : (size.circle ? 'circle' : 'rectangle'), style = `${kind}|${info.key || ''}|${size.width}|${size.height}`;
+      const live = new Set();
+      for (const particle of particles) {
+        if (!particle || particle.id == null) continue;
+        live.add(particle.id);
+        let visual = record.particleVisuals.get(particle.id);
+        if (!visual || visual.__ah2dStyle !== style) { if (visual) this._destroyParticle(record, particle.id); visual = this._createParticle(record, particle.id, appearance, info); }
+        visual.setPosition?.(finite(particle.x, 0), finite(particle.y, 0));
+        visual.x = finite(particle.x, 0); visual.y = finite(particle.y, 0);
+        const rotation = finite(particle.rotation, 0) * DEG_TO_RAD; visual.setRotation?.(rotation); visual.rotation = rotation;
+        const anchor = runtimeAnchor(appearance, 0.5); visual.setOrigin?.(anchor.x, anchor.y);
+        const scale = Math.max(0, finite(particle.scale, 1));
+        const scaleX = finite(visual.__ah2dBaseScaleX, 1) * scale, scaleY = finite(visual.__ah2dBaseScaleY, 1) * scale;
+        visual.setScale?.(scaleX, scaleY); visual.scaleX = scaleX; visual.scaleY = scaleY;
+        const alpha = clamp(finite(particle.opacity, 1), 0, 1); visual.setAlpha?.(alpha); visual.alpha = alpha;
+        const color = runtimeHueColor(particle.color ?? appearance.color, particle.hue); visual.setTint?.(color); visual.setFillStyle?.(color, 1);
+        const blend = String(particle.blend ?? appearance.blend ?? 'normal').toLowerCase(), mode = blend === 'additive' || blend === 'add' ? (this.Phaser?.BlendModes?.ADD ?? blend) : (this.Phaser?.BlendModes?.NORMAL ?? blend);
+        visual.setBlendMode?.(mode);
+      }
+      for (const particleId of [...record.particleVisuals.keys()]) if (!live.has(particleId)) this._destroyParticle(record, particleId);
+    }
+    _syncViewport() {
+      const size = this._size(), viewport = runtimeViewport(this.engine, this.target, this.options, size.width, size.height);
+      this.viewport = viewport;
+      this._applyTransform(this.world, decompose(viewport.view, { strict: true }));
+      const background = this.options.transparent === true
+        ? 'rgba(0,0,0,0)'
+        : (viewport.clearColor == null ? null : runtimeColorCss(viewport.clearColor, '#000000'));
+      if (background != null) (this.camera || this.scene?.cameras?.main)?.setBackgroundColor?.(background);
+    }
+    _syncScene() {
+      if (!this._mounted || !this.engine || !this.scene || !this.world) return false;
+      this.engine.transform.update();
+      const ids = this.engine.graph.traverse();
+      this._syncHierarchy(ids);
+      for (const id of ids) {
+        const record = this.nodes.get(id);
+        this._applyTransform(record.node, this._local(id));
+        this._syncRenderable(id, record);
+        this._syncParticles(id, record);
+      }
+      this._syncCameraIsolation();
+      this._syncViewport();
+      this.options.sync?.(this.scene, this.engine, this);
+      this.postProcess = this.engine.postProcess?.resolvedActive || [];
+      this.options.postProcess?.(this.scene, this.postProcess, this.engine, this);
+      return true;
+    }
+    render(alpha) {
+      const rendered = this._syncScene();
+      if (rendered) this.options.render?.(this.scene, this.engine, alpha, this);
+      return rendered;
+    }
+    pause() {
+      this._paused = true;
+      if ((this._ownsGame || this._ownsScene) && this.scene) this.game?.scene?.pause?.(this.scene.sys?.settings?.key || this._sceneKey);
+      return this;
+    }
+    resume() {
+      this._paused = false;
+      if ((this._ownsGame || this._ownsScene) && this.scene) this.game?.scene?.resume?.(this.scene.sys?.settings?.key || this._sceneKey);
+      return this;
+    }
+    resize(width, height) { this.game?.scale?.resize?.(finite(width, 0), finite(height, 0)); if (this._mounted) this._syncViewport(); return this; }
+    _dispose() {
+      const game = this.game, scene = this.scene, ownsGame = this._ownsGame, ownsScene = this._ownsScene, sceneKey = this._sceneKey;
+      this._settleReady?.(); this._settleReady = null;
+      this._mounted = false;
+      this._releaseCameraIsolation();
+      for (const id of [...this.nodes.keys()]) this._removeNode(id);
+      this.world?.removeAll?.(false); this.world?.destroy?.();
+      this.world = null;
+      this.nodes.clear(); this.objects.clear(); this.particleObjects.clear();
+      for (const record of this.textureLoads.values()) record?.cleanup?.();
+      for (const key of this.ownedTextureKeys) { try { scene?.textures?.remove?.(key); } catch (_) { /* Remove only adapter-owned texture keys. */ } }
+      this.textureLoads.clear(); this.ownedTextureKeys.clear();
+      if (game && ownsScene && !ownsGame && sceneKey) {
+        try { game.scene?.stop?.(sceneKey); game.scene?.remove?.(sceneKey); } catch (_) { /* Do not disturb host-owned Scenes. */ }
+      }
+      if (game && ownsGame) { try { game.destroy?.(true); } catch (_) { /* Best-effort across Phaser versions. */ } }
+      this.game = this.options.game || null;
+      this.scene = this.options.scene || null;
+      this.camera = null;
+      this._ownsScene = false;
+      this._sceneKey = null;
+      this._hostScene = Boolean(this.options.scene);
+      this._paused = false;
+    }
+    unmount() { ++this._mountGeneration; this._dispose(); this.ready = Promise.resolve(this); return this; }
+    destroy() { this.unmount(); this.options.destroy?.(this); this.error = null; super.destroy(); return this; }
   }
 
+  /**
+   * Default framework-free Runtime. Without host hooks it creates a Canvas2D
+   * surface and renders the same live ECS/Scene Graph used by Pixi and Phaser.
+   * Supplying a `render(engine, alpha)` hook preserves the original external
+   * custom-renderer contract.
+   */
   class CustomRuntimeAdapter extends RuntimeAdapter {
-    constructor(hooks = {}) { super('custom'); this.hooks = hooks; this.native = true; this.backend = 'custom'; }
-    mount(engine, target) { super.mount(engine, target); this.hooks.mount?.(engine, target); }
-    render(alpha) { this.hooks.render?.(this.engine, alpha); }
-    destroy() { this.hooks.destroy?.(); super.destroy(); }
+    constructor(hooks = {}) {
+      super('custom');
+      this.hooks = hooks || {};
+      this.options = this.hooks;
+      this.canvas = this.options.canvas && this.options.canvas !== true ? this.options.canvas : null;
+      this.context = null;
+      this.tintCanvas = null;
+      this.tintContext = null;
+      this.objects = new Map();
+      this.images = new Map();
+      this.assetSources = new Map();
+      this._assetDocument = null;
+      this._ownsCanvas = false;
+      this._mounted = false;
+      this._attached = false;
+      this._mountReady = true;
+      this._mountGeneration = 0;
+      this._cancelReady = null;
+      this._requestedSize = null;
+      this._external = typeof this.hooks.render === 'function' && this.options.canvas !== true && this.options.builtin !== true;
+      this.ready = Promise.resolve(this);
+      this.error = null;
+      this.native = true;
+      this.backend = 'custom';
+      this.implementation = this._external ? 'host' : 'canvas2d';
+    }
+    _isCanvas(target) { return String(target?.nodeName || target?.tagName || '').toUpperCase() === 'CANVAS' || typeof target?.getContext === 'function'; }
+    _createCanvas() {
+      if (this.canvas) return this.canvas;
+      if (this._isCanvas(this.target)) return this.target;
+      const canvas = this.options.canvasFactory?.(this.engine, this.target, this) || global.document?.createElement?.('canvas') || null;
+      if (canvas && typeof this.target?.appendChild === 'function') { this.target.appendChild(canvas); this._ownsCanvas = true; }
+      return canvas;
+    }
+    mount(engine, target) {
+      if (this._attached || this._mounted || this._ownsCanvas) this.unmount();
+      super.mount(engine, target);
+      const generation = ++this._mountGeneration;
+      this._attached = true;
+      this.error = null;
+      this.native = true;
+      this.backend = 'custom';
+      this.implementation = this._external ? 'host' : 'canvas2d';
+      try {
+        const mounted = this.hooks.mount?.(engine, target, this);
+        this._mountReady = !(mounted && typeof mounted.then === 'function');
+        if (!this._external) {
+          this.canvas = this._createCanvas();
+          this.context = this.canvas?.getContext?.('2d', this.options.contextAttributes) || null;
+          if (!this.canvas || !this.context) throw new Error('Custom Canvas Runtime requires a Canvas2D-capable target or document');
+          if (this.canvas.style) { this.canvas.style.width = '100%'; this.canvas.style.height = '100%'; this.canvas.style.display = 'block'; }
+          this._mounted = true;
+          this.render(1);
+        } else this._mounted = true;
+        const setup = Promise.resolve(mounted).then(
+          () => ({ ready: true }),
+          error => ({ error })
+        );
+        const cancelled = new Promise(resolve => { this._cancelReady = () => resolve({ cancelled: true }); });
+        this.ready = Promise.race([setup, cancelled]).then(result => {
+          this._cancelReady = null;
+          if (result.cancelled) return this;
+          if (result.error) return this._fallback(result.error, generation);
+          if (generation !== this._mountGeneration || !this._mounted) return this;
+          const needsInitialRender = !this._mountReady;
+          this._mountReady = true;
+          if (needsInitialRender && !this._external) this.render(1);
+          this.engine?.events.emit('runtime:ready', { runtime: this, engine: this.engine });
+          return this;
+        });
+      } catch (error) {
+        this._fallback(error, generation);
+        this.ready = Promise.resolve(this);
+      }
+      return this;
+    }
+    _fallback(error, generation = this._mountGeneration) {
+      if (generation !== this._mountGeneration) return this;
+      this.error = error instanceof Error ? error : new Error(String(error || 'Custom Runtime mount failed'));
+      this.native = false;
+      this.backend = 'editor-bridge';
+      try { this._detach(true); } catch (_) { this._detach(false); }
+      try { this.engine?.events.emit('runtime:fallback', { runtime: this, error: this.error, engine: this.engine }); } catch (_) { /* Preserve mount error. */ }
+      return this;
+    }
+    _size() {
+      const positive = (...values) => {
+        for (const value of values) { const number = finite(value, 0); if (number > 0) return number; }
+        return 1;
+      };
+      return {
+        width: positive(this._requestedSize?.width, this.target?.clientWidth, this.canvas?.clientWidth, this.options.width, this.options.designWidth, this.canvas?.width),
+        height: positive(this._requestedSize?.height, this.target?.clientHeight, this.canvas?.clientHeight, this.options.height, this.options.designHeight, this.canvas?.height)
+      };
+    }
+    _resize() {
+      const size = this._size(), ratio = Math.max(0.1, finite(this.options.resolution, global.devicePixelRatio || 1) || 1);
+      const width = Math.max(1, Math.round(size.width * ratio)), height = Math.max(1, Math.round(size.height * ratio));
+      if (this.canvas.width !== width) this.canvas.width = width;
+      if (this.canvas.height !== height) this.canvas.height = height;
+      this.resolution = ratio;
+      return size;
+    }
+    _refreshAssets() {
+      if (this._assetDocument === this.engine?.document) return;
+      this._assetDocument = this.engine?.document || null;
+      this.assetSources = runtimeAssetSources(this.engine);
+      this.images.clear();
+    }
+    _image(renderable, id) {
+      this._refreshAssets();
+      const resolved = this.options.imageResolver?.(renderable, id, this.engine, this);
+      if (resolved && typeof resolved !== 'string') return resolved;
+      const source = resolved || runtimeTextureSource(renderable, this.assetSources);
+      if (source == null || source === '') return null;
+      const key = String(resolved || source);
+      let record = this.images.get(key);
+      if (!record) {
+        const image = this.options.imageFactory?.(key, renderable, id, this.engine, this) || (typeof global.Image === 'function' ? new global.Image() : null);
+        record = { image, loaded: Boolean(image?.complete && (image.naturalWidth || image.width)), error: null };
+        this.images.set(key, record);
+        if (image && !record.loaded) {
+          if (this.options.crossOrigin != null && !String(key).startsWith('data:') && !String(key).startsWith('blob:')) image.crossOrigin = this.options.crossOrigin;
+          image.onload = () => {
+            record.loaded = Boolean(image.naturalWidth || image.width);
+            record.error = record.loaded ? null : new Error(`Loaded image has no drawable dimensions: ${key}`);
+            if (this._mounted && this.engine?.running) this.render(1);
+          };
+          image.onerror = error => { record.error = error || new Error(`Failed to load ${key}`); this.engine?.events.emit('runtime:textureError', { runtime: this, entityId: id, source: key, error: record.error, engine: this.engine }); };
+          image.src = key;
+        }
+      }
+      return record.loaded && !record.error ? record.image : null;
+    }
+    _orderedIds() {
+      const ids = [], visit = id => {
+        ids.push(id);
+        const children = this.engine.graph.getChildren(id).slice().sort((left, right) => {
+          const a = this.engine.ecs.get(left, 'Renderable'), b = this.engine.ecs.get(right, 'Renderable');
+          return finite(a?.zIndex ?? a?.zOrder ?? a?.layer, 0) - finite(b?.zIndex ?? b?.zOrder ?? b?.layer, 0);
+        });
+        children.forEach(visit);
+      };
+      this.engine.graph.roots().slice().sort((left, right) => {
+        const a = this.engine.ecs.get(left, 'Renderable'), b = this.engine.ecs.get(right, 'Renderable');
+        return finite(a?.zIndex ?? a?.zOrder ?? a?.layer, 0) - finite(b?.zIndex ?? b?.zOrder ?? b?.layer, 0);
+      }).forEach(visit);
+      return ids;
+    }
+    _visible(id, resolved) {
+      const parent = this.engine.graph.getParent(id), inherited = parent == null ? true : resolved.get(parent) !== false;
+      const renderable = this.engine.ecs.get(id, 'Renderable');
+      const visible = inherited && !this.engine.ecs.has(id, 'Hidden') && renderable?.visible !== false;
+      resolved.set(id, visible);
+      return visible;
+    }
+    _setMatrix(values) {
+      const ratio = this.resolution || 1;
+      this.context.setTransform(values[0] * ratio, values[1] * ratio, values[2] * ratio, values[3] * ratio, values[4] * ratio, values[5] * ratio);
+    }
+    _blend(value) {
+      const blend = String(value || 'normal').toLowerCase();
+      if (blend === 'additive' || blend === 'add') return 'lighter';
+      if (blend === 'multiply') return 'multiply';
+      if (blend === 'screen') return 'screen';
+      return 'source-over';
+    }
+    _tintBuffer(image, sourceRect, value) {
+      const color = runtimeColor(value, 0xffffff);
+      if (color === 0xffffff) return null;
+      const sourceWidth = Math.max(1, Math.ceil(finite(sourceRect?.width, image?.naturalWidth ?? image?.videoWidth ?? image?.width ?? 1)));
+      const sourceHeight = Math.max(1, Math.ceil(finite(sourceRect?.height, image?.naturalHeight ?? image?.videoHeight ?? image?.height ?? 1)));
+      if (!this.tintCanvas) {
+        this.tintCanvas = this.options.tintCanvasFactory?.(this.engine, this) ||
+          (typeof global.OffscreenCanvas === 'function' ? new global.OffscreenCanvas(sourceWidth, sourceHeight) : global.document?.createElement?.('canvas')) || null;
+        this.tintContext = this.tintCanvas?.getContext?.('2d') || null;
+      }
+      if (!this.tintCanvas || !this.tintContext) return null;
+      if (this.tintCanvas.width !== sourceWidth) this.tintCanvas.width = sourceWidth;
+      if (this.tintCanvas.height !== sourceHeight) this.tintCanvas.height = sourceHeight;
+      const context = this.tintContext;
+      context.setTransform?.(1, 0, 0, 1, 0, 0);
+      context.globalAlpha = 1;
+      context.globalCompositeOperation = 'source-over';
+      context.clearRect(0, 0, sourceWidth, sourceHeight);
+      if (sourceRect) context.drawImage(image, sourceRect.x, sourceRect.y, sourceRect.width, sourceRect.height, 0, 0, sourceWidth, sourceHeight);
+      else context.drawImage(image, 0, 0, sourceWidth, sourceHeight);
+      context.globalCompositeOperation = 'multiply';
+      context.fillStyle = runtimeColorCss(color);
+      context.fillRect(0, 0, sourceWidth, sourceHeight);
+      context.globalCompositeOperation = 'destination-in';
+      if (sourceRect) context.drawImage(image, sourceRect.x, sourceRect.y, sourceRect.width, sourceRect.height, 0, 0, sourceWidth, sourceHeight);
+      else context.drawImage(image, 0, 0, sourceWidth, sourceHeight);
+      context.globalCompositeOperation = 'source-over';
+      return this.tintCanvas;
+    }
+    _drawImage(image, sourceRect, x, y, width, height, tint = 0xffffff) {
+      const tinted = this._tintBuffer(image, sourceRect, tint);
+      if (tinted) this.context.drawImage(tinted, x, y, width, height);
+      else if (sourceRect) this.context.drawImage(image, sourceRect.x, sourceRect.y, sourceRect.width, sourceRect.height, x, y, width, height);
+      else this.context.drawImage(image, x, y, width, height);
+    }
+    _drawSkin(skin, renderable) {
+      const vertices = Array.isArray(skin?.deformedVertices) && skin.deformedVertices.length === skin?.vertices?.length ? skin.deformedVertices : skin?.vertices;
+      if (!Array.isArray(vertices) || vertices.length < 3) return false;
+      const indices = Array.isArray(skin.indices) && skin.indices.length ? skin.indices : Array.from({ length: Math.max(0, vertices.length - 2) }, (_, index) => [0, index + 1, index + 2]).flat();
+      this.context.fillStyle = runtimeColorCss(renderable?.tint ?? renderable?.color, '#ffffff');
+      for (let index = 0; index + 2 < indices.length; index += 3) {
+        const a = vertices[indices[index]], b = vertices[indices[index + 1]], c = vertices[indices[index + 2]];
+        if (![a, b, c].every(Boolean)) continue;
+        this.context.beginPath(); this.context.moveTo(finite(a.x, 0), finite(a.y, 0)); this.context.lineTo(finite(b.x, 0), finite(b.y, 0)); this.context.lineTo(finite(c.x, 0), finite(c.y, 0)); this.context.closePath(); this.context.fill();
+      }
+      return true;
+    }
+    _drawRenderable(id, renderable, skin) {
+      if (!renderable && !skin) return;
+      this.context.globalAlpha = clamp(finite(renderable?.alpha ?? renderable?.opacity, 1), 0, 1);
+      this.context.globalCompositeOperation = this._blend(renderable?.blendMode);
+      if (skin && this._drawSkin(skin, renderable)) return;
+      const sourceRect = runtimeSourceRect(renderable), anchor = runtimeAnchor(renderable, 0.5), image = this._image(renderable, id);
+      const width = Math.max(0, finite(renderable?.width, sourceRect?.width ?? 64));
+      const height = Math.max(0, finite(renderable?.height, sourceRect?.height ?? 64));
+      const x = -width * anchor.x, y = -height * anchor.y;
+      this.context.save();
+      if (renderable?.flipX || renderable?.flipY) { this.context.scale(renderable.flipX ? -1 : 1, renderable.flipY ? -1 : 1); }
+      if (image) this._drawImage(image, sourceRect, x, y, width, height, renderable?.tint ?? renderable?.color);
+      else {
+        this.context.fillStyle = runtimeColorCss(renderable?.tint ?? renderable?.color, '#ffffff');
+        this.context.fillRect(x, y, width, height);
+      }
+      this.context.restore();
+    }
+    _drawParticles(id, emitter) {
+      const asset = emitter ? this.engine.particles?.effectiveAsset(emitter) : null, particles = Array.isArray(emitter?.particles) ? emitter.particles : [];
+      if (!asset || !particles.length) return;
+      const appearance = asset.appearance || {}, image = this._image(appearance, id), size = runtimeParticleSize(appearance), anchor = runtimeAnchor(appearance, 0.5);
+      for (const particle of particles) {
+        this.context.save();
+        this.context.translate(finite(particle.x, 0), finite(particle.y, 0));
+        this.context.rotate(finite(particle.rotation, 0) * DEG_TO_RAD);
+        const scale = Math.max(0, finite(particle.scale, 1)); this.context.scale(scale, scale);
+        this.context.globalAlpha = clamp(finite(particle.opacity, 1), 0, 1);
+        this.context.globalCompositeOperation = this._blend(particle.blend ?? appearance.blend);
+        const x = -size.width * anchor.x, y = -size.height * anchor.y;
+        if (image) this._drawImage(image, runtimeSourceRect(appearance), x, y, size.width, size.height, runtimeHueColor(particle.color ?? appearance.color, particle.hue));
+        else {
+          this.context.fillStyle = runtimeColorCss(runtimeHueColor(particle.color ?? appearance.color, particle.hue));
+          if (size.circle) { this.context.beginPath(); this.context.arc(0, 0, Math.max(size.width, size.height) / 2, 0, Math.PI * 2); this.context.fill(); }
+          else this.context.fillRect(x, y, size.width, size.height);
+        }
+        this.context.restore();
+      }
+    }
+    _draw(alpha) {
+      if (!this._mounted || !this._mountReady || !this.context || !this.canvas) return false;
+      this.engine.transform.update();
+      const size = this._resize(), viewport = runtimeViewport(this.engine, this.target, this.options, size.width, size.height), ratio = this.resolution || 1;
+      this.viewport = viewport;
+      this.context.setTransform(1, 0, 0, 1, 0, 0);
+      this.context.globalAlpha = 1; this.context.globalCompositeOperation = 'source-over';
+      this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      if (viewport.clearColor != null && this.options.transparent !== true) {
+        this.context.fillStyle = runtimeColorCss(viewport.clearColor, '#000000'); this.context.fillRect(0, 0, this.canvas.width, this.canvas.height);
+      }
+      const ids = this._orderedIds(), live = new Set(ids), visible = new Map();
+      for (const id of ids) {
+        const isVisible = this._visible(id, visible), renderable = this.engine.ecs.get(id, 'Renderable'), skin = this.engine.ecs.get(id, 'Skin'), emitter = this.engine.ecs.get(id, 'ParticleEmitter');
+        const world = this.engine.transform.getWorldMatrix(id), screen = multiply(viewport.view, world);
+        this.objects.set(id, { id, parentId: this.engine.graph.getParent(id), world: world.slice(), screen: screen.slice(), visible: isVisible, renderable, particleCount: Array.isArray(emitter?.particles) ? emitter.particles.length : 0 });
+        if (!isVisible) continue;
+        this.context.save(); this._setMatrix(screen);
+        this._drawRenderable(id, renderable, skin); this._drawParticles(id, emitter);
+        this.context.restore();
+      }
+      for (const id of [...this.objects.keys()]) if (!live.has(id)) this.objects.delete(id);
+      this.context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      this.postProcess = this.engine.postProcess?.resolvedActive || [];
+      this.hooks.postProcess?.(this.context, this.canvas, this.postProcess, this.engine, this);
+      this.hooks.afterRender?.(this.context, this.canvas, this.engine, alpha, this);
+      return true;
+    }
+    render(alpha) {
+      if (this._external) {
+        if (!this._mounted || !this._mountReady) return false;
+        this.hooks.render?.(this.engine, alpha, this);
+        return true;
+      }
+      return this._draw(alpha);
+    }
+    resize(width, height) {
+      this._requestedSize = {
+        width: Math.max(1, finite(width, this._requestedSize?.width ?? this.options.width ?? 1)),
+        height: Math.max(1, finite(height, this._requestedSize?.height ?? this.options.height ?? 1))
+      };
+      if (this._mounted && !this._external) this.render(1);
+      return this;
+    }
+    _detach(notify) {
+      const attached = this._attached;
+      this._mounted = false;
+      this._mountReady = false;
+      this.objects.clear(); this.images.clear(); this.context = null; this.tintCanvas = null; this.tintContext = null;
+      if (this._ownsCanvas && this.canvas?.parentNode && typeof this.canvas.parentNode.removeChild === 'function') this.canvas.parentNode.removeChild(this.canvas);
+      this.canvas = this.options.canvas && this.options.canvas !== true ? this.options.canvas : null;
+      this._ownsCanvas = false;
+      this._attached = false;
+      if (notify && attached) this.hooks.unmount?.(this);
+      return this;
+    }
+    unmount() {
+      this._cancelReady?.(); this._cancelReady = null;
+      ++this._mountGeneration;
+      this._detach(true);
+      return this;
+    }
+    destroy() { this.unmount(); this.hooks.destroy?.(this); this.error = null; super.destroy(); return this; }
   }
 
   const prefabError = (code, message, details, pointer = '') => new DataModel.ComponentSchemaError(code, message, { pointer, details });
@@ -6592,7 +7701,7 @@ void main(void) { gl_Position = filterVertexPosition(); vTextureCoord = filterTe
       this.runtime?.destroy();
       if (type instanceof RuntimeAdapter) this.runtime = type;
       else if (type === 'pixijs') this.runtime = new PixiRuntimeAdapter(options.PIXI, options);
-      else if (type === 'phaserjs') this.runtime = new PhaserRuntimeAdapter(options.Phaser);
+      else if (type === 'phaserjs') this.runtime = new PhaserRuntimeAdapter(options.Phaser, options);
       else this.runtime = new CustomRuntimeAdapter(options);
       if (this.running && target) this.runtime.mount(this, target);
       this.events.emit('runtime:change', { runtime: this.runtime, name: this.runtime.name });
@@ -6994,17 +8103,32 @@ void main(void) { gl_Position = filterVertexPosition(); vTextureCoord = filterTe
       this.runtimeTarget = target || this.runtimeTarget;
       this.restoreOnStop = options.restoreOnStop !== false;
       this.playSnapshot = options.snapshot === false ? null : this.captureSnapshot();
-      this.runtime?.mount(this, this.runtimeTarget);
+      const startPaused = options.paused === true;
       this.running = true;
       this.lastTime = global.performance?.now?.() ?? Date.now();
-      this.events.emit('runtime:start', { runtime: this.runtime, snapshot: this.playSnapshot, engine: this });
-      this.frameHandle = this._requestFrame(this.frame);
+      try {
+        this.runtime?.mount(this, this.runtimeTarget);
+        if (!this.running) return this;
+        this.events.emit('runtime:start', { runtime: this.runtime, snapshot: this.playSnapshot, engine: this });
+        if (!this.running) return this;
+        if (startPaused) {
+          this.running = false;
+          this.runtime?.pause?.();
+          this.events.emit('runtime:pause', { engine: this });
+        } else this.frameHandle = this._requestFrame(this.frame);
+      } catch (error) {
+        this.running = false;
+        this._cancelFrame(this.frameHandle); this.frameHandle = null;
+        try { this.runtime?.unmount?.(); } catch (_) { /* Preserve the mount error. */ }
+        throw error;
+      }
       return this;
     }
     pause() {
       if (!this.running) return this;
       this.running = false;
       this._cancelFrame(this.frameHandle); this.frameHandle = null;
+      this.runtime?.pause?.();
       this.events.emit('runtime:pause', { engine: this });
       return this;
     }
@@ -7012,8 +8136,16 @@ void main(void) { gl_Position = filterVertexPosition(); vTextureCoord = filterTe
       if (this.running) return this;
       this.running = true;
       this.lastTime = global.performance?.now?.() ?? Date.now();
-      this.events.emit('runtime:resume', { engine: this });
-      this.frameHandle = this._requestFrame(this.frame);
+      try {
+        this.runtime?.resume?.();
+        if (!this.running) return this;
+        this.events.emit('runtime:resume', { engine: this });
+        if (this.running) this.frameHandle = this._requestFrame(this.frame);
+      } catch (error) {
+        this.running = false;
+        this._cancelFrame(this.frameHandle); this.frameHandle = null;
+        throw error;
+      }
       return this;
     }
     stop(options = {}) {

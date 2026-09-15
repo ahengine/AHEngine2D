@@ -401,21 +401,28 @@ async function main(): Promise<void> {
     const frameCsp = frameResponse.headers.get("content-security-policy") ?? "";
     assert.match(frameCsp, /default-src 'none'/);
     assert.doesNotMatch(frameCsp, /script-src[^;]*'unsafe-eval'/);
+    assert.match(frameCsp, /connect-src data: blob:/);
+    assert.match(frameCsp, /worker-src blob:/);
     assert.equal(frameResponse.headers.get("referrer-policy"), "no-referrer");
     const frameSource = await frameResponse.text();
     const framePixiIndex = frameSource.indexOf("var PIXI=(function");
     const framePixiCspIndex = frameSource.indexOf("generateUniformsSyncPolyfill");
+    const framePhaserIndex = frameSource.indexOf('define("Phaser"');
     const framePlanckIndex = frameSource.indexOf("Planck.js v1.5.0");
     const frameDataModelIndex = frameSource.indexOf("root.AH2DDataModel = api");
     const frameRuntimeIndex = frameSource.indexOf("const DataModel = global.AH2DDataModel");
+    const frameBridgeIndex = frameSource.indexOf("<script data-ah2d-workspace-bridge>");
     assert(framePixiIndex >= 0);
     assert(framePixiCspIndex > framePixiIndex);
-    assert(framePlanckIndex > framePixiCspIndex);
+    assert(framePhaserIndex > framePixiCspIndex);
+    assert(framePlanckIndex > framePhaserIndex);
     assert(frameDataModelIndex >= 0);
     assert(frameRuntimeIndex > frameDataModelIndex);
     assert(frameDataModelIndex > framePlanckIndex);
+    assert(frameBridgeIndex > frameRuntimeIndex, "the workspace bridge must be inserted after every inlined renderer/runtime bundle");
     assert.equal(frameSource.includes('<script src="./node_modules/pixi.js/dist/pixi.min.js"></script>'), false);
     assert.equal(frameSource.includes('<script src="./node_modules/pixi.js/dist/packages/unsafe-eval.min.js"></script>'), false);
+    assert.equal(frameSource.includes('<script src="./node_modules/phaser/dist/phaser.min.js"></script>'), false);
     assert.equal(frameSource.includes('<script src="./node_modules/planck/dist/planck.min.js"></script>'), false);
     assert.equal(frameSource.includes('<script src="./engine/AH2DEngine.js"></script>'), false);
     assert.equal(frameSource.includes('<script src="./engine/AH2DDataModel.js"></script>'), false);
@@ -446,10 +453,15 @@ async function main(): Promise<void> {
       },
     };
     let editorSnapshot: Record<string, unknown> | null = null;
+    let runtimeAssetSources: Record<string, string> = {};
     const bridgeWindow = {
       parent: bridgeParent,
+      getRuntimeAssetSources: () => structuredClone(runtimeAssetSources),
+      setRuntimeAssetSources: (sources: Record<string, string>) => { runtimeAssetSources = structuredClone(sources); },
       projectData: () => editorSnapshot,
-      loadProject(project: Record<string, unknown>) {
+      loadProject(project: Record<string, unknown>, assetSources: Record<string, string> = {}) {
+        if ((project.project as { name?: string } | undefined)?.name === "Rejected While Playing") return false;
+        runtimeAssetSources = structuredClone(assetSources);
         const sourceClip = (project.animations as Array<Record<string, unknown>>)[0];
         const sourceParticle = (project.particles as Array<Record<string, unknown>>)[0];
         const sourceShaderGraph = (project.shaderGraphs as Array<Record<string, unknown>>)[0];
@@ -596,6 +608,7 @@ async function main(): Promise<void> {
       scenes: [{ id: "main", name: "Main", objects: [] }],
       currentSceneId: "main",
       scene: [],
+      assets: [{ id: "hero", imageSrc: "textures/hero.png", futureAssetField: "keep" }],
       animations: [
         {
           id: "walk",
@@ -716,14 +729,34 @@ async function main(): Promise<void> {
         type: "AH2D_LOAD_PROJECT",
         requestId: "animation-load",
         document: loadedProject,
+        assetSources: { hero: "data:image/png;base64,aGVybw==", "textures/hero.png": "data:image/png;base64,aGVybw==" },
       },
     });
+    assert.equal(runtimeAssetSources.hero, "data:image/png;base64,aGVybw==", "ephemeral local asset data must reach the sandboxed Editor");
+    messageListener({
+      source: bridgeParent,
+      origin: "http://localhost",
+      data: {
+        source: "ah2d-studio",
+        type: "AH2D_LOAD_PROJECT",
+        requestId: "blocked-runtime-load",
+        document: { ...loadedProject, project: { name: "Rejected While Playing" } },
+        assetSources: { hero: "data:image/png;base64,bmV3" },
+      },
+    });
+    assert.equal(runtimeAssetSources.hero, "data:image/png;base64,aGVybw==", "a rejected active-Preview load must not replace the live Runtime asset map");
+    assert(bridgeMessages.some(message => message.type === "AH2D_BRIDGE_ERROR" && message.requestId === "blocked-runtime-load"));
     const hostCommandListener = bridgeListeners.get("ah2d:host-command")?.[0];
     assert(hostCommandListener, "the bridge must subscribe to hosted save commands");
     hostCommandListener({ detail: { command: "save", document: editorSnapshot } });
 
     const saveMessage = bridgeMessages.find((message) => message.type === "AH2D_SAVE_REQUEST");
     assert(saveMessage, "an authored animation change must produce a hosted save request");
+    assert.equal(
+      ((saveMessage.document as { assets: Array<{ imageSrc: string }> }).assets[0]).imageSrc,
+      "textures/hero.png",
+      "ephemeral asset data must never replace authored Universal asset paths",
+    );
     const savedAnimations = (saveMessage.document as {
       animations: Array<Record<string, unknown>>;
     }).animations;

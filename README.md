@@ -874,7 +874,7 @@ const pose = AH2D.sampleAnimationClip(
 );
 ```
 
-AnimationSystem زمان هر Entity را مستقل جلو می‌برد، Position/Rotation و Bone pose را روی Transform محلی، IK Track را روی Target/Constraint و Sprite را روی Renderable نمونه‌برداری و اعمال می‌کند، Hitbox sample را در state Runtime نگه می‌دارد و Event Track را با `animation:event` منتشر می‌کند. سپس SkeletonSystem زنجیره‌های IK را حل و Skin را deform می‌کند. Clip غیر-loop در پایان `animation:complete` می‌فرستد. PixiJS adapter مقدار `Renderable.sourceRect` را مستقیماً به subtexture برش‌خورده تبدیل می‌کند؛ مقدار `frame` بدون `sourceRect` فقط وقتی قابل‌نمایش است که Asset یا host متادیتای Sprite Sheet لازم برای تبدیل شمارهٔ frame به rectangle را فراهم کند. در PhaserJS و Runtime سفارشی، نگاشت Renderable نهایی به Texture/frame بومی همچنان بر عهدهٔ host است.
+AnimationSystem زمان هر Entity را مستقل جلو می‌برد، Position/Rotation و Bone pose را روی Transform محلی، IK Track را روی Target/Constraint و Sprite را روی Renderable نمونه‌برداری و اعمال می‌کند، Hitbox sample را در state Runtime نگه می‌دارد و Event Track را با `animation:event` منتشر می‌کند. سپس SkeletonSystem زنجیره‌های IK را حل و Skin را deform می‌کند. Clip غیر-loop در پایان `animation:complete` می‌فرستد. هر سه adapter مقدار نهایی `Renderable` را از همان ECS می‌خوانند: `sourceRect` در PixiJS به subtexture، در PhaserJS به crop و در Custom Canvas2D به `drawImage` نه‌آرگومانی تبدیل می‌شود. مقدار `frame` بدون `sourceRect` فقط وقتی قابل‌نمایش است که Asset یا host متادیتای Sprite Sheet لازم را فراهم کند.
 
 در Sprite Track، `keyframe.frame` موقعیت زمانی Key و `value.frame` شمارهٔ تصویر Sprite Sheet است؛ `value.sourceRect` برش دقیق پیکسلی را نگه می‌دارد. `spriteFrame` فقط alias سازگاری قدیمی است و خروجی canonical از `frame` استفاده می‌کند.
 
@@ -899,7 +899,7 @@ engine.skeleton.solve('foot-target');
 const vertices = engine.skeleton.deform('knight-skin');
 ```
 
-`Skeleton.pose`، `Skeleton.boneMatrices` و `Skin.deformedVertices` فقط Runtime state هستند و در Universal Authoring ذخیره نمی‌شوند. PixiJS یک Mesh واقعی می‌سازد و position buffer را با deformation همگام می‌کند؛ PhaserJS/Custom می‌توانند همان `deformedVertices` را مصرف کنند. Referenceهای Rig داخل Prefab با Source Entity ID نگه‌داری و برای هر Instance مستقل resolve می‌شوند. قرارداد کامل، مثال JSON، workflow Editor/CLI، Trackهای Bone/IK و قواعد Rebind در [`docs/SKELETONS.md`](./docs/SKELETONS.md) آمده است.
+`Skeleton.pose`، `Skeleton.boneMatrices` و `Skin.deformedVertices` فقط Runtime state هستند و در Universal Authoring ذخیره نمی‌شوند. PixiJS یک Mesh واقعی می‌سازد و position buffer را با deformation همگام می‌کند؛ PhaserJS و Custom Canvas2D نیز یک fallback بومی از مثلث‌های بدون Texture را با همان `deformedVertices` رسم می‌کنند و host می‌تواند نگاشت مش کامل‌تری ارائه دهد. Referenceهای Rig داخل Prefab با Source Entity ID نگه‌داری و برای هر Instance مستقل resolve می‌شوند. قرارداد کامل، مثال JSON، workflow Editor/CLI، Trackهای Bone/IK و قواعد Rebind در [`docs/SKELETONS.md`](./docs/SKELETONS.md) آمده است.
 
 ### Camera، Light، Shadow و Tilemap
 
@@ -930,17 +930,22 @@ PixiJS Runtime دوربین فعال را به‌صورت خودکار روی ro
 
 ```js
 engine.useRuntime('custom', {
-  mount(engine, target) {
-    renderer.attach(target);
-  },
-  render(engine, alpha) {
-    renderer.draw(engine.ecs, engine.camera.view, alpha);
-  },
-  destroy() {
-    renderer.dispose();
+  designWidth: 1920,
+  designHeight: 1080,
+  fit: 'contain',
+  clearColor: '#101826',
+  imageResolver(renderable) {
+    return imageCache.get(renderable.assetId) || null;
   }
 });
+
+engine.start(document.querySelector('#game'), { paused: true });
+await engine.runtime.ready;
+if (!engine.runtime.native) throw engine.runtime.error;
+engine.resume();
 ```
+
+بدون hook، Runtime سفارشی یک Canvas2D واقعی می‌سازد و مستقیماً همان ECS و Scene Graph حاصل از Universal JSON را Render می‌کند. Transformهای تو‌در‌تو، Camera، visibility، layer، crop، tint، particle hue و Skin fallback همگام هستند؛ اندازهٔ تصویری که width/height ندارد به‌صورت ثابت `64x64` می‌ماند و `resize()` حتی در Pause بلافاصله Canvas را اصلاح می‌کند. قرارداد host-owned قبلی نیز با دادن `mount/render/unmount/destroy` حفظ شده است؛ در آن حالت `render(engine, alpha)` انحصاری است و Canvas دوم ساخته نمی‌شود. جزئیات هر دو مسیر در [`docs/RUNTIMES.md`](./docs/RUNTIMES.md) آمده است.
 
 ### PixiJS Runtime
 
@@ -949,6 +954,7 @@ PixiJS v8 وابستگی Runtime است. در صفحهٔ Browser، bundle آن �
 ```html
 <script src="./node_modules/pixi.js/dist/pixi.min.js"></script>
 <script src="./node_modules/pixi.js/dist/packages/unsafe-eval.min.js"></script>
+<script src="./node_modules/phaser/dist/phaser.min.js"></script>
 <script src="./node_modules/planck/dist/planck.min.js"></script>
 <script src="./engine/AH2DDataModel.js"></script>
 <script src="./engine/AH2DEngine.js"></script>
@@ -1000,25 +1006,27 @@ Adapter به‌صورت خودکار:
 ### PhaserJS Runtime
 
 ```js
-engine.useRuntime('phaserjs', { Phaser: window.Phaser });
-
-class GameScene extends Phaser.Scene {
-  create() {
-    engine.load(project);
-    engine.update(0);
-    createPhaserObjectsFromECS(this, engine.ecs);
+engine.useRuntime('phaserjs', {
+  Phaser: window.Phaser,
+  designWidth: 1920,
+  designHeight: 1080,
+  fit: 'contain',
+  transparent: true,
+  textureResolver(renderable) {
+    return runtimeAssetUrls.get(renderable.assetId) || renderable.imageSrc || null;
   }
-
-  update(_time, deltaMilliseconds) {
-    const dt = Math.min(0.05, deltaMilliseconds / 1000);
-    updateGameplay(dt);
-    engine.update(dt);
-    syncPhaserObjectsFromECS(this, engine.ecs);
-  }
-}
+});
+engine.start(document.querySelector('#game'), { paused: true });
+await engine.runtime.ready;
+if (!engine.runtime.native) throw engine.runtime.error;
+engine.resume();
 ```
 
-PixiJS adapter اکنون Display Tree، Sprite/Graphics/Mesh، Transform، visibility، Camera، Skin deformation، Particleهای texture/graphics، asset loading پایه، برش native مقدار `Renderable.sourceRect` و—روی WebGL—Filterهای Post Process/Shader Graph را مستقیماً ایجاد و Render می‌کند. مقدار `Renderable.frame` به‌تنهایی ابعاد و مختصات برش را تعیین نمی‌کند و به metadata مربوط به Asset یا host نیاز دارد. PhaserJS همچنان یک adapter انتخاب/سازگاری است و ساخت Game Objectها، همگام‌سازی ECS و `Skin.deformedVertices`، `ParticleEmitter.particles` و Camera/renderer mapping آن باید توسط پروژهٔ بازی انجام شود؛ مثال `createPhaserObjectsFromECS` بالا host-owned است. Light/Shadow و Post Process در PhaserJS/Custom به نگاشت اختصاصی host نیاز دارند.
+PhaserJS adapter یک `Phaser.Game` مدیریت‌شده می‌سازد، یا یک `scene`/`game` موجود را می‌پذیرد. مسیر مدیریت‌شده به‌صورت پیش‌فرض WebGL، بارگذاری `HTMLImageElement` و `Scale.RESIZE` دارد. Phaser Canvas چون tint/hue قرارداد Universal را کامل Render نمی‌کند با خطای روشن `E_RUNTIME_CAPABILITY` متوقف می‌شود؛ برای Canvas2D باید Runtime سفارشی را انتخاب کرد. Entityها به Containerهای Nested، Renderableها به Image/Rectangle، `sourceRect` به crop بومی، و particleهای زنده به Game Object تبدیل می‌شوند؛ create/delete/reparent، visibility، Transform، Camera و layer در هر Frame از همان ECS همگام می‌شوند. `transparent: true` بر `Camera.clearColor` اولویت دارد و Camera دارای shear غیرقابل‌نمایش با `E_TRANSFORM_SHEAR` fail-closed می‌شود. حلقهٔ simulation فقط متعلق به AH2D است و Phaser Scene نباید دوباره `engine.update()` را صدا بزند.
+
+در Studio، مسیرهای نسبی Asset مثل `textures/hero.png` داخل Universal JSON دست‌نخورده می‌مانند. وقتی پوشهٔ پروژه باز شود، فایل‌ها فقط در حافظه به `data:image/...;base64` امن تبدیل و به iframe سندباکس‌شده فرستاده می‌شوند؛ Scene، Animator، Particle Preview و هر سه Runtime همان منبع را resolve می‌کنند و هیچ Data URLای ذخیره نمی‌شود. اگر فقط فایل JSON را باز کنید، مرورگر به فایل‌های sibling دسترسی ندارد و برای resolve شدن تصاویر باید پوشهٔ پروژه را Open کنید.
+
+PixiJS adapter Display Tree، Sprite/Graphics/Mesh، Transform، visibility، Camera، Skin deformation، Particleهای texture/graphics، asset loading پایه، برش native مقدار `Renderable.sourceRect` و—روی WebGL—Filterهای Post Process/Shader Graph را مستقیماً ایجاد و Render می‌کند. مقدار `Renderable.frame` به‌تنهایی ابعاد و مختصات برش را تعیین نمی‌کند و به metadata مربوط به Asset یا host نیاز دارد. Light/Shadow و Tilemap هنوز در هر سه renderer به نگاشت اختصاصی host نیاز دارند. PhaserJS و Custom descriptorهای مرتب `engine.postProcess.resolvedActive` را به hook میزبان می‌دهند. قرارداد کامل در [`docs/RUNTIMES.md`](./docs/RUNTIMES.md) است.
 
 ### اجرای Headless در Node.js
 
@@ -1149,7 +1157,7 @@ engine.events.emit(type, payload)
 - standalone animation/particle JSON ورودی مستقیم Project Load نیستند.
 - layout پنل‌ها، selection، undo history، grid/snap، commentهای محلی داخل canvas و وضعیت دوربین Prefab در Universal JSON ذخیره نمی‌شوند. Commentهای مشارکتی Studio جداگانه در Project API ذخیره می‌شوند.
 - Prefabهای canonical از Asset/Instance/Override/Apply/Revert/Unpack پشتیبانی می‌کنند؛ nested Prefab Asset و structural override هنوز پشتیبانی نمی‌شوند و برای تغییر hierarchy یک Instance متصل باید ابتدا Unpack انجام شود.
-- Sprite Track اطلاعات canonical `frame`/`sourceRect` را ذخیره می‌کند. PixiJS adapter مستقیماً `sourceRect` را به subtexture تبدیل می‌کند؛ `frame` بدون rectangle به متادیتای Sprite Sheet از Asset/host نیاز دارد و نگاشت PhaserJS/Custom همچنان host-owned است.
+- Sprite Track اطلاعات canonical `frame`/`sourceRect` را ذخیره می‌کند. PixiJS adapter آن را به subtexture، PhaserJS به crop و Custom Canvas به `drawImage` نه‌آرگومانی تبدیل می‌کند؛ `frame` بدون rectangle همچنان به متادیتای Sprite Sheet از Asset/host نیاز دارد.
 - Particle export قرارداد مستقل `AH2D.Particle` نسخهٔ ۱ را همراه texture reference و Curve keyها ذخیره می‌کند؛ فقط ذرات زنده و bookkeeping شبیه‌سازی صادر نمی‌شوند.
 - Editor چند fixture مستقل box/circle را روی یک Entity مدیریت می‌کند. polygon/chain/joint هنوز قرارداد Authoring داخل Universal JSON ندارند؛ در صورت نیاز بازی از handle بومی Runtime استفاده کند.
 - lifecycle هر Instance در `ParticleEmitter` نگه‌داری می‌شود و داده‌های `particles`، `emissionAccumulator`، `completed` و `rngState` فقط Runtime هستند.

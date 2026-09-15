@@ -323,7 +323,7 @@ const WORKSPACE_BRIDGE = String.raw`
     readySent = true;
     const document = readProject();
     lastSnapshot = document ? JSON.stringify(document) : "";
-    send("AH2D_EDITOR_READY", { capabilities: ["project-load", "project-snapshot", "autosave"] });
+    send("AH2D_EDITOR_READY", { capabilities: ["project-load", "project-snapshot", "autosave", "local-asset-sources"] });
   }
 
   function publishIfChanged(force) {
@@ -356,7 +356,7 @@ const WORKSPACE_BRIDGE = String.raw`
       try {
         ignoreChangesUntil = Date.now() + 1000;
         baseProject = clone(message.document);
-        const loaded = window.loadProject(message.document);
+        const loaded = window.loadProject(message.document, message.assetSources || {});
         if (loaded !== true) throw new Error("Stop Preview before opening another Project.");
         const current = mergeProject(readProject());
         if (!current) throw new Error("The Editor did not produce a project snapshot after loading.");
@@ -432,10 +432,11 @@ const WORKSPACE_BRIDGE = String.raw`
 </script>`;
 
 export async function GET(request: Request) {
-  const [editorSource, pixiSource, pixiCspSource, planckSource, dataModelSource, engineSource] = await Promise.all([
+  const [editorSource, pixiSource, pixiCspSource, phaserSource, planckSource, dataModelSource, engineSource] = await Promise.all([
     readFile(path.join(process.cwd(), "AH2DEdtior.html"), "utf8"),
     readFile(path.join(process.cwd(), "node_modules", "pixi.js", "dist", "pixi.min.js"), "utf8"),
     readFile(path.join(process.cwd(), "node_modules", "pixi.js", "dist", "packages", "unsafe-eval.min.js"), "utf8"),
+    readFile(path.join(process.cwd(), "node_modules", "phaser", "dist", "phaser.min.js"), "utf8"),
     readFile(path.join(process.cwd(), "node_modules", "planck", "dist", "planck.min.js"), "utf8"),
     readFile(path.join(process.cwd(), "engine", "AH2DDataModel.js"), "utf8"),
     readFile(path.join(process.cwd(), "engine", "AH2DEngine.js"), "utf8"),
@@ -450,6 +451,10 @@ export async function GET(request: Request) {
       () => `<script>${pixiCspSource.replace(/<\/script/gi, "<\\/script")}</script>`,
     )
     .replace(
+      '<script src="./node_modules/phaser/dist/phaser.min.js"></script>',
+      () => `<script>${phaserSource.replace(/<\/script/gi, "<\\/script")}</script>`,
+    )
+    .replace(
       '<script src="./node_modules/planck/dist/planck.min.js"></script>',
       () => `<script>${planckSource.replace(/<\/script/gi, "<\\/script")}</script>`,
     )
@@ -460,13 +465,18 @@ export async function GET(request: Request) {
         `<script>${engineSource.replace(/<\/script/gi, "<\\/script")}</script>`,
     );
   const bridge = WORKSPACE_BRIDGE.replace("__AH2D_PARENT_ORIGIN__", JSON.stringify(new URL(request.url).origin));
-  html = html.replace("</body>", `${bridge}\n</body>`);
+  // Renderer bundles can legitimately contain strings such as "</body>".
+  // Insert at the document's closing tag, not the first matching source text.
+  const closingBodyIndex = html.toLocaleLowerCase().lastIndexOf("</body>");
+  html = closingBodyIndex >= 0
+    ? `${html.slice(0, closingBodyIndex)}${bridge}\n${html.slice(closingBodyIndex)}`
+    : `${html}\n${bridge}`;
 
   return new Response(html, {
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
-      "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
+      "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src data: blob:; worker-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
       "Referrer-Policy": "no-referrer",
       "X-Content-Type-Options": "nosniff",
     },

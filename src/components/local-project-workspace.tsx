@@ -9,7 +9,10 @@ import {
 } from "react";
 import {
   findProjectInDirectory,
+  listLocalProjectAssetPaths,
+  localImageMimeType,
   readProjectFile,
+  resolveProjectAssetFiles,
   writeProjectText,
   type ProjectDirectoryHandle,
   type WritableProjectFileHandle,
@@ -48,6 +51,9 @@ interface LocalSession {
   fileHandle: WritableProjectFileHandle | null;
   expectedDiskText: string | null;
   document: UniversalProjectDocument;
+  directoryHandle: ProjectDirectoryHandle | null;
+  runtimeAssetSources: Record<string, string>;
+  missingAssets: string[];
 }
 
 interface CandidateProject {
@@ -94,6 +100,39 @@ function isNotFoundError(error: unknown): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "The local project operation failed.";
+}
+
+const EMPTY_RUNTIME_ASSETS = Object.freeze({
+  sources: {} as Record<string, string>,
+  missing: [] as string[],
+});
+
+async function readFileAsDataUrl(file: File): Promise<string> {
+  const mime = localImageMimeType(file.name);
+  if (!mime) throw new Error(`Unsupported local image asset ${file.name}.`);
+  const source = file.type.toLowerCase() === mime
+    ? file
+    : new Blob([await file.arrayBuffer()], { type: mime });
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      if (typeof reader.result === "string") resolve(reader.result);
+      else reject(new Error(`Unable to read local image asset ${file.name}.`));
+    }, { once: true });
+    reader.addEventListener("error", () => reject(reader.error || new Error(`Unable to read local image asset ${file.name}.`)), { once: true });
+    reader.readAsDataURL(source);
+  });
+}
+
+async function createRuntimeAssets(directory: ProjectDirectoryHandle | null, document: UniversalProjectDocument) {
+  if (!directory) return { ...EMPTY_RUNTIME_ASSETS, sources: {}, missing: listLocalProjectAssetPaths(document) };
+  const resolved = await resolveProjectAssetFiles(directory, document);
+  const sources: Record<string, string> = {};
+  for (const entry of resolved.files) {
+    const dataUrl = await readFileAsDataUrl(entry.file);
+    for (const alias of entry.aliases) sources[alias] = dataUrl;
+  }
+  return { sources, missing: resolved.missing };
 }
 
 function downloadProject(project: UniversalProjectDocument, fileName: string): void {
@@ -165,6 +204,7 @@ export function LocalProjectWorkspace() {
       type: "AH2D_LOAD_PROJECT",
       requestId: candidate.requestId,
       document: candidate.session.document,
+      assetSources: candidate.session.runtimeAssetSources,
     });
   }, [postToEditor]);
 
@@ -270,6 +310,7 @@ export function LocalProjectWorkspace() {
         const directory = await pickerWindow.showDirectoryPicker({ id: "ah2d-open-project", mode: "readwrite" });
         const selected = await findProjectInDirectory(directory);
         if (!await prepareProjectSwitch()) return;
+        const runtimeAssets = await createRuntimeAssets(directory, selected.document);
         beginLoadingProject({
           id: nextId("session"),
           projectName: projectDisplayName(selected.document, directory.name),
@@ -278,6 +319,9 @@ export function LocalProjectWorkspace() {
           fileHandle: selected.fileHandle,
           expectedDiskText: selected.diskText,
           document: selected.document,
+          directoryHandle: directory,
+          runtimeAssetSources: runtimeAssets.sources,
+          missingAssets: runtimeAssets.missing,
         });
         return;
       }
@@ -286,6 +330,7 @@ export function LocalProjectWorkspace() {
         if (!handle) return;
         const selected = await readProjectFile(handle);
         if (!await prepareProjectSwitch()) return;
+        const runtimeAssets = await createRuntimeAssets(null, selected.document);
         beginLoadingProject({
           id: nextId("session"),
           projectName: projectDisplayName(selected.document, selected.fileName.replace(/\.(?:ah2d\.)?json$/i, "")),
@@ -294,6 +339,9 @@ export function LocalProjectWorkspace() {
           fileHandle: selected.fileHandle,
           expectedDiskText: selected.diskText,
           document: selected.document,
+          directoryHandle: null,
+          runtimeAssetSources: runtimeAssets.sources,
+          missingAssets: runtimeAssets.missing,
         });
         return;
       }
@@ -350,6 +398,9 @@ export function LocalProjectWorkspace() {
           fileHandle,
           expectedDiskText: text,
           document,
+          directoryHandle: projectDirectory,
+          runtimeAssetSources: {},
+          missingAssets: [],
         });
       } else if (standaloneFile) {
         await writeProjectText(standaloneFile, text);
@@ -361,6 +412,9 @@ export function LocalProjectWorkspace() {
           fileHandle: standaloneFile,
           expectedDiskText: text,
           document,
+          directoryHandle: null,
+          runtimeAssetSources: {},
+          missingAssets: [],
         });
       } else {
         const fileName = `${safeProjectDirectoryName(name)}.ah2d.json`;
@@ -373,6 +427,9 @@ export function LocalProjectWorkspace() {
           fileHandle: null,
           expectedDiskText: null,
           document,
+          directoryHandle: null,
+          runtimeAssetSources: {},
+          missingAssets: [],
         });
       }
       setNewProjectOpen(false);
@@ -387,6 +444,7 @@ export function LocalProjectWorkspace() {
       const diskText = await file.text();
       const document = parseUniversalProject(diskText);
       if (!await prepareProjectSwitch()) return;
+      const runtimeAssets = await createRuntimeAssets(null, document);
       beginLoadingProject({
         id: nextId("session"),
         projectName: projectDisplayName(document, file.name.replace(/\.(?:ah2d\.)?json$/i, "")),
@@ -395,6 +453,9 @@ export function LocalProjectWorkspace() {
         fileHandle: null,
         expectedDiskText: diskText,
         document,
+        directoryHandle: null,
+        runtimeAssetSources: runtimeAssets.sources,
+        missingAssets: runtimeAssets.missing,
       });
     } catch (fallbackError) {
       setError(errorMessage(fallbackError));
@@ -415,12 +476,15 @@ export function LocalProjectWorkspace() {
     if (!active?.fileHandle) return;
     try {
       const selected = await readProjectFile(active.fileHandle);
+      const runtimeAssets = await createRuntimeAssets(active.directoryHandle, selected.document);
       setNotice("");
       beginLoadingProject({
         ...active,
         projectName: projectDisplayName(selected.document, active.projectName),
         expectedDiskText: selected.diskText,
         document: selected.document,
+        runtimeAssetSources: runtimeAssets.sources,
+        missingAssets: runtimeAssets.missing,
       });
     } catch (reloadError) {
       setSaveState("error");
@@ -462,9 +526,10 @@ export function LocalProjectWorkspace() {
         setEditorLoaded(true);
         setGateOpen(false);
         window.document.title = `${candidate.session.projectName} — AH2D Editor`;
-        if (!candidate.session.fileHandle) {
-          setNotice("Opened in download mode. Save downloads a new copy because direct filesystem access is unavailable.");
-        }
+        const notices: string[] = [];
+        if (candidate.session.missingAssets.length) notices.push(`Opened with ${candidate.session.missingAssets.length} unresolved local image asset${candidate.session.missingAssets.length === 1 ? "" : "s"}; open the project folder to resolve relative paths.`);
+        if (!candidate.session.fileHandle) notices.push("Save downloads a new copy because direct filesystem access is unavailable.");
+        if (notices.length) setNotice(notices.join(" "));
         return;
       }
       if (message.type === "AH2D_PROJECT_CHANGED" && message.document && acceptsChangesRef.current) {
